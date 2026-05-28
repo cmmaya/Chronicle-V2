@@ -1,0 +1,31 @@
+PySide6==6.6.0
+mss==10.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+soundcard>=0.4.0
+soundfile>=0.12.0
+sounddevice>=0.4.0
+numpy<2
+# Primary STT backend: Whisper
+# Whisper (openai-whisper) requires PyTorch. Installing torch is platform-dependent;
+# please install a compatible torch wheel first before installing requirements.txt.
+# Example (CPU-only, Linux/Windows/macOS):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Then install the rest:
+#   pip install -r requirements.txt
+openai-whisper
+
+# Note: If you cannot install torch/openai-whisper on your Python version, either
+# use a different Python (3.10/3.11 recommended) or install one of the alternative
+# backends (parakeet-ctc or coqui-stt) and provide model files as needed.
+
+# QUICK SETUP (Whisper)
+# Whisper requires PyTorch. Installing PyTorch is platform and CUDA-version dependent.
+# Recommended flow:
+# 1) Install a compatible PyTorch wheel for your platform. Example CPU-only install:
+#    pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 2) Install remaining Python deps (this file):
+#    pip install -r requirements.txt
+#
+# If you prefer, create a small helper file requirements-whisper.txt that includes
+# the correct torch wheel link for your platform before openai-whisper.
