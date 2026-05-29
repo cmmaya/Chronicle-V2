@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU013
-- Next BU: BU014
+- Current BU: BU014
+- Next BU: BU015
 
 ## Target Architecture
 
@@ -28,6 +28,7 @@ BU010 - System Audio Capture
 BU011 - Chunk-Based Transcription
 BU012 - Fix Transcription Pipeline to Use Real Speech-to-Text Model
 BU013 - Display Past Sessions in UI
+BU014 - Add Session Status to UI
 
 ## In Progress BUs
 None
@@ -85,3 +86,7 @@ None
 - Added _on_status_update in MainWindow to display status and errors
 - Centralized all status updates through the callback system
 - Session list UI added to MainWindow - displays past sessions with name, date, and status
+- Added transcription_status and summary_status columns to sessions table
+- UI now displays transcription and summarization status for each session
+- Status is updated in database after transcription/summary generation
+- Session list refreshes after processing to show updated status

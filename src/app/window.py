@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QLabel, QStatusBar,
                                QMessageBox, QApplication, QListWidget, QGroupBox,
-                               QListWidgetItem, QMenu)
+                               QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
+                               QHeaderView)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 import logging
@@ -62,18 +63,45 @@ class MainWindow(QMainWindow):
         """Load and display past sessions from the database."""
         try:
             sessions = self.session_manager.db.list_sessions()
-            self.sessions_list.clear()
-            for session in sessions:
-                item = QListWidgetItem(session['name'])
-                item.setData(Qt.UserRole, session['id'])
-                item.setFlags(item.flags() | Qt.ItemIsEditable)
-                self.sessions_list.addItem(item)
+            
+            # Disconnect signal to prevent triggering during programmatic updates
+            self.sessions_list.cellChanged.disconnect()
+            
+            self.sessions_list.setRowCount(len(sessions))
+            
+            for row, session in enumerate(sessions):
+                trans_status = session.get('transcription_status', 'none')
+                sum_status = session.get('summary_status', 'none')
+                
+                # Session name (editable)
+                name_item = QTableWidgetItem(session['name'])
+                name_item.setData(Qt.UserRole, session['id'])
+                name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+                self.sessions_list.setItem(row, 0, name_item)
+                
+                # Transcription status (read-only)
+                trans_item = QTableWidgetItem(trans_status)
+                trans_item.setFlags(trans_item.flags() & ~Qt.ItemIsEditable)
+                self.sessions_list.setItem(row, 1, trans_item)
+                
+                # Summary status (read-only)
+                sum_item = QTableWidgetItem(sum_status)
+                sum_item.setFlags(sum_item.flags() & ~Qt.ItemIsEditable)
+                self.sessions_list.setItem(row, 2, sum_item)
+            
+            # Reconnect signal after loading
+            self.sessions_list.cellChanged.connect(self._on_session_name_changed)
+            
         except Exception as e:
             logger.warning(f"Failed to load past sessions: {str(e)}")
     
-    def _on_session_name_changed(self, item):
+    def _on_session_name_changed(self, row, column):
         """Handle the renaming of a session."""
+        if column != 0:
+            return  # Only allow editing the name column
+        
         try:
+            item = self.sessions_list.item(row, 0)
             session_id = item.data(Qt.UserRole)
             new_name = item.text()
             
@@ -92,9 +120,10 @@ class MainWindow(QMainWindow):
     
     def _show_session_context_menu(self, position):
         """Show a context menu for the right-clicked session item."""
-        item = self.sessions_list.itemAt(position)
+        # Get row from position
+        row = self.sessions_list.row(self.sessions_list.itemAt(position))
         
-        if not item:
+        if row < 0:
             return
         
         menu = QMenu()
@@ -103,13 +132,13 @@ class MainWindow(QMainWindow):
         chosen_action = menu.exec(self.sessions_list.mapToGlobal(position))
         
         if chosen_action == delete_action:
-            self._delete_session(item)
+            self._delete_session(row)
     
-    def _delete_session(self, item):
+    def _delete_session(self, row):
         """Delete the selected session after confirmation."""
         try:
-            session_id = item.data(Qt.UserRole)
-            session_name = item.text()
+            session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
+            session_name = self.sessions_list.item(row, 0).text()
             
             if session_id is None:
                 return
@@ -128,7 +157,7 @@ class MainWindow(QMainWindow):
                 self.session_manager.db.delete_transcripts(session_id)
                 # Delete the session itself
                 self.session_manager.db.delete_session(session_id)
-                self.sessions_list.takeItem(self.sessions_list.row(item))
+                self.sessions_list.removeRow(row)
                 
                 logger.info(f"Deleted session {session_id} ('{session_name}')")
                 self._on_status_update(f"Session '{session_name}' deleted.")
@@ -236,13 +265,20 @@ class MainWindow(QMainWindow):
         self.status_label.setFont(status_font)
         layout.addWidget(self.status_label)
         
-        # Past Sessions list
+        # Past Sessions list - using table for separate cells
         sessions_group = QGroupBox('Past Sessions')
         sessions_layout = QVBoxLayout()
-        self.sessions_list = QListWidget()
-        self.sessions_list.itemChanged.connect(self._on_session_name_changed)
+        self.sessions_list = QTableWidget()
+        self.sessions_list.setColumnCount(3)
+        self.sessions_list.setHorizontalHeaderLabels(['Session Name', 'Transcription', 'Summary'])
+        self.sessions_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.sessions_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.sessions_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.sessions_list.setSelectionBehavior(QTableWidget.SelectRows)
+        self.sessions_list.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.sessions_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sessions_list.customContextMenuRequested.connect(self._show_session_context_menu)
+        self.sessions_list.cellChanged.connect(self._on_session_name_changed)
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
         layout.addWidget(sessions_group)
@@ -375,6 +411,9 @@ class MainWindow(QMainWindow):
                         
                         summary_content = summary_result.get('content', '')
                         logger.info(f"Summary generated for session {session.id}")
+                        
+                        # Update summary status in database
+                        self.session_manager.db.update_session(session.id, summary_status='summarized')
                     else:
                         summary_content = None
                         logger.warning(f"No transcript text found for session {session.id}")
@@ -390,6 +429,9 @@ class MainWindow(QMainWindow):
             
             # Update status to show session finished
             self._on_status_update('Session complete')
+            
+            # Reload sessions to show updated status
+            self._load_past_sessions()
             
             # Show completion message
             mic_count = len(results.get('microphone', []))

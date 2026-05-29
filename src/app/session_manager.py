@@ -315,7 +315,14 @@ class SessionManager:
         if not session:
             raise RuntimeError('No active session')
         
-        return session.process_transcriptions()
+        result = session.process_transcriptions()
+        
+        # Update transcription status in database
+        if result:
+            self.db.update_session(session.id, transcription_status='transcribed')
+            self._update_status(f'Transcription completed for session {session.id}')
+        
+        return result
     
     def get_timeline(self) -> Optional[Timeline]:
         """Get the current timeline.

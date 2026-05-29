@@ -262,3 +262,26 @@ Recovery Notes:
 - Ready for BU014 to add session interaction (clicking, selecting)
 - No interaction functionality included per BU013 scope
 - Uses existing database method - no schema changes needed
+
+---
+
+## BU014 - Add Session Status to UI
+
+Summary:
+Added transcription and summarization status display to the session list in the UI using a QTableWidget with separate cells. Database schema updated with transcription_status and summary_status columns, status updates are set in the database when transcription/summarization complete, and only the session name cell is editable.
+
+Files Changed:
+- src/storage/database.py (added transcription_status and summary_status columns with migration)
+- src/app/window.py (changed from QListWidget to QTableWidget with 3 columns)
+- src/app/session_manager.py (modified process_transcriptions to update status)
+
+Important Decisions:
+- Database migration uses ALTER TABLE for existing databases (try/except for OperationalError)
+- Status values: 'none' (default), 'transcribed', 'summarized'
+- UI uses QTableWidget with 3 columns: Session Name (editable), Transcription (read-only), Summary (read-only)
+- Session list refreshes after processing to show updated status
+- Only name column is editable; status columns are read-only via item flags
+
+Recovery Notes:
+- Ready for BU015 to add trigger buttons for transcription/summarization
+- Status is informational only per BU014 scope

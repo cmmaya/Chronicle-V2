@@ -37,9 +37,20 @@ class Database:
                     name TEXT NOT NULL,
                     start_time INTEGER NOT NULL,
                     end_time INTEGER,
-                    status TEXT NOT NULL
+                    status TEXT NOT NULL,
+                    transcription_status TEXT DEFAULT 'none',
+                    summary_status TEXT DEFAULT 'none'
                 )
             ''')
+            # Add columns to existing tables if they don't exist
+            try:
+                cursor.execute('ALTER TABLE sessions ADD COLUMN transcription_status TEXT DEFAULT "none"')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                cursor.execute('ALTER TABLE sessions ADD COLUMN summary_status TEXT DEFAULT "none"')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,13 +85,14 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Schema initialization failed: {str(e)}')
 
-    def create_session(self, name: str, start_time: datetime, status: str = 'active') -> int:
+    def create_session(self, name: str, start_time: datetime, status: str = 'active', 
+                       transcription_status: str = 'none', summary_status: str = 'none') -> int:
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
-                INSERT INTO sessions (name, start_time, status)
-                VALUES (?, ?, ?)
-            ''', (name, int(start_time.timestamp()), status))
+                INSERT INTO sessions (name, start_time, status, transcription_status, summary_status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (name, int(start_time.timestamp()), status, transcription_status, summary_status))
             self.connection.commit()
             return cursor.lastrowid
         except sqlite3.Error as e:
