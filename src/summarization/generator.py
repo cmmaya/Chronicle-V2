@@ -54,7 +54,8 @@ class SummaryGenerator:
                  max_tokens: int = None,
                  temperature: float = None,
                  top_p: float = None,
-                 api_url: str = None):
+                 api_url: str = None,
+                 custom_instructions: str = None):
         """Initialize summary generator.
         
         Args:
@@ -65,6 +66,7 @@ class SummaryGenerator:
             temperature: Sampling temperature (0.0-1.0)
             top_p: Nucleus sampling parameter (0.0-1.0)
             api_url: OpenRouter API URL (defaults to env var or standard URL)
+            custom_instructions: Custom instructions to prepend to prompts
         """
         # Load API key from .env if not provided
         if api_key is None:
@@ -85,6 +87,11 @@ class SummaryGenerator:
         self.temperature = temperature if temperature is not None else self.DEFAULT_TEMPERATURE
         self.top_p = top_p if top_p is not None else self.DEFAULT_TOP_P
         
+        # Load custom instructions from config if not provided
+        if custom_instructions is None:
+            custom_instructions = self._load_custom_instructions()
+        self.custom_instructions = custom_instructions
+        
         # Lazy import to handle missing requests library gracefully
         self._requests = None
     
@@ -101,6 +108,19 @@ class SummaryGenerator:
                     "Install with: pip install requests"
                 )
         return self._requests
+    
+    def _load_custom_instructions(self) -> str:
+        """Load custom instructions from config file.
+        
+        Returns:
+            Custom instructions string, or empty string if not configured
+        """
+        try:
+            from .. import config
+            summarization_config = getattr(config, 'SUMMARIZATION', {})
+            return summarization_config.get('custom_instructions', '')
+        except ImportError:
+            return ''
     
     def _call_api(self, messages: List[Dict[str, str]], use_fallback: bool = False) -> tuple:
         """Call OpenRouter API with messages.
@@ -200,9 +220,14 @@ class SummaryGenerator:
         if not self.api_key:
             raise SummaryError("API key required for summary generation")
         
+        # Combine custom instructions with template system prompt
+        system_prompt = template.system_prompt
+        if self.custom_instructions:
+            system_prompt = f"{self.custom_instructions}\n\n{system_prompt}"
+        
         # Format messages
         messages = [
-            {"role": "system", "content": template.system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": template.format_user_message(transcript, context)}
         ]
         

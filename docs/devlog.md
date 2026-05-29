@@ -285,3 +285,109 @@ Important Decisions:
 Recovery Notes:
 - Ready for BU015 to add trigger buttons for transcription/summarization
 - Status is informational only per BU014 scope
+
+---
+
+## BU015 - Trigger Transcription from UI
+
+Summary:
+Added a Transcribe button to the UI for triggering transcription on past sessions. Sessions table now has 4 columns: Session Name, Transcription, Summary, and Actions. The button appears only for untranscribed sessions (transcription_status != 'transcribed'). When clicked, it disables the button, shows "Transcribing..." text, processes transcriptions via SessionManager, updates the database status, reloads the UI, and shows a completion message.
+
+Files Changed:
+- src/app/window.py (added Actions column with Transcribe button, _on_transcribe_clicked, _run_transcription methods)
+
+Important Decisions:
+- Button shows "Done" for already transcribed sessions
+- Uses QTimer.singleShot to run transcription in background to keep UI responsive
+- Session is loaded via SessionManager.load_session() for processing
+- Database status updated to 'transcribed' after successful transcription
+
+Recovery Notes:
+- Ready for BU016 to add trigger button for summarization
+- Transcription process already exists in session_manager.py - this BU only adds the UI trigger
+
+---
+
+## BU016 - Configure Summarization Agent
+
+Summary:
+Updated SummaryGenerator to support custom instructions loaded from a configuration file. Added config.py with summarization settings including model selection and custom instructions.
+
+Files Changed:
+- src/config.py (new - configuration settings for summarization)
+- src/summarization/generator.py (added custom_instructions parameter and _load_custom_instructions method)
+
+Important Decisions:
+- Default model is GEMINI_2_5_FLASH
+- Custom instructions are optional and prepended to template system prompts
+- Configuration loaded from SUMMARIZATION dict in config.py
+
+Recovery Notes:
+- Ready for BU017 to add trigger button for summarization
+- Custom instructions can be modified in config.py
+
+---
+
+## BU017 - Trigger Summarization from UI
+
+Summary:
+Added a Summarize option to the Actions dropdown for triggering summarization on transcribed sessions. The button appears only when transcription_status == 'transcribed' and summary_status in (None, 'none'). Uses QTimer.singleShot for background processing to keep UI responsive.
+
+Files Changed:
+- src/app/window.py (added Summarize action option and _on_summarize_clicked, _run_summarization methods)
+
+Important Decisions:
+- Summarize option in dropdown appears only when transcription is complete
+- Uses existing SummaryGenerator.generate_and_store method
+- UI provides feedback during summarization process
+- Status updated to 'summarized' after completion
+
+Recovery Notes:
+- Ready for BU018 to add view summary functionality
+- Combined with BU016 for implementation efficiency
+
+---
+
+## BU018 - Display Summary in UI
+
+Summary:
+Added functionality to display session summaries in a separate window. Users can double-click on a summarized session or use the "View Summary" option from the context menu to view the summary content in a modal dialog.
+
+Files Changed:
+- src/app/window.py (added _on_session_double_clicked, _show_session_summary methods, QDialog and QTextBrowser imports)
+
+Important Decisions:
+- Summary display uses a QDialog with QTextBrowser for readable text presentation
+- Shows session name, summary type, and model used in the dialog header
+- Double-click handling on table rows triggers summary display
+- Context menu option provides alternative access to view summary
+- Shows informative message if session has no summary
+
+Recovery Notes:
+- Ready for BU019 for additional UI features
+- Uses existing Database.get_summaries() method
+
+---
+
+## BU020 - Display Screenshots in UI
+
+Summary:
+Added functionality to display session screenshots in a separate window with timestamps. Users can:
+1. Right-click on a past session and select "View Screenshots" from the context menu
+2. Click the "View Screenshots" button during an active session
+
+Files Changed:
+- src/storage/database.py (added get_screenshots method)
+- src/app/window.py (added _show_session_screenshots method, _on_view_screenshots method, "View Screenshots" button, added QScrollArea and QGridLayout imports, added "View Screenshots" to context menu)
+
+Important Decisions:
+- Screenshot display uses a QDialog with QScrollArea for scrollable content
+- Uses QGridLayout to display screenshots in a 2-column grid
+- Each screenshot is displayed with its capture timestamp
+- Images are scaled to 300x200 while maintaining aspect ratio
+- Shows informative message if session has no screenshots
+- Uses existing Database.get_screenshots() method
+- Added dedicated "View Screenshots" button enabled during active sessions
+
+Recovery Notes:
+- Ready for BU021 for additional UI features

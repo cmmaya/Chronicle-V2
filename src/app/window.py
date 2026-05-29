@@ -1,10 +1,10 @@
 from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout, 
-                               QHBoxLayout, QPushButton, QLabel, QStatusBar,
-                               QMessageBox, QApplication, QListWidget, QGroupBox,
-                               QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
-                               QHeaderView)
+                                QHBoxLayout, QPushButton, QLabel, QStatusBar,
+                                QMessageBox, QApplication, QListWidget, QGroupBox,
+                                QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
+                                QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, QGridLayout)
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QPixmap
 import logging
 
 from .session_manager import SessionManager
@@ -88,6 +88,32 @@ class MainWindow(QMainWindow):
                 sum_item = QTableWidgetItem(sum_status)
                 sum_item.setFlags(sum_item.flags() & ~Qt.ItemIsEditable)
                 self.sessions_list.setItem(row, 2, sum_item)
+                
+                # Actions column with dropdown (only enabled when transcription_status is None or 'none')
+                action_combo = QComboBox()
+                action_combo.addItem("Select Action", "none")
+                
+                # Add transcribe option only if transcription status is None or 'none'
+                if trans_status in (None, 'none'):
+                    action_combo.addItem("Transcribe", "transcribe")
+                
+                # Add summarize option only if transcription is complete and summary is None or 'none'
+                if trans_status == 'transcribed' and sum_status in (None, 'none'):
+                    action_combo.addItem("Summarize", "summarize")
+                
+                # Set current index based on status
+                if trans_status == 'transcribed' and sum_status == 'summarized':
+                    action_combo.setCurrentIndex(1)  # Select "Done" or adjust
+                    action_combo.setEnabled(False)
+                elif trans_status == 'transcribed' and sum_status in (None, 'none'):
+                    # Has transcribe option at index 1, summarize at index 2
+                    action_combo.setCurrentIndex(0)
+                else:
+                    action_combo.setCurrentIndex(0)
+                
+                action_combo.setProperty('session_id', session['id'])
+                action_combo.currentIndexChanged.connect(lambda index, sid=session['id'], combo=action_combo: self._on_action_selected(sid, index, combo))
+                self.sessions_list.setCellWidget(row, 3, action_combo)
             
             # Reconnect signal after loading
             self.sessions_list.cellChanged.connect(self._on_session_name_changed)
@@ -118,6 +144,145 @@ class MainWindow(QMainWindow):
             logger.error(f"Failed to rename session: {str(e)}")
             self._on_status_update(f"Error renaming session.", is_error=True)
     
+    def _on_action_selected(self, session_id: int, index: int, combo: QComboBox):
+        """Handle the action selection from the dropdown."""
+        if index == 0:  # "Select Action" - do nothing
+            return
+        
+        action = combo.currentData()
+        
+        if action == "transcribe":
+            # Disable the combo to prevent multiple clicks
+            combo.setEnabled(False)
+            self._on_transcribe_clicked(session_id, combo)
+        elif action == "summarize":
+            # Disable the combo to prevent multiple clicks
+            combo.setEnabled(False)
+            self._on_summarize_clicked(session_id, combo)
+    
+    def _on_transcribe_clicked(self, session_id: int, combo: QComboBox):
+        """Handle the transcribe action for a session."""
+        try:
+            # Update status
+            self._on_status_update(f'Transcribing session {session_id}...')
+            
+            # Run transcription in background using timer to allow UI to update
+            QTimer.singleShot(50, lambda: self._run_transcription(session_id, combo))
+            
+        except Exception as e:
+            logger.error(f"Failed to start transcription: {str(e)}")
+            self._on_status_update(f"Error: {str(e)}", is_error=True)
+            # Reload to reset state
+            self._load_past_sessions()
+    
+    def _run_transcription(self, session_id: int, combo: QComboBox):
+        """Run the transcription process for a session."""
+        try:
+            self._on_status_update('Loading session...')
+            
+            # Load the session using session manager
+            session = self.session_manager.load_session(session_id)
+            
+            self._on_status_update('Processing transcriptions...')
+            QApplication.processEvents()
+            
+            # Process transcriptions
+            results = session.process_transcriptions()
+            
+            # Update transcription status in database
+            if results:
+                self.session_manager.db.update_session(session_id, transcription_status='transcribed')
+                mic_count = len(results.get('microphone', []))
+                sys_count = len(results.get('system', []))
+                self._on_status_update(f'Transcribed {mic_count} mic chunks, {sys_count} system chunks')
+            else:
+                self._on_status_update('No audio files found to transcribe')
+            
+            # Reload the sessions list to update UI
+            self._load_past_sessions()
+            
+        except Exception as e:
+            logger.error(f"Transcription failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._on_status_update(f"Transcription failed: {str(e)}", is_error=True)
+            QMessageBox.warning(self, 'Transcription Failed', str(e))
+            # Reload to reset button state
+            self._load_past_sessions()
+    
+    def _on_summarize_clicked(self, session_id: int, combo: QComboBox):
+        """Handle the summarize action for a session."""
+        try:
+            # Update status
+            self._on_status_update(f'Summarizing session {session_id}...')
+            
+            # Run summarization in background using timer to allow UI to update
+            QTimer.singleShot(50, lambda: self._run_summarization(session_id, combo))
+            
+        except Exception as e:
+            logger.error(f"Failed to start summarization: {str(e)}")
+            self._on_status_update(f"Error: {str(e)}", is_error=True)
+            # Reload to reset state
+            self._load_past_sessions()
+    
+    def _run_summarization(self, session_id: int, combo: QComboBox):
+        """Run the summarization process for a session."""
+        try:
+            self._on_status_update('Loading session...')
+            
+            # Load the session using session manager
+            session = self.session_manager.load_session(session_id)
+            
+            self._on_status_update('Generating summary...')
+            QApplication.processEvents()
+            
+            # Get transcripts from database
+            transcripts = self.session_manager.db.get_transcripts(session_id)
+            
+            if not transcripts:
+                self._on_status_update('No transcripts found for summarization')
+                QMessageBox.warning(self, 'No Transcripts', 'No transcripts available. Please transcribe first.')
+                self._load_past_sessions()
+                return
+            
+            # Combine all transcript text
+            full_transcript = ' '.join(
+                t.get('text', '') for t in transcripts if t.get('text')
+            )
+            
+            if not full_transcript.strip():
+                self._on_status_update('No transcript text found')
+                QMessageBox.warning(self, 'No Transcript Text', 'Transcripts are empty.')
+                self._load_past_sessions()
+                return
+            
+            # Create summary generator (reads API key from .env)
+            summary_gen = SummaryGenerator(db=self.session_manager.db)
+            
+            # Generate and store summary
+            summary_result = summary_gen.generate_and_store(
+                transcript=full_transcript,
+                session_id=session_id,
+                summary_type='full'
+            )
+            
+            # Update summary status in database
+            self.session_manager.db.update_session(session_id, summary_status='summarized')
+            
+            self._on_status_update('Summary generated successfully')
+            
+            # Reload the sessions list to update UI
+            self._load_past_sessions()
+            
+        except Exception as e:
+            logger.error(f"Summarization failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._on_status_update(f"Summarization failed: {str(e)}", is_error=True)
+            QMessageBox.warning(self, 'Summarization Failed', str(e))
+            # Reload to reset button state
+            self._load_past_sessions()
+    
     def _show_session_context_menu(self, position):
         """Show a context menu for the right-clicked session item."""
         # Get row from position
@@ -127,11 +292,18 @@ class MainWindow(QMainWindow):
             return
         
         menu = QMenu()
+        view_summary_action = menu.addAction("View Summary")
+        view_screenshots_action = menu.addAction("View Screenshots")
+        menu.addSeparator()
         delete_action = menu.addAction("Delete Session")
         
         chosen_action = menu.exec(self.sessions_list.mapToGlobal(position))
         
-        if chosen_action == delete_action:
+        if chosen_action == view_summary_action:
+            self._show_session_summary(row)
+        elif chosen_action == view_screenshots_action:
+            self._show_session_screenshots(row)
+        elif chosen_action == delete_action:
             self._delete_session(row)
     
     def _delete_session(self, row):
@@ -166,6 +338,298 @@ class MainWindow(QMainWindow):
             logger.error(f"Failed to delete session: {str(e)}")
             self._on_status_update(f"Error deleting session.", is_error=True)
             QMessageBox.critical(self, 'Error', 'Could not delete the session from the database.')
+    
+    def _on_session_double_clicked(self, row, column):
+        """Handle double-click on a session row to view summary."""
+        self._show_session_summary(row)
+    
+    def _show_session_summary(self, row):
+        """Show the summary for a session in a separate window."""
+        try:
+            session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
+            session_name = self.sessions_list.item(row, 0).text()
+            summary_status = self.sessions_list.item(row, 2).text()
+            
+            if session_id is None:
+                return
+            
+            # Check if session has a summary
+            if summary_status != 'summarized':
+                QMessageBox.information(
+                    self,
+                    'No Summary',
+                    f"Session '{session_name}' does not have a summary yet.\n\n"
+                    "Please transcribe and summarize the session first."
+                )
+                return
+            
+            # Fetch summary from database
+            summaries = self.session_manager.db.get_summaries(session_id)
+            
+            if not summaries:
+                QMessageBox.warning(
+                    self,
+                    'No Summary',
+                    f"No summary found for session '{session_name}'."
+                )
+                return
+            
+            # Get the first summary (or most recent)
+            summary = summaries[0]
+            summary_content = summary.get('content', '')
+            summary_type = summary.get('summary_type', 'full')
+            model_used = summary.get('model_used', 'unknown')
+            
+            # Create a dialog to display the summary
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Summary - {session_name}")
+            dialog.setMinimumSize(600, 400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header with session info
+            header_label = QLabel(f"Session: {session_name}")
+            header_font = header_label.font()
+            header_font.setPointSize(14)
+            header_font.setBold(True)
+            header_label.setFont(header_font)
+            layout.addWidget(header_label)
+            
+            # Summary type and model info
+            info_label = QLabel(f"Type: {summary_type} | Model: {model_used}")
+            info_label.setStyleSheet("color: gray;")
+            layout.addWidget(info_label)
+            
+            # Summary content
+            text_browser = QTextBrowser()
+            text_browser.setPlainText(summary_content)
+            text_browser.setOpenExternalLinks(True)
+            layout.addWidget(text_browser)
+            
+            # Close button
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            layout.addWidget(close_button)
+            
+            dialog.exec()
+            
+        except Exception as e:
+            logger.error(f"Failed to show summary: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(
+                self,
+                'Error',
+                f"Failed to load summary: {str(e)}"
+            )
+    
+    def _show_full_image(self, filepath: str, timestamp: int):
+        """Show a full-size image in a dialog."""
+        try:
+            from datetime import datetime
+            from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy
+            
+            # Create dialog with window controls
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Screenshot")
+            dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowMinMaxButtonsHint)
+            
+            # Get screen size
+            screen = QApplication.primaryScreen()
+            screen_geometry = screen.availableGeometry()
+            
+            # Default to 50% of screen
+            width = int(screen_geometry.width() * 0.5)
+            height = int(screen_geometry.height() * 0.5)
+            dialog.resize(width, height)
+            
+            # Center the window
+            dialog.move(int((screen_geometry.width() - width) / 2), 
+                       int((screen_geometry.height() - height) / 2))
+            
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(5, 5, 5, 5)
+            
+            # Timestamp
+            dt = datetime.fromtimestamp(timestamp)
+            time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+            time_label = QLabel(f"Captured at: {time_str}")
+            time_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(time_label)
+            
+            # Image with scroll area for zooming/panning
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setAlignment(Qt.AlignCenter)
+            
+            image_label = QLabel()
+            image_label.setAlignment(Qt.AlignCenter)
+            pixmap = QPixmap(filepath)
+            
+            if not pixmap.isNull():
+                # Scale image to fit in the scroll area
+                image_label.setPixmap(pixmap.scaled(
+                    screen_geometry.width(), 
+                    screen_geometry.height(), 
+                    Qt.KeepAspectRatio, 
+                    Qt.SmoothTransformation
+                ))
+            else:
+                image_label.setText(f"Failed to load image\n{filepath}")
+            
+            scroll_area.setWidget(image_label)
+            layout.addWidget(scroll_area)
+            
+            # Button layout for Close and Fullscreen
+            button_layout = QHBoxLayout()
+            button_layout.addStretch()
+            
+            # Fullscreen toggle button
+            fullscreen_btn = QPushButton("Fullscreen")
+            fullscreen_btn.clicked.connect(lambda: self._toggle_fullscreen(dialog, fullscreen_btn, image_label, pixmap, screen_geometry))
+            button_layout.addWidget(fullscreen_btn)
+            
+            # Close button
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            button_layout.addWidget(close_button)
+            
+            layout.addLayout(button_layout)
+            
+            dialog.exec()
+            
+        except Exception as e:
+            logger.error(f"Failed to show full image: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(self, 'Error', f"Failed to show full image: {str(e)}")
+    
+    def _toggle_fullscreen(self, dialog: QDialog, btn: QPushButton, image_label: QLabel, pixmap: QPixmap, screen_geometry):
+        """Toggle between fullscreen and normal mode."""
+        if dialog.isFullScreen():
+            dialog.showNormal()
+            btn.setText("Fullscreen")
+            # Scale to 50% when not fullscreen
+            width = int(screen_geometry.width() * 0.5)
+            height = int(screen_geometry.height() * 0.5)
+            dialog.resize(width, height)
+            dialog.move(int((screen_geometry.width() - width) / 2), 
+                       int((screen_geometry.height() - height) / 2))
+            # Scale image to fit in the window
+            image_label.setPixmap(pixmap.scaled(
+                screen_geometry.width(), 
+                screen_geometry.height(), 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            ))
+        else:
+            # Save current geometry for restore
+            dialog.showFullScreen()
+            btn.setText("Exit Fullscreen")
+            # Scale image to fill the fullscreen
+            image_label.setPixmap(pixmap.scaled(
+                screen_geometry.width(), 
+                screen_geometry.height(), 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            ))
+    
+    def _show_session_screenshots(self, row):
+        """Show the screenshots for a session in a separate window."""
+        try:
+            session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
+            session_name = self.sessions_list.item(row, 0).text()
+            
+            if session_id is None:
+                return
+            
+            # Fetch screenshots from database
+            screenshots = self.session_manager.db.get_screenshots(session_id)
+            
+            if not screenshots:
+                QMessageBox.information(
+                    self,
+                    'No Screenshots',
+                    f"Session '{session_name}' does not have any screenshots yet."
+                )
+                return
+            
+            # Create a dialog to display the screenshots
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Screenshots - {session_name}")
+            dialog.setMinimumSize(800, 600)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header with session info
+            header_label = QLabel(f"Screenshots for: {session_name}")
+            header_font = header_label.font()
+            header_font.setPointSize(14)
+            header_font.setBold(True)
+            header_label.setFont(header_font)
+            layout.addWidget(header_label)
+            
+            # Scroll area for screenshots
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            
+            # Grid layout for screenshots
+            grid_widget = QWidget()
+            grid_layout = QGridLayout(grid_widget)
+            grid_layout.setSpacing(10)
+            
+            # Add screenshots to the grid
+            from datetime import datetime
+            for idx, screenshot in enumerate(screenshots):
+                filepath = screenshot.get('filepath', '')
+                timestamp = screenshot.get('timestamp', 0)
+                
+                # Convert timestamp to readable format
+                dt = datetime.fromtimestamp(timestamp)
+                time_str = dt.strftime('%H:%M:%S')
+                
+                # Create label with image
+                image_label = QLabel()
+                pixmap = QPixmap(filepath)
+                
+                if not pixmap.isNull():
+                    # Scale to fit while maintaining aspect ratio
+                    scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    image_label.setPixmap(scaled_pixmap)
+                else:
+                    image_label.setText(f"Failed to load image\n{filepath}")
+                
+                image_label.setAlignment(Qt.AlignCenter)
+                image_label.setCursor(Qt.PointingHandCursor)
+                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp: self._show_full_image(fp, ts)
+                
+                # Timestamp label
+                time_label = QLabel(f"Captured at: {time_str}")
+                time_label.setAlignment(Qt.AlignCenter)
+                
+                # Add to grid (2 columns)
+                grid_layout.addWidget(image_label, idx // 2 * 2, idx % 2)
+                grid_layout.addWidget(time_label, idx // 2 * 2 + 1, idx % 2)
+            
+            scroll_area.setWidget(grid_widget)
+            layout.addWidget(scroll_area)
+            
+            # Close button
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            layout.addWidget(close_button)
+            
+            dialog.exec()
+            
+        except Exception as e:
+            logger.error(f"Failed to show screenshots: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(
+                self,
+                'Error',
+                f"Failed to load screenshots: {str(e)}"
+            )
     
     def _create_menu_bar(self):
         """Create the application menu bar."""
@@ -247,9 +711,23 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self._on_stop_session)
         self.stop_button.setEnabled(False)
         
+        self.screenshot_button = QPushButton('Take Screenshot')
+        self.screenshot_button.setMinimumSize(150, 50)
+        self.screenshot_button.setFont(title_font)
+        self.screenshot_button.clicked.connect(self._on_take_screenshot)
+        self.screenshot_button.setEnabled(False)
+        
+        self.view_screenshots_button = QPushButton('View Screenshots')
+        self.view_screenshots_button.setMinimumSize(150, 50)
+        self.view_screenshots_button.setFont(title_font)
+        self.view_screenshots_button.clicked.connect(self._on_view_screenshots)
+        self.view_screenshots_button.setEnabled(False)
+        
         button_layout.addStretch()
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.screenshot_button)
+        button_layout.addWidget(self.view_screenshots_button)
         button_layout.addStretch()
         
         layout.addLayout(button_layout)
@@ -269,16 +747,18 @@ class MainWindow(QMainWindow):
         sessions_group = QGroupBox('Past Sessions')
         sessions_layout = QVBoxLayout()
         self.sessions_list = QTableWidget()
-        self.sessions_list.setColumnCount(3)
-        self.sessions_list.setHorizontalHeaderLabels(['Session Name', 'Transcription', 'Summary'])
+        self.sessions_list.setColumnCount(4)
+        self.sessions_list.setHorizontalHeaderLabels(['Session Name', 'Transcription', 'Summary', 'Actions'])
         self.sessions_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.sessions_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.sessions_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.sessions_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.sessions_list.setSelectionBehavior(QTableWidget.SelectRows)
         self.sessions_list.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.sessions_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sessions_list.customContextMenuRequested.connect(self._show_session_context_menu)
         self.sessions_list.cellChanged.connect(self._on_session_name_changed)
+        self.sessions_list.cellDoubleClicked.connect(self._on_session_double_clicked)
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
         layout.addWidget(sessions_group)
@@ -313,14 +793,20 @@ class MainWindow(QMainWindow):
         if active_session and active_session.status == 'active':
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
+            self.screenshot_button.setEnabled(True)
+            self.view_screenshots_button.setEnabled(True)
             self._is_recording = True
             self.session_name_input.setText(active_session.name)
         elif active_session and active_session.status == 'processing':
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+            self.screenshot_button.setEnabled(False)
+            self.view_screenshots_button.setEnabled(False)
         else:
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
+            self.screenshot_button.setEnabled(False)
+            self.view_screenshots_button.setEnabled(False)
             self._is_recording = False
     
     def _on_start_session(self):
@@ -344,22 +830,152 @@ class MainWindow(QMainWindow):
     def _on_stop_session(self):
         """Handle stop session button click."""
         try:
-            # Stop session without auto-transcribing (we'll do it manually to show status)
+            # Stop session without auto-transcribing (manual transcription only)
             session = self.session_manager.stop_session(auto_transcribe=False)
             
             # Update UI
-            self.start_button.setEnabled(False)
+            self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
+            self.screenshot_button.setEnabled(False)
             
-            # Process transcriptions in background
+            # Just show status - no automatic transcription/summarization
             if session:
-                # Run transcription in a timer to allow UI to update
-                QTimer.singleShot(100, lambda: self._process_transcription(session))
+                self._on_status_update(f"Session '{session.name}' saved. Use Transcribe button to process.")
+            
+            # Reload sessions to show the new session
+            self._load_past_sessions()
             
         except Exception as e:
             self._on_status_update(f'Failed to stop session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to stop session: {str(e)}')
             self._update_ui_state()
+    
+    def _on_take_screenshot(self):
+        """Handle take screenshot button click."""
+        try:
+            # Capture screenshot via session manager
+            screenshot_path = self.session_manager.capture_screenshot()
+            
+            if screenshot_path:
+                self._on_status_update(f'Screenshot saved: {screenshot_path}')
+                QMessageBox.information(
+                    self,
+                    'Screenshot Saved',
+                    f'Screenshot saved successfully.'
+                )
+            else:
+                self._on_status_update('Failed to capture screenshot', is_error=True)
+                QMessageBox.warning(self, 'Screenshot Failed', 'Failed to capture screenshot.')
+                
+        except Exception as e:
+            logger.error(f"Failed to take screenshot: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._on_status_update(f'Failed to take screenshot: {str(e)}', is_error=True)
+            QMessageBox.critical(self, 'Error', f'Failed to take screenshot: {str(e)}')
+    
+    def _on_view_screenshots(self):
+        """Handle view screenshots button click."""
+        try:
+            active_session = self.session_manager.get_active_session()
+            
+            if not active_session:
+                QMessageBox.information(
+                    self,
+                    'No Active Session',
+                    'There is no active session to view screenshots for.'
+                )
+                return
+            
+            session_id = active_session.id
+            
+            # Fetch screenshots from database
+            screenshots = self.session_manager.db.get_screenshots(session_id)
+            
+            if not screenshots:
+                QMessageBox.information(
+                    self,
+                    'No Screenshots',
+                    "No screenshots have been taken in this session yet."
+                )
+                return
+            
+            # Create a dialog to display the screenshots
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Screenshots - {active_session.name}")
+            dialog.setMinimumSize(800, 600)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header
+            header_label = QLabel(f"Screenshots for: {active_session.name}")
+            header_font = header_label.font()
+            header_font.setPointSize(14)
+            header_font.setBold(True)
+            header_label.setFont(header_font)
+            layout.addWidget(header_label)
+            
+            # Scroll area for screenshots
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            
+            # Grid layout for screenshots
+            grid_widget = QWidget()
+            grid_layout = QGridLayout(grid_widget)
+            grid_layout.setSpacing(10)
+            
+            # Add screenshots to the grid
+            from datetime import datetime
+            for idx, screenshot in enumerate(screenshots):
+                filepath = screenshot.get('filepath', '')
+                timestamp = screenshot.get('timestamp', 0)
+                
+                # Convert timestamp to readable format
+                dt = datetime.fromtimestamp(timestamp)
+                time_str = dt.strftime('%H:%M:%S')
+                
+                # Create label with image
+                image_label = QLabel()
+                pixmap = QPixmap(filepath)
+                
+                if not pixmap.isNull():
+                    # Scale to fit while maintaining aspect ratio
+                    scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    image_label.setPixmap(scaled_pixmap)
+                else:
+                    image_label.setText(f"Failed to load image\n{filepath}")
+                
+                image_label.setAlignment(Qt.AlignCenter)
+                image_label.setCursor(Qt.PointingHandCursor)
+                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp: self._show_full_image(fp, ts)
+                
+                # Timestamp label
+                time_label = QLabel(f"Captured at: {time_str}")
+                time_label.setAlignment(Qt.AlignCenter)
+                
+                # Add to grid (2 columns)
+                grid_layout.addWidget(image_label, idx // 2 * 2, idx % 2)
+                grid_layout.addWidget(time_label, idx // 2 * 2 + 1, idx % 2)
+            
+            scroll_area.setWidget(grid_widget)
+            layout.addWidget(scroll_area)
+            
+            # Close button
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            layout.addWidget(close_button)
+            
+            dialog.exec()
+            
+        except Exception as e:
+            logger.error(f"Failed to view screenshots: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(
+                self,
+                'Error',
+                f"Failed to view screenshots: {str(e)}"
+            )
     
     def _process_transcription(self, session):
         """Process transcriptions after session stops."""

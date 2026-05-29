@@ -136,6 +136,30 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Session listing failed: {str(e)}')
 
+    def get_screenshots(self, session_id: int) -> List[Dict[str, Any]]:
+        """Get all screenshots for a session.
+
+        Args:
+            session_id: ID of the session
+
+        Returns:
+            List of screenshot dictionaries sorted by timestamp
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT * FROM screenshots 
+                WHERE session_id = ?
+                ORDER BY timestamp ASC
+            ''', (session_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot retrieval failed: {str(e)}')
+
+
     def add_transcript(self, session_id: int, timestamp: datetime, text: str, source: str) -> int:
         """Add a transcript entry to the database.
         

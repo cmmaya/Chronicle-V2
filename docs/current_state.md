@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU014
-- Next BU: BU015
+- Current BU: BU020
+- Next BU: BU021
 
 ## Target Architecture
 
@@ -13,8 +13,9 @@ The current development effort is focused on building a UI for session managemen
 3.  Providing a UI to view summaries and screenshots.
 4.  Integrating existing backend functionality for screenshots and summarization with the UI.
 5.  Configuring the summarization agent to use a specific model and custom instructions.
+6.  Implementing a global hotkey for interactive screen capture.
 
-This work will be carried out in BUs 013-020.
+This work will be carried out in BUs 013-022.
 
 ## Completed BUs
 BU003 - Audio Recording
@@ -29,6 +30,12 @@ BU011 - Chunk-Based Transcription
 BU012 - Fix Transcription Pipeline to Use Real Speech-to-Text Model
 BU013 - Display Past Sessions in UI
 BU014 - Add Session Status to UI
+BU015 - Trigger Transcription from UI
+BU016 - Configure Summarization Agent
+BU017 - Trigger Summarization from UI
+BU018 - Display Summary in UI
+BU019 - Screenshot Button in UI
+BU020 - Display Screenshots in UI
 
 ## In Progress BUs
 None
@@ -90,3 +97,6 @@ None
 - UI now displays transcription and summarization status for each session
 - Status is updated in database after transcription/summary generation
 - Session list refreshes after processing to show updated status
+- Added Transcribe button to Actions column for untranscribed sessions
+- Button shows "Transcribing..." during processing and "Done" when complete
+- Summary display in separate window via double-click or context menu
