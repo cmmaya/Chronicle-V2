@@ -168,6 +168,26 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Screenshot retrieval failed: {str(e)}')
 
+    def update_screenshot_description(self, filepath: str, description: str) -> None:
+        """Update the description of a screenshot.
+
+        Args:
+            filepath: Path to the screenshot file
+            description: New description text
+
+        Raises:
+            DatabaseError: If update fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'UPDATE screenshots SET description = ? WHERE filepath = ?',
+                (description, filepath)
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot description update failed: {str(e)}')
+
 
     def add_transcript(self, session_id: int, timestamp: datetime, text: str, source: str) -> int:
         """Add a transcript entry to the database.

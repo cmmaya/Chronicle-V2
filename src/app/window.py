@@ -39,6 +39,47 @@ class MainWindow(QMainWindow):
         
         # Initialize session manager
         self._init_session_manager(sessions_path)
+
+    def eventFilter(self, obj, event):
+        """Filter events for editing screenshot descriptions."""
+        if event.type() == event.Type.MouseButtonDblClick:
+            # Check if it's a description label
+            if obj.objectName().startswith('desc_label_'):
+                filepath = obj.property('filepath')
+                session_id = obj.property('session_id')
+                if filepath and session_id:
+                    self._edit_screenshot_description(obj, filepath, session_id)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _edit_screenshot_description(self, label, filepath, session_id):
+        """Edit screenshot description with a dialog."""
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+
+        # Get current description
+        current_desc = label.property('description') or ''
+
+        text, ok = QInputDialog.getText(
+            self,
+            'Edit Description',
+            'Enter a description for this screenshot:',
+            QLineEdit.Normal,
+            current_desc
+        )
+
+        if ok and text is not None:
+            new_description = text.strip()
+            # Update in database
+            self.session_manager.db.update_screenshot_description(filepath, new_description)
+            # Update label
+            if new_description:
+                label.setText(f"Description: {new_description}")
+                label.setStyleSheet("color: black;")
+            else:
+                label.setText("<i>Double-click to add description</i>")
+                label.setStyleSheet("color: gray;")
+            label.setProperty('description', new_description)
+            self._on_status_update('Screenshot description updated')
         
     def _init_session_manager(self, sessions_path: str):
         """Initialize the session manager.
@@ -907,10 +948,10 @@ class MainWindow(QMainWindow):
         try:
             session_id = None
             session_name = None
-            
+
             # Check if there's an active session first
             active_session = self.session_manager.get_active_session()
-            
+
             if active_session:
                 session_id = active_session.id
                 session_name = active_session.name
@@ -920,7 +961,7 @@ class MainWindow(QMainWindow):
                 if sessions:
                     session_id = sessions[0]['id']
                     session_name = sessions[0]['name']
-            
+
             if not session_id:
                 QMessageBox.information(
                     self,
@@ -928,10 +969,10 @@ class MainWindow(QMainWindow):
                     'There are no sessions to view screenshots for.'
                 )
                 return
-            
+
             # Fetch screenshots from database
             screenshots = self.session_manager.db.get_screenshots(session_id)
-            
+
             if not screenshots:
                 QMessageBox.information(
                     self,
@@ -939,14 +980,14 @@ class MainWindow(QMainWindow):
                     "No screenshots have been taken in this session yet."
                 )
                 return
-            
+
             # Create a dialog to display the screenshots
             dialog = QDialog(self)
             dialog.setWindowTitle(f"Screenshots - {session_name}")
             dialog.setMinimumSize(800, 600)
-            
+
             layout = QVBoxLayout(dialog)
-            
+
             # Header
             header_label = QLabel(f"Screenshots for: {session_name}")
             header_font = header_label.font()
@@ -954,54 +995,79 @@ class MainWindow(QMainWindow):
             header_font.setBold(True)
             header_label.setFont(header_font)
             layout.addWidget(header_label)
-            
+
             # Scroll area for screenshots
             scroll_area = QScrollArea()
             scroll_area.setWidgetResizable(True)
-            
+
             # Grid layout for screenshots
             grid_widget = QWidget()
             grid_layout = QGridLayout(grid_widget)
             grid_layout.setSpacing(10)
-            
+
             # Add screenshots to the grid
             from datetime import datetime
             for idx, screenshot in enumerate(screenshots):
                 filepath = screenshot.get('filepath', '')
                 timestamp = screenshot.get('timestamp', 0)
-                
+                description = screenshot.get('description', '') or ''
+
                 # Convert timestamp to readable format
                 dt = datetime.fromtimestamp(timestamp)
                 time_str = dt.strftime('%H:%M:%S')
-                
+
                 # Create label with image
                 image_label = QLabel()
                 pixmap = QPixmap(filepath)
-                
+
                 if not pixmap.isNull():
                     # Scale to fit while maintaining aspect ratio
                     scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     image_label.setPixmap(scaled_pixmap)
                 else:
                     image_label.setText(f"Failed to load image\n{filepath}")
-                
+
                 image_label.setAlignment(Qt.AlignCenter)
                 image_label.setCursor(Qt.PointingHandCursor)
                 image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp: self._show_full_image(fp, ts)
-                
+
                 # Timestamp label
                 time_label = QLabel(f"Captured at: {time_str}")
                 time_label.setAlignment(Qt.AlignCenter)
-                
+
+                # Description label (editable with double click)
+                desc_label = QLabel()
+                if description:
+                    desc_label.setText(f"Description: {description}")
+                else:
+                    desc_label.setText("<i>Double-click to add description</i>")
+                    desc_label.setStyleSheet("color: gray;")
+                desc_label.setAlignment(Qt.AlignCenter)
+                desc_label.setTextInteractionFlags(Qt.NoTextInteraction)
+                desc_label.setCursor(Qt.PointingHandCursor)
+
+                # Store filepath for editing
+                desc_label.setProperty('filepath', filepath)
+                desc_label.setProperty('session_id', session_id)
+
+                # Install event filter for double-click
+                desc_label.installEventFilter(self)
+                desc_label.setObjectName(f"desc_label_{idx}")
+
                 # Add to grid (2 columns)
-                grid_layout.addWidget(image_label, idx // 2 * 2, idx % 2)
-                grid_layout.addWidget(time_label, idx // 2 * 2 + 1, idx % 2)
-            
+                grid_layout.addWidget(image_label, idx // 2 * 3, idx % 2)
+                grid_layout.addWidget(time_label, idx // 2 * 3 + 1, idx % 2)
+                grid_layout.addWidget(desc_label, idx // 2 * 3 + 2, idx % 2)
+
             scroll_area.setWidget(grid_widget)
             layout.addWidget(scroll_area)
-            
+
             # Close button
             close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            layout.addWidget(close_button)
+
+            dialog.exec()
             close_button.clicked.connect(dialog.close)
             layout.addWidget(close_button)
             
