@@ -312,8 +312,11 @@ class SessionManager:
         if not self.current_session:
             raise RuntimeError('No active session')
 
+        # Obtener el nombre de la sesión para el nombre del archivo
+        session_name = self.current_session.name
+
         output_path = self.current_session.screenshot_capture.capture_interactive_region(
-            label=label,
+            session_name=session_name,
             session_id=self.current_session.id
         )
 

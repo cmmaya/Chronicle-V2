@@ -886,12 +886,7 @@ class MainWindow(QMainWindow):
             self.raise_()
 
             if screenshot_path:
-                self._on_status_update(f'Screenshot saved: {screenshot_path}')
-                QMessageBox.information(
-                    self,
-                    'Screenshot Saved',
-                    f'Screenshot saved successfully.'
-                )
+                self._on_status_update(f'Screenshot saved')
             else:
                 self._on_status_update('Screenshot cancelled', is_error=False)
 

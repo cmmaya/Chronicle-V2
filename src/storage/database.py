@@ -67,6 +67,7 @@ class Database:
                     session_id INTEGER NOT NULL,
                     timestamp INTEGER NOT NULL,
                     filepath TEXT NOT NULL,
+                    description TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 )
             ''')
@@ -82,6 +83,14 @@ class Database:
                 )
             ''')
             self.connection.commit()
+
+            # Migración: agregar columna description a screenshots si no existe
+            try:
+                cursor.execute("ALTER TABLE screenshots ADD COLUMN description TEXT")
+                self.connection.commit()
+            except sqlite3.OperationalError:
+                pass  # La columna ya existe
+
         except sqlite3.Error as e:
             raise DatabaseError(f'Schema initialization failed: {str(e)}')
 

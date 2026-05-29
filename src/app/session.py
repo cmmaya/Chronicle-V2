@@ -183,7 +183,7 @@ class Session:
             self.start()
         
         output_path = self.screenshot_capture.capture_fullscreen(
-            label=label, 
+            session_name=self.name,
             session_id=self.id
         )
         
