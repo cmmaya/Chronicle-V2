@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QLabel, QStatusBar,
-                               QMessageBox)
+                               QMessageBox, QApplication, QListWidget, QGroupBox)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 import logging
@@ -47,13 +47,29 @@ class MainWindow(QMainWindow):
         try:
             self.session_manager = SessionManager(
                 base_path=sessions_path,
-                db_path='chronicle.db'
+                db_path='chronicle.db',
+                status_callback=self._on_status_update
             )
             self._update_ui_state()
+            self._load_past_sessions()
             self.status_label.setText('Ready')
         except Exception as e:
-            self.status_label.setText(f'Error: {str(e)}')
+            self._on_status_update(f'Failed to initialize: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to initialize: {str(e)}')
+    
+    def _load_past_sessions(self):
+        """Load and display past sessions from the database."""
+        try:
+            sessions = self.session_manager.db.list_sessions()
+            self.sessions_list.clear()
+            for session in sessions:
+                # Format: Session name - Date/Time
+                from datetime import datetime
+                start_time = datetime.fromtimestamp(session['start_time'])
+                display_text = f"{session['name']} - {start_time.strftime('%Y-%m-%d %H:%M')}"
+                self.sessions_list.addItem(display_text)
+        except Exception as e:
+            logger.warning(f"Failed to load past sessions: {str(e)}")
     
     def _create_menu_bar(self):
         """Create the application menu bar."""
@@ -153,6 +169,14 @@ class MainWindow(QMainWindow):
         self.status_label.setFont(status_font)
         layout.addWidget(self.status_label)
         
+        # Past Sessions list
+        sessions_group = QGroupBox('Past Sessions')
+        sessions_layout = QVBoxLayout()
+        self.sessions_list = QListWidget()
+        sessions_layout.addWidget(self.sessions_list)
+        sessions_group.setLayout(sessions_layout)
+        layout.addWidget(sessions_group)
+        
         # Spacer at bottom
         layout.addStretch()
     
@@ -161,7 +185,18 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('Ready')
-    
+
+    def _on_status_update(self, message: str, is_error: bool = False):
+        """Handle status updates from the session manager."""
+        print(f"[DEBUG] Status update: {message}")
+        self.status_label.setText(message)
+        self.status_bar.showMessage(message)
+        
+        if is_error:
+            self.status_label.setStyleSheet("color: red;")
+        else:
+            self.status_label.setStyleSheet("")
+
     def _update_ui_state(self):
         """Update UI based on current session state."""
         if self.session_manager is None:
@@ -173,20 +208,14 @@ class MainWindow(QMainWindow):
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
             self._is_recording = True
-            self.status_label.setText('Recording')
             self.session_name_input.setText(active_session.name)
         elif active_session and active_session.status == 'processing':
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-            self.status_label.setText('Transcribing...')
         else:
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self._is_recording = False
-            if active_session and active_session.status == 'completed':
-                self.status_label.setText('Completed')
-            else:
-                self.status_label.setText('Ready')
     
     def _on_start_session(self):
         """Handle start session button click."""
@@ -201,26 +230,20 @@ class MainWindow(QMainWindow):
             
             # Update UI
             self._update_ui_state()
-            self.status_bar.showMessage(f'Session started: {session_name}')
             
         except Exception as e:
+            self._on_status_update(f'Failed to start session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to start session: {str(e)}')
-            self.status_label.setText(f'Error: {str(e)}')
     
     def _on_stop_session(self):
         """Handle stop session button click."""
         try:
-            # Stop recording first
-            self.session_manager.stop_recording(label='main')
+            # Stop session without auto-transcribing (we'll do it manually to show status)
+            session = self.session_manager.stop_session(auto_transcribe=False)
             
-            # Stop session (this triggers transcription via the manager)
-            session = self.session_manager.stop_session()
-            
-            # Update UI to show processing
-            self.status_label.setText('Transcribing...')
+            # Update UI
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-            self.status_bar.showMessage('Processing transcriptions...')
             
             # Process transcriptions in background
             if session:
@@ -228,22 +251,27 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(100, lambda: self._process_transcription(session))
             
         except Exception as e:
+            self._on_status_update(f'Failed to stop session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to stop session: {str(e)}')
-            self.status_label.setText(f'Error: {str(e)}')
             self._update_ui_state()
     
     def _process_transcription(self, session):
         """Process transcriptions after session stops."""
+        print(f"[DEBUG] _process_transcription called with session: {session}")
         try:
+            # Show status before processing
+            self._on_status_update('Processing transcriptions...')
+            QApplication.processEvents()
+            print("[DEBUG] Set status to Processing transcriptions...")
+            
             results = self.session_manager.process_transcriptions(session)
             
             # Update UI
             self._update_ui_state()
-            self.status_bar.showMessage('Transcription completed')
             
             # Generate summary
-            self.status_label.setText('Generating summary...')
-            self.status_bar.showMessage('Generating summary...')
+            self._on_status_update('Generating summary...')
+            QApplication.processEvents()
             
             try:
                 # Get transcripts from database
@@ -291,8 +319,7 @@ class MainWindow(QMainWindow):
                 summary_content = None
             
             # Update status to show session finished
-            self.status_label.setText('Session complete')
-            self.status_bar.showMessage('Session complete')
+            self._on_status_update('Session complete')
             
             # Show completion message
             mic_count = len(results.get('microphone', []))
@@ -312,8 +339,6 @@ class MainWindow(QMainWindow):
                 'Session Complete',
                 msg
             )
-            
-            self.status_bar.showMessage('Session complete')
             
         except Exception as e:
             QMessageBox.warning(self, 'Warning', f'Transcription failed: {str(e)}')

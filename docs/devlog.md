@@ -241,3 +241,24 @@ Recovery Notes:
 - Ready for BU013 to implement temporal merge layer for transcripts
 - Application will now fail with clear error if STT model cannot be loaded
 - Users must install either parakeet-ctc or coqui-stt package and download model files
+
+---
+
+## BU013 - Display Past Sessions in UI
+
+Summary:
+Added a session list widget to the main window that displays all past sessions from the database. Each session entry shows the session name, timestamp, and status. The list is populated on application startup.
+
+Files Changed:
+- src/app/window.py (modified)
+
+Important Decisions:
+- Used QGroupBox to group the sessions list with a label
+- Used existing Database.list_sessions() method which was already implemented
+- Format: "Session name - YYYY-MM-DD HH:MM - status"
+- Sessions are sorted by start_time DESC (newest first) as per database query
+
+Recovery Notes:
+- Ready for BU014 to add session interaction (clicking, selecting)
+- No interaction functionality included per BU013 scope
+- Uses existing database method - no schema changes needed

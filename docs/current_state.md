@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: None
-- Next BU: BU013
+- Current BU: BU013
+- Next BU: BU014
 
 ## Target Architecture
 
@@ -27,6 +27,7 @@ BU009 - Chunked Audio Recording
 BU010 - System Audio Capture
 BU011 - Chunk-Based Transcription
 BU012 - Fix Transcription Pipeline to Use Real Speech-to-Text Model
+BU013 - Display Past Sessions in UI
 
 ## In Progress BUs
 None
@@ -80,3 +81,7 @@ None
 - start_polling() / stop_polling() for real-time chunk processing
 - Transcribe now raises ModelLoadError instead of fallback to mock
 - coqui-stt dependency added to requirements.txt
+- Implemented status callback system in SessionManager for real-time UI updates
+- Added _on_status_update in MainWindow to display status and errors
+- Centralized all status updates through the callback system
+- Session list UI added to MainWindow - displays past sessions with name, date, and status

@@ -4,7 +4,7 @@ description: Stateless reviewer for Builder Units (BU). Validates correctness, s
 model: openrouter/minimax/minimax-m2.1
 mode: primary
 temperature: 0.1
-maxSteps: 4
+maxSteps: 6
 tools:
   read: true
   bash: true
@@ -21,6 +21,7 @@ Never rely on chat history.
 Repository documentation is your ONLY source of truth.
 
 You DO NOT:
+
 - redesign architecture
 - request unrelated refactors
 - nitpick style
@@ -64,25 +65,30 @@ REVIEW PROCESS
 Validate:
 
 1. Scope
+
 - only requested scope implemented
 - Allowed Files respected
 - no future BU leakage
 
 2. Functionality
+
 - implementation works
 - validation requirements satisfied
 - Definition of Done completed
 
 3. Architecture
+
 - consistent with project_brief
 - no unnecessary abstractions
 - no architectural drift
 
 4. Reliability
+
 - no obvious regressions
 - acceptable failure handling
 
 5. Documentation
+
 - current_state updated
 - devlog appended
 
@@ -91,6 +97,7 @@ FINDING CLASSIFICATION
 ==================================================
 
 CRITICAL
+
 - broken functionality
 - Definition of Done failure
 - architecture violation
@@ -98,12 +105,14 @@ CRITICAL
 - out-of-scope modifications
 
 IMPORTANT
+
 - maintainability issues
 - unclear implementation
 - incomplete validation
 - weak edge handling
 
 OPTIONAL
+
 - readability improvements
 - small cleanup
 - non-essential polish
@@ -123,6 +132,7 @@ RESPONSE FORMAT
 ## Optional Improvements
 
 ## Final Recommendation
+
 - APPROVED
 - APPROVED WITH FIXES
 - REQUIRES CHANGES

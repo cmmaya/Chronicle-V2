@@ -24,15 +24,18 @@ class SessionManager:
     
     def __init__(self, 
                  base_path: str = 'sessions',
-                 db_path: str = 'chronicle.db'):
+                 db_path: str = 'chronicle.db',
+                 status_callback: Optional[callable] = None):
         """Initialize SessionManager.
         
         Args:
             base_path: Base directory for session data
             db_path: Path to SQLite database
+            status_callback: Optional callable for status updates
         """
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
+        self.status_callback = status_callback
         
         # Initialize database
         self.db = Database(db_path)
@@ -46,6 +49,16 @@ class SessionManager:
         self.dual_recorder_factory = DualSourceChunkedRecorder
         self.screenshot_capture_factory = ScreenshotCapture
         self.transcription_processor_factory = TranscriptionProcessor
+
+    def _update_status(self, message: str, is_error: bool = False):
+        """Update status via callback and log."""
+        if is_error:
+            logger.error(message)
+        else:
+            logger.info(message)
+        
+        if self.status_callback:
+            self.status_callback(message, is_error)
     
     def _get_session_path(self, session_id: int) -> Path:
         """Get path for a session directory.
@@ -97,7 +110,7 @@ class SessionManager:
         # Create timeline
         self.current_timeline = Timeline(session_id, now)
         
-        logger.info(f'Created session {session_id}: {name}')
+        self._update_status(f'Created session {session_id}: {name}')
         return session
     
     def load_session(self, session_id: int) -> Session:
@@ -143,7 +156,7 @@ class SessionManager:
         # Create timeline with session start time
         self.current_timeline = Timeline(session_id, session.start_time)
         
-        logger.info(f'Loaded session {session_id}: {session.name}')
+        self._update_status(f'Loaded session {session_id}: {session.name}')
         return session
     
     def start_session(self, name: str, auto_record: bool = True) -> Session:
@@ -164,7 +177,7 @@ class SessionManager:
         if auto_record:
             self.start_recording(label='main')
         
-        logger.info(f'Started session {session.id}: {session.name}')
+        self._update_status(f'Started session {session.id}: {session.name}')
         return session
     
     def stop_session(self, auto_transcribe: bool = True) -> Optional[Session]:
@@ -177,9 +190,10 @@ class SessionManager:
             The stopped session, or None if no active session
         """
         if not self.current_session:
-            logger.warning('No active session to stop')
+            self._update_status('No active session to stop', is_error=True)
             return None
         
+        self._update_status('Stopping session...')
         # Stop recording first
         self.stop_recording(label='main')
         
@@ -195,11 +209,13 @@ class SessionManager:
         # Auto-process transcriptions if enabled
         if auto_transcribe:
             try:
+                self._update_status('Processing transcriptions...')
                 session.process_transcriptions()
+                self._update_status('Transcription processing finished.')
             except Exception as e:
-                logger.error(f'Auto transcription failed: {str(e)}')
+                self._update_status(f'Auto transcription failed: {str(e)}', is_error=True)
         
-        logger.info(f'Stopped session {session.id}: {session.name}')
+        self._update_status(f'Stopped session {session.id}: {session.name}')
         return session
     
     def get_active_session(self) -> Optional[Session]:
@@ -239,6 +255,7 @@ class SessionManager:
         if self.current_timeline:
             self.current_timeline.add_audio_start(label)
         
+        self._update_status('Recording started...')
         return self.current_session.start_recording(label)
     
     def stop_recording(self, label: str = 'recording') -> Optional[str]:
@@ -252,6 +269,8 @@ class SessionManager:
         """
         if not self.current_session:
             return None
+        
+        self._update_status('Recording stopped.')
         
         output_path = self.current_session.stop_recording(label)
         
@@ -327,7 +346,7 @@ class SessionManager:
             session = self.load_session(session_id)
             return session.get_summary()
         except Exception as e:
-            logger.error(f'Failed to get session summary: {str(e)}')
+            self._update_status(f'Failed to get session summary: {str(e)}', is_error=True)
             return None
     
     def close(self) -> None:
@@ -338,7 +357,7 @@ class SessionManager:
         if self.db:
             self.db.disconnect()
         
-        logger.info('SessionManager closed')
+        self._update_status('SessionManager closed')
     
     def __enter__(self):
         return self

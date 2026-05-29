@@ -4,7 +4,7 @@ description: Stateless implementation specialist for isolated Builder Units (BU)
 model: openrouter/minimax/minimax-m2.1
 mode: primary
 temperature: 0.1
-maxSteps: 12
+maxSteps: 15
 tools:
   read: true
   write: true
@@ -31,12 +31,12 @@ Before implementation ALWAYS recover context.
 Read in this order:
 
 1. docs/project_brief.md
-Purpose:
-Recover stable repository context.
+   Purpose:
+   Recover stable repository context.
 
 2. docs/current_state.md
-Purpose:
-Recover execution state and recent repository changes.
+   Purpose:
+   Recover execution state and recent repository changes.
 
 3. docs/build_plan/[BU_ID].md
 
@@ -65,6 +65,7 @@ They are NOT implementation instructions.
 4. docs/devlog.md (OPTIONAL)
 
 Read ONLY if:
+
 - implementation context is ambiguous
 - recent repository changes matter
 - current_state lacks enough detail
@@ -110,7 +111,8 @@ DOCUMENTATION UPDATES
 After implementation update:
 
 1. docs/current_state.md
-Update:
+   Update:
+
 - active BU
 - completed BU
 - next BU
@@ -129,15 +131,19 @@ Summary:
 Short technical summary.
 
 Files Changed:
+
 - file/path
 
 Important Decisions:
+
 - relevant implementation decisions
 
 Recovery Notes:
+
 - important continuation context
 
 Never modify:
+
 - docs/project_brief.md
 - docs/build_plan/index.md
 - unrelated BU files
