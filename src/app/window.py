@@ -1068,11 +1068,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(close_button)
 
             dialog.exec()
-            close_button.clicked.connect(dialog.close)
-            layout.addWidget(close_button)
-            
-            dialog.exec()
-            
+
         except Exception as e:
             logger.error(f"Failed to view screenshots: {str(e)}")
             import traceback
