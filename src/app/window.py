@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QLabel, QStatusBar,
-                               QMessageBox, QApplication, QListWidget, QGroupBox)
+                               QMessageBox, QApplication, QListWidget, QGroupBox,
+                               QListWidgetItem, QMenu)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 import logging
@@ -63,13 +64,79 @@ class MainWindow(QMainWindow):
             sessions = self.session_manager.db.list_sessions()
             self.sessions_list.clear()
             for session in sessions:
-                # Format: Session name - Date/Time
-                from datetime import datetime
-                start_time = datetime.fromtimestamp(session['start_time'])
-                display_text = f"{session['name']} - {start_time.strftime('%Y-%m-%d %H:%M')}"
-                self.sessions_list.addItem(display_text)
+                item = QListWidgetItem(session['name'])
+                item.setData(Qt.UserRole, session['id'])
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+                self.sessions_list.addItem(item)
         except Exception as e:
             logger.warning(f"Failed to load past sessions: {str(e)}")
+    
+    def _on_session_name_changed(self, item):
+        """Handle the renaming of a session."""
+        try:
+            session_id = item.data(Qt.UserRole)
+            new_name = item.text()
+            
+            if session_id is None:
+                return
+            
+            # Update the database
+            self.session_manager.db.update_session(session_id, name=new_name)
+            
+            logger.info(f"Renamed session {session_id} to '{new_name}'")
+            self._on_status_update(f"Session renamed to '{new_name}'")
+            
+        except Exception as e:
+            logger.error(f"Failed to rename session: {str(e)}")
+            self._on_status_update(f"Error renaming session.", is_error=True)
+    
+    def _show_session_context_menu(self, position):
+        """Show a context menu for the right-clicked session item."""
+        item = self.sessions_list.itemAt(position)
+        
+        if not item:
+            return
+        
+        menu = QMenu()
+        delete_action = menu.addAction("Delete Session")
+        
+        chosen_action = menu.exec(self.sessions_list.mapToGlobal(position))
+        
+        if chosen_action == delete_action:
+            self._delete_session(item)
+    
+    def _delete_session(self, item):
+        """Delete the selected session after confirmation."""
+        try:
+            session_id = item.data(Qt.UserRole)
+            session_name = item.text()
+            
+            if session_id is None:
+                return
+            
+            reply = QMessageBox.question(
+                self,
+                'Delete Session',
+                f"Are you sure you want to permanently delete '{session_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Delete related data first (summaries, transcripts)
+                self.session_manager.db.delete_summaries(session_id)
+                self.session_manager.db.delete_transcripts(session_id)
+                # Delete the session itself
+                self.session_manager.db.delete_session(session_id)
+                self.sessions_list.takeItem(self.sessions_list.row(item))
+                
+                logger.info(f"Deleted session {session_id} ('{session_name}')")
+                self._on_status_update(f"Session '{session_name}' deleted.")
+                
+        except Exception as e:
+            logger.error(f"Failed to delete session: {str(e)}")
+            self._on_status_update(f"Error deleting session.", is_error=True)
+            QMessageBox.critical(self, 'Error', 'Could not delete the session from the database.')
     
     def _create_menu_bar(self):
         """Create the application menu bar."""
@@ -173,6 +240,9 @@ class MainWindow(QMainWindow):
         sessions_group = QGroupBox('Past Sessions')
         sessions_layout = QVBoxLayout()
         self.sessions_list = QListWidget()
+        self.sessions_list.itemChanged.connect(self._on_session_name_changed)
+        self.sessions_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.sessions_list.customContextMenuRequested.connect(self._show_session_context_menu)
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
         layout.addWidget(sessions_group)
