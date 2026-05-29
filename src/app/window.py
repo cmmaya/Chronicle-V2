@@ -806,7 +806,9 @@ class MainWindow(QMainWindow):
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.screenshot_button.setEnabled(False)
-            self.view_screenshots_button.setEnabled(False)
+            # Enable View Screenshots button if there are past sessions
+            sessions = self.session_manager.db.list_sessions()
+            self.view_screenshots_button.setEnabled(len(sessions) > 0)
             self._is_recording = False
     
     def _on_start_session(self):
@@ -853,9 +855,36 @@ class MainWindow(QMainWindow):
     def _on_take_screenshot(self):
         """Handle take screenshot button click."""
         try:
-            # Capture screenshot via session manager
-            screenshot_path = self.session_manager.capture_screenshot()
-            
+            # Minimizar la ventana antes de tomar la captura
+            self.showMinimized()
+
+            # Esperar a que la ventana se minimice completamente antes de mostrar el dialog
+            # Usar QTimer.singleShot para dar tiempo al sistema de minimizar
+            QTimer.singleShot(300, self._execute_screenshot_capture)
+
+        except Exception as e:
+            # Asegurar que la ventana se restaure en caso de error
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+
+            logger.error(f"Failed to take screenshot: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._on_status_update(f'Failed to take screenshot: {str(e)}', is_error=True)
+            QMessageBox.critical(self, 'Error', f'Failed to take screenshot: {str(e)}')
+
+    def _execute_screenshot_capture(self):
+        """Execute the screenshot capture after window is minimized."""
+        try:
+            # Capture screenshot via session manager (interactive region selection)
+            screenshot_path = self.session_manager.capture_interactive_region()
+
+            # Restaurar la ventana
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+
             if screenshot_path:
                 self._on_status_update(f'Screenshot saved: {screenshot_path}')
                 QMessageBox.information(
@@ -864,10 +893,14 @@ class MainWindow(QMainWindow):
                     f'Screenshot saved successfully.'
                 )
             else:
-                self._on_status_update('Failed to capture screenshot', is_error=True)
-                QMessageBox.warning(self, 'Screenshot Failed', 'Failed to capture screenshot.')
-                
+                self._on_status_update('Screenshot cancelled', is_error=False)
+
         except Exception as e:
+            # Asegurar que la ventana se restaure en caso de error
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+
             logger.error(f"Failed to take screenshot: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
@@ -877,17 +910,29 @@ class MainWindow(QMainWindow):
     def _on_view_screenshots(self):
         """Handle view screenshots button click."""
         try:
+            session_id = None
+            session_name = None
+            
+            # Check if there's an active session first
             active_session = self.session_manager.get_active_session()
             
-            if not active_session:
+            if active_session:
+                session_id = active_session.id
+                session_name = active_session.name
+            else:
+                # Get the most recent session from the list
+                sessions = self.session_manager.db.list_sessions()
+                if sessions:
+                    session_id = sessions[0]['id']
+                    session_name = sessions[0]['name']
+            
+            if not session_id:
                 QMessageBox.information(
                     self,
-                    'No Active Session',
-                    'There is no active session to view screenshots for.'
+                    'No Sessions',
+                    'There are no sessions to view screenshots for.'
                 )
                 return
-            
-            session_id = active_session.id
             
             # Fetch screenshots from database
             screenshots = self.session_manager.db.get_screenshots(session_id)
@@ -902,13 +947,13 @@ class MainWindow(QMainWindow):
             
             # Create a dialog to display the screenshots
             dialog = QDialog(self)
-            dialog.setWindowTitle(f"Screenshots - {active_session.name}")
+            dialog.setWindowTitle(f"Screenshots - {session_name}")
             dialog.setMinimumSize(800, 600)
             
             layout = QVBoxLayout(dialog)
             
             # Header
-            header_label = QLabel(f"Screenshots for: {active_session.name}")
+            header_label = QLabel(f"Screenshots for: {session_name}")
             header_font = header_label.font()
             header_font.setPointSize(14)
             header_font.setBold(True)

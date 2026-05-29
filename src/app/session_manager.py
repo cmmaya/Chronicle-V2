@@ -299,7 +299,30 @@ class SessionManager:
             self.current_timeline.add_screenshot(output_path, label)
         
         return output_path
-    
+
+    def capture_interactive_region(self, label: str = 'region') -> Optional[str]:
+        """Capture an interactive region screenshot in the current session.
+
+        Args:
+            label: Screenshot label
+
+        Returns:
+            Path to saved screenshot, or None if cancelled
+        """
+        if not self.current_session:
+            raise RuntimeError('No active session')
+
+        output_path = self.current_session.screenshot_capture.capture_interactive_region(
+            label=label,
+            session_id=self.current_session.id
+        )
+
+        # Track in timeline
+        if output_path and self.current_timeline:
+            self.current_timeline.add_screenshot(output_path, label)
+
+        return output_path
+
     def process_transcriptions(self, session=None) -> Dict[str, List[Dict[str, Any]]]:
         """Process transcriptions for a session.
         
