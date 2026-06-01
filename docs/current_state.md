@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU020
-- Next BU: BU021
+- Current BU: BU023
+- Next BU: BU024
 
 ## Target Architecture
 
@@ -36,6 +36,7 @@ BU017 - Trigger Summarization from UI
 BU018 - Display Summary in UI
 BU019 - Screenshot Button in UI
 BU020 - Display Screenshots in UI
+BU023 - Implement Overlapping Audio Chunking
 
 ## In Progress BUs
 None

@@ -10,3 +10,6 @@
 | BU020 | Display Screenshots in UI | Pending | BU019 | --- |
 | BU021 | Add Global Hotkey Library | Pending | BU019 | BU022 |
 | BU022 | Integrate Global Hotkey for Interactive Snipping | Pending | BU021 | BU020 |
+| BU023 | Implement Overlapping Audio Chunking | Pending | --- | BU024 |
+| BU024 | Add Transcription Deduplication and Context | Pending | BU023 | BU025 |
+| BU025 | Integrate WebRTC VAD | Pending | BU023 | --- |

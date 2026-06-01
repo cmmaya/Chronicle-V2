@@ -391,3 +391,25 @@ Important Decisions:
 
 Recovery Notes:
 - Ready for BU021 for additional UI features
+
+---
+
+## BU023 - Implement Overlapping Audio Chunking
+
+Summary:
+Modified the AudioRecorder to save audio in continuous, overlapping chunks to prevent word loss at boundaries. The recorder now maintains a circular buffer and saves 10-second chunks every 9 seconds, creating a 1-second overlap between consecutive chunks.
+
+Files Changed:
+- src/audio/recorder.py
+
+Important Decisions:
+- Used deque as circular buffer to hold last 11 seconds of audio
+- Chunk saving runs in a background thread that wakes every 9 seconds
+- Supports both microphone (sounddevice) and system audio (parec) recording modes
+- Legacy complete recording file only saved for sounddevice path (not for parec)
+- Chunk filenames include timestamp and chunk index: `YYYYMMDD_HHMMSS_chunk_XXXX.wav`
+
+Recovery Notes:
+- Ready for BU024 to handle deduplication of overlapping transcriptions
+- Chunks are saved to `session_path/audio/<source>/` directory
+- Total chunks logged after recording stops
