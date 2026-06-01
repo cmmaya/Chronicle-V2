@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRect, QPoint
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication, QCursor, QImage
 from PySide6.QtWidgets import QDialog, QRubberBand
 
@@ -53,9 +53,11 @@ class SnippingOverlay(QDialog):
         self.rubber_band = None
         self.selection_rect = QRect()
 
+        # Window flags para pantalla completa sin bordes
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
+            | Qt.Tool
         )
 
         # Hacer el dialog modal para que bloquee hasta que el usuario seleccione
@@ -68,8 +70,9 @@ class SnippingOverlay(QDialog):
         self.setGeometry(self.screen_geometry)
 
     def showEvent(self, event):
-        """Override para asegurar que el dialog se muestre correctamente."""
+        """Override para asegurar que el dialog se muestre en pantalla completa."""
         super().showEvent(event)
+        self.showFullScreen()
         self.activateWindow()
         self.raise_()
 
@@ -128,7 +131,7 @@ class SnippingOverlay(QDialog):
             if selection_rect.width() > 5 and selection_rect.height() > 5:
                 # Convertir coordenadas lógicas a coordenadas de imagen real
                 image_rect = self.logical_to_image_rect(selection_rect)
-                self.on_region_selected(image_rect, self.output_dir)
+                self.on_region_selected(image_rect, self.full_image, self.output_dir)
 
             self.accept()  # Cerrar el dialog
 

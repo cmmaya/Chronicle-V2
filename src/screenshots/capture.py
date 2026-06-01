@@ -115,23 +115,10 @@ class ScreenshotCapture:
         """
         result = {}
 
-        def on_region_selected(image_rect: QRect, output_dir: Path):
+        def on_region_selected(image_rect: QRect, full_image: 'QImage', output_dir: Path):
             """Callback que se ejecuta cuando el usuario selecciona una región."""
             try:
-                # Obtener la pantalla actual
-                screen = QGuiApplication.screenAt(QCursor.pos())
-
-                if screen is None:
-                    screen = QGuiApplication.primaryScreen()
-
-                # Capturar pantalla completa
-                pixmap = screen.grabWindow(0)
-
-                # Convertir a QImage y neutralizar DPR
-                full_image = pixmap.toImage()
-                full_image.setDevicePixelRatio(1)
-
-                # Recortar la región seleccionada
+                # Recortar la región seleccionada de la imagen original
                 cropped = full_image.copy(image_rect)
 
                 # Generar nombre de archivo con session_name + timestamp

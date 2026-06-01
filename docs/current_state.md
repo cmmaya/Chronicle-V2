@@ -99,4 +99,4 @@ None
 - Session list refreshes after processing to show updated status
 - Added Transcribe button to Actions column for untranscribed sessions
 - Button shows "Transcribing..." during processing and "Done" when complete
-- Summary display in separate window via double-click or context menu
+- Summary display via context menu or Actions dropdown when session has summary

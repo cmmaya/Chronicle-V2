@@ -142,10 +142,14 @@ class MainWindow(QMainWindow):
                 if trans_status == 'transcribed' and sum_status in (None, 'none'):
                     action_combo.addItem("Summarize", "summarize")
                 
+                # Add view summary option only if summary exists
+                if sum_status == 'summarized':
+                    action_combo.addItem("View Summary", "view_summary")
+                
                 # Set current index based on status
                 if trans_status == 'transcribed' and sum_status == 'summarized':
-                    action_combo.setCurrentIndex(1)  # Select "Done" or adjust
-                    action_combo.setEnabled(False)
+                    action_combo.setCurrentIndex(0)  # Keep "Select Action" visible, show options on dropdown
+                    action_combo.setEnabled(True)
                 elif trans_status == 'transcribed' and sum_status in (None, 'none'):
                     # Has transcribe option at index 1, summarize at index 2
                     action_combo.setCurrentIndex(0)
@@ -200,6 +204,13 @@ class MainWindow(QMainWindow):
             # Disable the combo to prevent multiple clicks
             combo.setEnabled(False)
             self._on_summarize_clicked(session_id, combo)
+        elif action == "view_summary":
+            # Find the row for this session_id and show summary
+            for r in range(self.sessions_list.rowCount()):
+                item = self.sessions_list.item(r, 0)
+                if item and item.data(Qt.UserRole) == session_id:
+                    self._show_session_summary(r)
+                    break
     
     def _on_transcribe_clicked(self, session_id: int, combo: QComboBox):
         """Handle the transcribe action for a session."""
@@ -799,7 +810,6 @@ class MainWindow(QMainWindow):
         self.sessions_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sessions_list.customContextMenuRequested.connect(self._show_session_context_menu)
         self.sessions_list.cellChanged.connect(self._on_session_name_changed)
-        self.sessions_list.cellDoubleClicked.connect(self._on_session_double_clicked)
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
         layout.addWidget(sessions_group)
