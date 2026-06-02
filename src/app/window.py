@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHBoxLayout, QPushButton, QLabel, QStatusBar,
                                 QMessageBox, QApplication, QListWidget, QGroupBox,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
-                                QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, QGridLayout)
+                                QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, QGridLayout, QSlider, QDialogButtonBox)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QPixmap
 import logging
@@ -31,6 +31,10 @@ class MainWindow(QMainWindow):
         
         # UI state
         self._is_recording = False
+        
+        # VAD settings
+        self._vad_threshold = 30  # Default 30%
+        self._vad_aggressiveness = 2  # Default mode 2
         
         # Create UI components
         self._create_menu_bar()
@@ -705,6 +709,13 @@ class MainWindow(QMainWindow):
         stop_action.triggered.connect(self._on_stop_session)
         session_menu.addAction(stop_action)
         
+        settings_menu = menu_bar.addMenu('Settings')
+        
+        # VAD settings action
+        vad_action = QAction('VAD Settings...', self)
+        vad_action.triggered.connect(self._show_vad_settings)
+        settings_menu.addAction(vad_action)
+        
         help_menu = menu_bar.addMenu('Help')
         
         # About action
@@ -1193,6 +1204,88 @@ class MainWindow(QMainWindow):
             'Meeting capture and transcription tool.\n\n'
             'Captures audio, screenshots, and generates summaries.'
         )
+    
+    def _show_vad_settings(self):
+        """Show VAD settings dialog."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle('VAD Settings')
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Threshold slider
+        threshold_label = QLabel('Speech Threshold:')
+        layout.addWidget(threshold_label)
+        
+        threshold_layout = QHBoxLayout()
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setMinimum(5)
+        self.threshold_slider.setMaximum(100)
+        self.threshold_slider.setValue(self._vad_threshold)
+        self.threshold_value_label = QLabel(f'{self._vad_threshold}%')
+        threshold_layout.addWidget(self.threshold_slider)
+        threshold_layout.addWidget(self.threshold_value_label)
+        layout.addLayout(threshold_layout)
+        
+        # Update label when slider moves
+        self.threshold_slider.valueChanged.connect(
+            lambda v: self.threshold_value_label.setText(f'{v}%')
+        )
+        
+        # Description
+        desc_label = QLabel(
+            'Minimum percentage of audio frames that must contain\n'
+            'speech for the chunk to be saved. Lower values = more\n'
+            'sensitive to short utterances.'
+        )
+        desc_label.setStyleSheet('color: gray; font-size: 10pt;')
+        layout.addWidget(desc_label)
+        
+        # Aggressiveness slider
+        agg_label = QLabel('Aggressiveness:')
+        layout.addWidget(agg_label)
+        
+        agg_layout = QHBoxLayout()
+        self.agg_slider = QSlider(Qt.Horizontal)
+        self.agg_slider.setMinimum(0)
+        self.agg_slider.setMaximum(3)
+        self.agg_slider.setValue(self._vad_aggressiveness)
+        self.agg_value_label = QLabel(f'Mode {self._vad_aggressiveness}')
+        agg_layout.addWidget(self.agg_slider)
+        agg_layout.addWidget(self.agg_value_label)
+        layout.addLayout(agg_layout)
+        
+        # Update label when slider moves
+        self.agg_slider.valueChanged.connect(
+            lambda v: self.agg_value_label.setText(f'Mode {v}')
+        )
+        
+        # Description
+        agg_desc_label = QLabel(
+            'VAD aggressiveness: 0=least filtering, 3=most aggressive.\n'
+            'Use higher modes in noisy environments.'
+        )
+        agg_desc_label.setStyleSheet('color: gray; font-size: 10pt;')
+        layout.addWidget(agg_desc_label)
+        
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec():
+            self._vad_threshold = self.threshold_slider.value()
+            self._vad_aggressiveness = self.agg_slider.value()
+            
+            # Update SessionManager with new VAD settings
+            if self.session_manager:
+                self.session_manager.vad_threshold = self._vad_threshold / 100.0
+                self.session_manager.vad_aggressiveness = self._vad_aggressiveness
+            
+            self._on_status_update(f'VAD settings updated: {self._vad_threshold}% threshold, Mode {self._vad_aggressiveness}')
     
     def closeEvent(self, event):
         """Handle window close event."""

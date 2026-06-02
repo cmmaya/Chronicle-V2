@@ -271,42 +271,122 @@ class TranscriptionProcessor:
         prev_words = self._last_transcript.split()
         new_words = new_text.split()
         
-        if len(prev_words) < 3 or len(new_words) < 3:
+        # Require at least 2 words in both for meaningful deduplication
+        if len(prev_words) < 2 or len(new_words) < 2:
             logger.debug(f"Deduplication skipped: prev_words={len(prev_words)}, new_words={len(new_words)}")
             return new_text
         
-        # Try to find overlap starting from longer phrases to shorter
-        # Check last 8, 6, 4, 3 words of previous transcript
-        for num_words in [min(8, len(prev_words)), min(6, len(prev_words)), 
-                          min(4, len(prev_words)), 3]:
-            # Get last N words from previous
-            phrase = ' '.join(prev_words[-num_words:]).lower()
-            
-            # Check if new text starts with similar phrase
-            new_lower = new_text.lower().strip()
-            
-            # Find this phrase in the beginning of new text
-            idx = new_lower.find(phrase)
-            if idx == 0:
-                # Found exact match at start - remove it
-                result_words = new_words[num_words:]
-                result = ' '.join(result_words)
-                logger.info(f"Deduplication: removed {num_words} words overlap. Before: {len(new_words)} words, After: {len(result_words)} words")
+        # Common small words that might be added at chunk boundaries
+        prefix_words = {'and', 'but', 'so', 'the', 'a', 'an', 'to', 'of', 'in', 'for', 'is', 'it', 'that', 'this', 'with', 'as'}
+        
+        new_lower = new_text.lower().strip()
+        
+        # Strategy 1: Direct match at start (no prefix)
+        result = self._try_match_at_start(prev_words, new_words, new_lower, allow_prefix=False)
+        if result is not None:
+            return result
+        
+        # Strategy 2: Try with potential prefix words (e.g., "and good enough")
+        if new_words[0].lower() in prefix_words:
+            result = self._try_match_at_start(prev_words, new_words, new_lower, allow_prefix=True)
+            if result is not None:
                 return result
-            
-            # Check for partial match (whitespace variations)
-            phrase_words = phrase.split()
-            if len(phrase_words) >= 3:
-                # Check if first 3+ words match
-                new_start = ' '.join(new_words[:num_words]).lower()
-                if self._words_similar(phrase, new_start):
-                    result_words = new_words[num_words:]
-                    result = ' '.join(result_words)
-                    logger.info(f"Deduplication: removed {num_words} words (partial match). Before: {len(new_words)} words, After: {len(result_words)} words")
-                    return result
+        
+        # Strategy 3: Fuzzy match anywhere in the text (for non-contiguous overlaps)
+        result = self._try_fuzzy_match(prev_words, new_words)
+        if result is not None:
+            return result
         
         logger.debug(f"No overlap detected between transcripts")
         return new_text
+    
+    def _try_match_at_start(self, prev_words: list, new_words: list, new_lower: str, allow_prefix: bool) -> Optional[str]:
+        """Try to find overlap at the start of new text.
+        
+        Args:
+            prev_words: Words from previous transcript
+            new_words: Words from new transcript  
+            new_lower: Lowercased new text
+            allow_prefix: If True, skip first word of new if it's a small word
+            
+        Returns:
+            Deduplicated text if overlap found, None otherwise
+        """
+        prefix_words = {'and', 'but', 'so', 'the', 'a', 'an', 'to', 'of', 'in', 'for', 'is', 'it', 'that', 'this', 'with', 'as'}
+        
+        # Check from longer phrases down to 2 words
+        for num_words in [min(8, len(prev_words)), min(6, len(prev_words)), 
+                          min(4, len(prev_words)), 3, 2]:
+            # Get last N words from previous
+            prev_phrase = ' '.join(prev_words[-num_words:]).lower()
+            prev_phrase = prev_phrase.rstrip('.,!?')
+            
+            # Direct match
+            idx = new_lower.find(prev_phrase)
+            if idx == 0:
+                result_words = new_words[num_words:]
+                result = ' '.join(result_words)
+                logger.info(f"Deduplication: removed {num_words} words (exact). Before: {len(new_words)} words, After: {len(result_words)} words")
+                return result
+            
+            # If allow_prefix, try skipping first word
+            if allow_prefix and len(new_words) > 1 and new_words[0].lower() in prefix_words:
+                new_without_prefix = ' '.join(new_words[1:]).lower()
+                idx = new_without_prefix.find(prev_phrase)
+                if idx == 0:
+                    result_words = new_words[1 + num_words:]
+                    result = ' '.join(result_words)
+                    logger.info(f"Deduplication: removed {num_words} words (with prefix). Before: {len(new_words)} words, After: {len(result_words)} words")
+                    return result
+        
+        return None
+    
+    def _try_fuzzy_match(self, prev_words: list, new_words: list) -> Optional[str]:
+        """Try to find overlapping text anywhere in the new transcript.
+        
+        Looks for any sequence of 2+ consecutive words from previous transcript
+        that appears anywhere in the new transcript.
+        
+        Args:
+            prev_words: Words from previous transcript
+            new_words: Words from new transcript
+            
+        Returns:
+            Deduplicated text if overlap found, None otherwise
+        """
+        prev_str = ' '.join(prev_words).lower()
+        new_str = ' '.join(new_words).lower()
+        
+        # Try phrases of different lengths (longer first)
+        for num_words in [min(6, len(prev_words)), min(5, len(prev_words)), 
+                          min(4, len(prev_words)), 3, 2]:
+            if num_words < 2:
+                continue
+                
+            # Check each position in prev_words
+            for start_idx in range(len(prev_words) - num_words + 1):
+                phrase = ' '.join(prev_words[start_idx:start_idx + num_words]).lower()
+                phrase = phrase.rstrip('.,!?')
+                
+                if not phrase:
+                    continue
+                    
+                # Find this phrase in new text
+                idx = new_str.find(phrase)
+                if idx >= 0:
+                    # Found overlap - remove it
+                    # Count words before the match
+                    words_before = new_str[:idx].split()
+                    
+                    # Remove the overlapping phrase
+                    phrase_word_count = len(phrase.split())
+                    result_words = words_before + new_words[len(words_before) + phrase_word_count:]
+                    result = ' '.join(result_words)
+                    
+                    logger.info(f"Deduplication: removed fuzzy overlap ({num_words} words). Before: {len(new_words)} words, After: {len(result_words)} words")
+                    return result
+        
+        return None
     
     def _words_similar(self, phrase1: str, phrase2: str, threshold: float = 0.7) -> bool:
         """Check if two phrases are similar (70%+ word overlap).

@@ -49,6 +49,10 @@ class SessionManager:
         self.dual_recorder_factory = DualSourceChunkedRecorder
         self.screenshot_capture_factory = ScreenshotCapture
         self.transcription_processor_factory = TranscriptionProcessor
+        
+        # VAD settings
+        self.vad_threshold = 0.30  # 30% of frames must have speech
+        self.vad_aggressiveness = 2  # VAD mode (0-3)
 
     def _update_status(self, message: str, is_error: bool = False):
         """Update status via callback and log."""
@@ -97,7 +101,11 @@ class SessionManager:
         )
         
         # Initialize components
-        session.dual_recorder = self.dual_recorder_factory(str(session_path))
+        session.dual_recorder = self.dual_recorder_factory(
+            str(session_path),
+            vad_aggressiveness=self.vad_aggressiveness,
+            vad_threshold=self.vad_threshold
+        )
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path), 
             db=self.db
@@ -143,7 +151,11 @@ class SessionManager:
             session.end_time = datetime.fromtimestamp(db_session['end_time'])
         
         # Initialize components
-        session.dual_recorder = self.dual_recorder_factory(str(session_path))
+        session.dual_recorder = self.dual_recorder_factory(
+            str(session_path),
+            vad_aggressiveness=self.vad_aggressiveness,
+            vad_threshold=self.vad_threshold
+        )
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path),
             db=self.db

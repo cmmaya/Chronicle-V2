@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU025
-- Next BU: BU026
+- Current BU: BU027
+- Next BU: BU028
 
 ## Target Architecture
 
@@ -41,6 +41,7 @@ BU022 - Session Deletion
 BU023 - Overlapping Audio Chunking
 BU024 - Transcription Deduplication and Context
 BU025 - Mono Recording
+BU026 - VAD Integration
 
 ## In Progress BUs
 None
@@ -105,3 +106,12 @@ None
 - Added Transcribe button to Actions column for untranscribed sessions
 - Button shows "Transcribing..." during processing and "Done" when complete
 - Summary display via context menu or Actions dropdown when session has summary
+- WebRTC VAD integrated into ChunkedAudioRecorder for speech detection
+- Silent audio chunks are discarded before saving
+- VAD checks audio at 16kHz with 30ms frames
+- Configurable VAD aggressiveness (default mode 2)
+- VAD settings UI added (Settings > VAD Settings) - threshold % and aggressiveness mode
+- Rolling context of last 5 transcriptions maintained for improved accuracy
+- Context passed as initial_prompt to transcription engine
+- Duplicate text removal at chunk boundaries using overlap detection
+- _deduplicate_transcription() removes repeated phrases between consecutive chunks

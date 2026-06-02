@@ -394,3 +394,21 @@ class Database:
             self.connection.commit()
         except sqlite3.Error as e:
             raise DatabaseError(f'Summary deletion failed: {str(e)}')
+
+    def reset_database(self) -> None:
+        """Delete all data from all tables but keep the schema.
+        
+        Useful for testing or starting fresh.
+        
+        Raises:
+            DatabaseError: If reset fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM transcripts')
+            cursor.execute('DELETE FROM screenshots')
+            cursor.execute('DELETE FROM summaries')
+            cursor.execute('DELETE FROM sessions')
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Database reset failed: {str(e)}')

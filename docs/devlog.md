@@ -1,4 +1,5 @@
 # BU003 Implementation Summary (Completed)
+
 - Created audio directory structure
 - Implemented AudioRecorder class with start/stop methods
 - Added device enumeration and selection functionality
@@ -12,6 +13,7 @@
 - Implemented system audio capture using PulseAudio monitor sources
 
 # Key Accomplishments
+
 - Microphone recording functional
 - System audio capture using PulseAudio monitor sources
 - Session folder integration
@@ -19,17 +21,20 @@
 - Clear error handling
 
 # Future Improvements
+
 - Integration with session manager from BU002
 - More sophisticated device selection UI
 - Additional audio formats support
 
 # Environment:
+
 - Python 3.12.3
 - Virtual environment with sounddevice and numpy installed
 - PortAudio library installed
 - Documentation updated to reflect current status
 
 # BU004 Implementation Summary (Completed)
+
 - Created screenshots directory structure
 - Implemented ScreenshotCapture class with full screen and region capture methods
 - Created SnippingOverlay widget for interactive drag-select region snipping
@@ -41,6 +46,7 @@
 - Added mss dependency to requirements.txt
 
 # Key Accomplishments
+
 - Full screen capture verified working
 - Region capture functional via coordinate API
 - Interactive snipping overlay with rubber band selection
@@ -48,11 +54,13 @@
 - Consistent with AudioRecorder patterns (session_path, logging, error handling)
 
 # Future Improvements
+
 - Integration with session manager from BU006 for dynamic session_id
 - Thumbnail generation for screenshot gallery
 - Multi-monitor support improvement
 
 # Environment:
+
 - mss 10.2.0 installed
 - Test screenshots saved to /tmp/sessions/session_001/screenshots/
 - All existing dependencies preserved
@@ -65,12 +73,15 @@ Summary:
 Added `get_start_time()` and `get_elapsed_time()` methods to AudioRecorder class for timestamp synchronization with transcription and screenshots.
 
 Files Changed:
+
 - src/audio/recorder.py
 
 Important Decisions:
+
 - Added both absolute timestamp (get_start_time) and relative elapsed time (get_elapsed_time) methods to support different synchronization use cases
 
 Recovery Notes:
+
 - Methods enable transcription sync per architecture principle: "Timestamp synchronization between transcript and screenshots"
 
 ---
@@ -81,20 +92,23 @@ Summary:
 Implemented audio transcription using Parakeet V3 for both microphone and system audio streams. Created transcription directory structure with ParakeetV3 engine wrapper and TranscriptionProcessor workflow class.
 
 Files Changed:
-- src/transcription/__init__.py
+
+- src/transcription/**init**.py
 - src/transcription/parakeet.py
 - src/transcription/processor.py
 - src/storage/database.py (added transcript methods)
 - requirements.txt (added parakeet-ctc==0.0.3)
 
 Important Decisions:
+
 - Mock mode fallback when no Parakeet model is available (allows testing without heavy model download)
 - Audio preprocessing handles WAV loading, mono/stereo conversion, and resampling to 16kHz
 - Timestamp extracted from audio filename (YYYYMMDD_HHMMSS format)
-- Source detection based on filename pattern (_system suffix)
+- Source detection based on filename pattern (\_system suffix)
 - Database stores transcripts with session_id, timestamp, text, and source fields
 
 Recovery Notes:
+
 - TranscriptionProcessor integrates with existing AudioRecorder file format (WAV, 44100Hz, 16-bit)
 - Ready for BU006 integration with session manager
 - Mock mode enables development testing before model installation
@@ -107,19 +121,22 @@ Summary:
 Implemented session lifecycle management integrating recording, screenshots, and transcription into cohesive meeting sessions. Created Session class for meeting lifecycle, SessionManager for coordination, and Timeline for timestamp synchronization.
 
 Files Changed:
+
 - src/app/session.py (new)
 - src/app/session_manager.py (new)
 - src/app/timeline.py (new)
-- src/app/__init__.py (updated exports)
+- src/app/**init**.py (updated exports)
 - docs/current_state.md (updated status)
 
 Important Decisions:
+
 - Session manages lifecycle states: active, paused, stopped, processing, completed
 - SessionManager wires together AudioRecorder, ScreenshotCapture, TranscriptionProcessor
 - Timeline provides timestamp correlation across components
 - All components use consistent session_path pattern for file organization
 
 Recovery Notes:
+
 - Ready for BU007 integration with UI
 - All components now coordinate through SessionManager
 - Timeline enables per-architecture: "Timestamp synchronization between transcript and screenshots"
@@ -132,13 +149,15 @@ Summary:
 Implemented meeting summary generation using OpenRouter API with Gemini Flash and DeepSeek models. Created SummaryGenerator class with template-based summarization supporting key points, action items, decisions, and comprehensive summaries.
 
 Files Changed:
-- src/summarization/__init__.py (new)
+
+- src/summarization/**init**.py (new)
 - src/summarization/templates.py (new)
 - src/summarization/generator.py (new)
 - src/storage/database.py (added summaries table and methods)
 - requirements.txt (added requests>=2.31.0)
 
 Important Decisions:
+
 - Template-based approach with 4 template types for flexible summary generation
 - Lazy import of requests library to handle missing dependency gracefully
 - Default to Gemini Flash 2.0 model, with DeepSeek alternatives available
@@ -146,6 +165,7 @@ Important Decisions:
 - All template types can be generated in one call via generate_all()
 
 Recovery Notes:
+
 - Ready for BU008 integration with Notion sync
 - API key required for OpenRouter (set via SummaryGenerator constructor)
 - Mock mode could be added for testing without API key
@@ -158,17 +178,20 @@ Summary:
 Implemented chunked audio recording with 10-second WAV chunks and metadata. Created AudioChunk dataclass for metadata management and ChunkedAudioRecorder class for continuous chunked capture. DualSourceChunkedRecorder coordinates simultaneous mic/system recording.
 
 Files Changed:
-- src/audio_capture/__init__.py (new)
+
+- src/audio_capture/**init**.py (new)
 - src/audio_capture/core.py (new)
 - src/audio_capture/chunk.py (new)
 
 Important Decisions:
+
 - AudioChunk uses dataclass with ISO timestamp strings for serialization
 - Metadata saved as JSON file alongside each audio chunk
 - ChunkedAudioRecorder uses threading for background chunk processing
-- Samples per chunk calculated as sample_rate * chunk_duration
+- Samples per chunk calculated as sample_rate \* chunk_duration
 
 Recovery Notes:
+
 - Ready for BU010 to process chunks in transcriber
 - Uses existing AudioRecorder for underlying audio capture
 - Handles both mic and system sources in same manner
@@ -181,12 +204,14 @@ Summary:
 Implemented system audio capture using soundcard loopback functionality. Added soundcard and soundfile dependencies, created SystemAudioRecorder class for loopback capture, and integrated it into the ChunkedAudioRecorder architecture. The system audio now uses the same chunking mechanism as microphone audio, saving 10-second timestamped chunks with metadata to the audio/system/ directory.
 
 Files Changed:
+
 - requirements.txt (added soundcard, soundfile)
 - src/audio_capture/system_recorder.py (new)
 - src/audio_capture/core.py (modified ChunkedAudioRecorder)
-- src/audio_capture/__init__.py (updated exports)
+- src/audio_capture/**init**.py (updated exports)
 
 Important Decisions:
+
 - SystemAudioRecorder uses soundcard library's loopback functionality
 - Auto-detects default speaker and uses its loopback microphone
 - Uses buffer-based approach (poll every 500ms)不同于 sounddevice的callback方式
@@ -194,6 +219,7 @@ Important Decisions:
 - ChunkedAudioRecorder now routes to appropriate recorder based on source type
 
 Recovery Notes:
+
 - Ready for BU011 to process system audio chunks in transcriber
 - Both microphone and system audio now independently capturable
 - DualSourceChunkedRecorder coordinates simultaneous capture
@@ -206,15 +232,18 @@ Summary:
 Refactored the TranscriptionProcessor to work with chunked audio from dual sources. Added chunk tracking to avoid re-transcription, new methods for incremental processing, and polling support for real-time transcription as chunks appear.
 
 Files Changed:
+
 - src/transcription/processor.py (modified)
 
 Important Decisions:
+
 - Scans audio/mic/ and audio/system/ directories separately
 - Uses in-memory set to track processed chunks (avoids re-transcription)
 - Added get_new_chunks() for incremental processing
 - Added polling loop for continuous transcription during recording
 
 Recovery Notes:
+
 - Ready for BU012 to merge and order transcripts chronologically
 - Source attribution preserved in database (mic vs system)
 - Timestamps extracted from chunk metadata for synchronization
@@ -227,17 +256,20 @@ Summary:
 Fixed the transcription pipeline to use a real speech-to-text model instead of silently falling back to mock transcriptions. The pipeline now raises a clear ModelLoadError if neither parakeet-ctc nor coqui-stt can be loaded.
 
 Files Changed:
+
 - src/transcription/parakeet.py (modified)
 - src/transcription/processor.py (modified)
 - requirements.txt (added coqui-stt)
 
 Important Decisions:
+
 - Removed mock fallback in ParakeetV3.load() - now raises ModelLoadError if no model available
-- Removed _mock_transcribe() method entirely
+- Removed \_mock_transcribe() method entirely
 - Added ModelLoadError handling in TranscriptionProcessor methods
 - Added coqui-stt as alternative dependency in requirements.txt
 
 Recovery Notes:
+
 - Ready for BU013 to implement temporal merge layer for transcripts
 - Application will now fail with clear error if STT model cannot be loaded
 - Users must install either parakeet-ctc or coqui-stt package and download model files
@@ -250,15 +282,18 @@ Summary:
 Added a session list widget to the main window that displays all past sessions from the database. Each session entry shows the session name, timestamp, and status. The list is populated on application startup.
 
 Files Changed:
+
 - src/app/window.py (modified)
 
 Important Decisions:
+
 - Used QGroupBox to group the sessions list with a label
 - Used existing Database.list_sessions() method which was already implemented
 - Format: "Session name - YYYY-MM-DD HH:MM - status"
 - Sessions are sorted by start_time DESC (newest first) as per database query
 
 Recovery Notes:
+
 - Ready for BU014 to add session interaction (clicking, selecting)
 - No interaction functionality included per BU013 scope
 - Uses existing database method - no schema changes needed
@@ -271,11 +306,13 @@ Summary:
 Added transcription and summarization status display to the session list in the UI using a QTableWidget with separate cells. Database schema updated with transcription_status and summary_status columns, status updates are set in the database when transcription/summarization complete, and only the session name cell is editable.
 
 Files Changed:
+
 - src/storage/database.py (added transcription_status and summary_status columns with migration)
 - src/app/window.py (changed from QListWidget to QTableWidget with 3 columns)
 - src/app/session_manager.py (modified process_transcriptions to update status)
 
 Important Decisions:
+
 - Database migration uses ALTER TABLE for existing databases (try/except for OperationalError)
 - Status values: 'none' (default), 'transcribed', 'summarized'
 - UI uses QTableWidget with 3 columns: Session Name (editable), Transcription (read-only), Summary (read-only)
@@ -283,6 +320,7 @@ Important Decisions:
 - Only name column is editable; status columns are read-only via item flags
 
 Recovery Notes:
+
 - Ready for BU015 to add trigger buttons for transcription/summarization
 - Status is informational only per BU014 scope
 
@@ -294,15 +332,18 @@ Summary:
 Added a Transcribe button to the UI for triggering transcription on past sessions. Sessions table now has 4 columns: Session Name, Transcription, Summary, and Actions. The button appears only for untranscribed sessions (transcription_status != 'transcribed'). When clicked, it disables the button, shows "Transcribing..." text, processes transcriptions via SessionManager, updates the database status, reloads the UI, and shows a completion message.
 
 Files Changed:
-- src/app/window.py (added Actions column with Transcribe button, _on_transcribe_clicked, _run_transcription methods)
+
+- src/app/window.py (added Actions column with Transcribe button, \_on_transcribe_clicked, \_run_transcription methods)
 
 Important Decisions:
+
 - Button shows "Done" for already transcribed sessions
 - Uses QTimer.singleShot to run transcription in background to keep UI responsive
 - Session is loaded via SessionManager.load_session() for processing
 - Database status updated to 'transcribed' after successful transcription
 
 Recovery Notes:
+
 - Ready for BU016 to add trigger button for summarization
 - Transcription process already exists in session_manager.py - this BU only adds the UI trigger
 
@@ -314,15 +355,18 @@ Summary:
 Updated SummaryGenerator to support custom instructions loaded from a configuration file. Added config.py with summarization settings including model selection and custom instructions.
 
 Files Changed:
+
 - src/config.py (new - configuration settings for summarization)
-- src/summarization/generator.py (added custom_instructions parameter and _load_custom_instructions method)
+- src/summarization/generator.py (added custom_instructions parameter and \_load_custom_instructions method)
 
 Important Decisions:
+
 - Default model is GEMINI_2_5_FLASH
 - Custom instructions are optional and prepended to template system prompts
 - Configuration loaded from SUMMARIZATION dict in config.py
 
 Recovery Notes:
+
 - Ready for BU017 to add trigger button for summarization
 - Custom instructions can be modified in config.py
 
@@ -334,15 +378,18 @@ Summary:
 Added a Summarize option to the Actions dropdown for triggering summarization on transcribed sessions. The button appears only when transcription_status == 'transcribed' and summary_status in (None, 'none'). Uses QTimer.singleShot for background processing to keep UI responsive.
 
 Files Changed:
-- src/app/window.py (added Summarize action option and _on_summarize_clicked, _run_summarization methods)
+
+- src/app/window.py (added Summarize action option and \_on_summarize_clicked, \_run_summarization methods)
 
 Important Decisions:
+
 - Summarize option in dropdown appears only when transcription is complete
 - Uses existing SummaryGenerator.generate_and_store method
 - UI provides feedback during summarization process
 - Status updated to 'summarized' after completion
 
 Recovery Notes:
+
 - Ready for BU018 to add view summary functionality
 - Combined with BU016 for implementation efficiency
 
@@ -354,9 +401,11 @@ Summary:
 Added functionality to display session summaries in a separate window. Users can double-click on a summarized session or use the "View Summary" option from the context menu to view the summary content in a modal dialog.
 
 Files Changed:
-- src/app/window.py (added _on_session_double_clicked, _show_session_summary methods, QDialog and QTextBrowser imports)
+
+- src/app/window.py (added \_on_session_double_clicked, \_show_session_summary methods, QDialog and QTextBrowser imports)
 
 Important Decisions:
+
 - Summary display uses a QDialog with QTextBrowser for readable text presentation
 - Shows session name, summary type, and model used in the dialog header
 - Double-click handling on table rows triggers summary display
@@ -364,6 +413,7 @@ Important Decisions:
 - Shows informative message if session has no summary
 
 Recovery Notes:
+
 - Ready for BU019 for additional UI features
 - Uses existing Database.get_summaries() method
 
@@ -373,14 +423,17 @@ Recovery Notes:
 
 Summary:
 Added functionality to display session screenshots in a separate window with timestamps. Users can:
+
 1. Right-click on a past session and select "View Screenshots" from the context menu
 2. Click the "View Screenshots" button during an active session
 
 Files Changed:
+
 - src/storage/database.py (added get_screenshots method)
-- src/app/window.py (added _show_session_screenshots method, _on_view_screenshots method, "View Screenshots" button, added QScrollArea and QGridLayout imports, added "View Screenshots" to context menu)
+- src/app/window.py (added \_show_session_screenshots method, \_on_view_screenshots method, "View Screenshots" button, added QScrollArea and QGridLayout imports, added "View Screenshots" to context menu)
 
 Important Decisions:
+
 - Screenshot display uses a QDialog with QScrollArea for scrollable content
 - Uses QGridLayout to display screenshots in a 2-column grid
 - Each screenshot is displayed with its capture timestamp
@@ -390,4 +443,87 @@ Important Decisions:
 - Added dedicated "View Screenshots" button enabled during active sessions
 
 Recovery Notes:
+
 - Ready for BU021 for additional UI features
+
+---
+
+## BU023 - Overlapping Audio Chunks Implementation
+
+Summary:
+Implemented overlapping audio chunk recording in ChunkedAudioRecorder to prevent word loss at chunk boundaries. Each chunk saves 10 seconds of audio with a 1-second overlap from the previous chunk. This ensures continuous audio coverage for transcription.
+
+Files Changed:
+
+- src/audio_capture/core.py (added overlap_duration parameter and overlapping chunk logic)
+
+Important Decisions:
+
+- Added overlap_duration parameter to ChunkedAudioRecorder (default: 1 second)
+- Rewrote \_recording_loop() to use continuous buffer approach with overlap
+- Rewrote \_system_recording_loop() with same overlapping logic
+- Added \_save_chunk_from_array() method for saving chunks from numpy arrays
+- Updated DualSourceChunkedRecorder to pass overlap_duration to both sources
+- Updated factory functions to accept overlap_duration parameter
+- Each chunk saves every (chunk_duration - overlap_duration) seconds of NEW audio
+- Buffer keeps only the overlap portion after each save for the next chunk
+- Maintains backward compatibility via default parameter value
+
+How It Works:
+
+- Chunk duration: 10 seconds
+- Overlap: 1 second
+- Save interval: Every 9 seconds of NEW audio
+- Each chunk: Last 10 seconds (9s new + 1s from previous)
+- Buffer after save: Keeps only last 1 second for next chunk
+
+Recovery Notes:
+
+- VAD integration (BU026) continues to work - chunks still filtered by speech detection
+- Transcription pipeline processes each chunk independently
+- Overlap enables better transcription at chunk boundaries
+
+---
+
+## BU024 - Transcription Deduplication and Context
+
+Summary:
+Implemented rolling context of recent transcriptions (last 5) to improve accuracy, passes context as initial_prompt for better transcription, and removes duplicate text at chunk boundaries using overlap detection.
+
+Files Changed:
+
+- src/transcription/processor.py (existing implementation verified)
+
+Important Decisions:
+
+- Rolling context uses last 5 transcriptions via `_transcription_context` list
+- Context prompt built via `_get_context_prompt()` method and passed to transcribe_audio()
+- Deduplication handled by `_deduplicate_transcription()` method which detects overlapping phrases
+- Algorithm checks last 8, 6, 4, 3 words for overlap detection
+- Partial matches with 70%+ word similarity also removed
+- Context limited to MAX_CONTEXT_LENGTH (2000 chars) to prevent prompt overflow
+- Note: Parakeet via onnx-asr does not natively support initial_prompt, but the context is prepared for compatibility with other engines (whisper.py)
+
+---
+
+## BU026 - VAD Integration
+
+Files Changed:
+
+- requirements.txt (added webrtcvad-wheels)
+- src/audio_capture/core.py (added VAD integration)
+
+Important Decisions:
+
+- Used webrtcvad-wheels for pre-compiled Windows binaries
+- VAD operates at 16kHz with 30ms frames (WebRTC standard)
+- Configurable aggressiveness mode (0-3, default 2)
+- Returns None from \_save_chunk when no speech detected
+- Only appends chunks to list and calls callback if chunk contains speech
+- Handles both mic and system audio recording loops
+
+Recovery Notes:
+
+- Ready for BU027 (next BU)
+- No changes to UI or transcription pipeline needed
+- Silent chunks are simply not saved - existing transcription code works unchanged

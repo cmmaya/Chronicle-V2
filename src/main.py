@@ -6,7 +6,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# Reduce noise from buffer retrieval logs
+# Reduce noise from specific modules
+logging.getLogger('src.audio_capture.system_recorder').setLevel(logging.WARNING)
 logging.getLogger('src.audio_capture.core').setLevel(logging.WARNING)
 
 from PySide6.QtWidgets import QApplication
