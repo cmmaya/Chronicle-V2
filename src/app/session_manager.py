@@ -2,12 +2,13 @@
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 from ..storage.database import Database
 from ..audio_capture.core import DualSourceChunkedRecorder
 from ..screenshots.capture import ScreenshotCapture
 from ..transcription.processor import TranscriptionProcessor
+from ..transcription.live import LiveTranscriber
 
 from .session import Session
 from .timeline import Timeline
@@ -25,17 +26,20 @@ class SessionManager:
     def __init__(self, 
                  base_path: str = 'sessions',
                  db_path: str = 'chronicle.db',
-                 status_callback: Optional[callable] = None):
+                 status_callback: Optional[callable] = None,
+                 live_transcription_ui_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         """Initialize SessionManager.
         
         Args:
             base_path: Base directory for session data
             db_path: Path to SQLite database
             status_callback: Optional callable for status updates
+            live_transcription_ui_callback: Optional callback for live transcription results
         """
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.status_callback = status_callback
+        self.live_transcription_ui_callback = live_transcription_ui_callback
         
         # Initialize database
         self.db = Database(db_path)
@@ -64,6 +68,92 @@ class SessionManager:
         if self.status_callback:
             self.status_callback(message, is_error)
     
+    def handle_live_transcription(self, source_or_chunk, chunk=None) -> None:
+        """Handle live transcription of an audio chunk.
+        
+        This method is called by the audio recorder's live_transcription_callback.
+        It transcribes the audio chunk, saves it to the database, and passes 
+        the result to the UI callback.
+        
+        Args:
+            source_or_chunk: Either the audio source string ('mic'/'system') or AudioChunk object
+            chunk: AudioChunk object (if first arg is source string)
+        """
+        try:
+            # Handle both calling conventions:
+            # - DualSourceChunkedRecorder passes (source, chunk)
+            # - ChunkedAudioRecorder passes just (chunk,)
+            if chunk is not None:
+                # Called as (source, chunk)
+                source = source_or_chunk
+                audio_chunk = chunk
+            else:
+                # Called as (chunk,) - extract source from chunk
+                audio_chunk = source_or_chunk
+                source = audio_chunk.source
+            
+            # Import here to avoid circular imports
+            from ..transcription.live import LiveTranscriber
+            
+            # Get or create live transcriber for this session
+            if not hasattr(self, '_live_transcriber'):
+                self._live_transcriber = LiveTranscriber()
+            
+            # Transcribe the chunk
+            result = self._live_transcriber.transcribe_chunk(audio_chunk)
+            
+            if result:
+                # Add source to result
+                result['source'] = source
+                
+                # Get session_id from current session
+                session_id = None
+                if self.current_session:
+                    session_id = self.current_session.id
+                
+                # Save to database if we have a session - use thread-safe approach
+                if session_id:
+                    try:
+                        # Convert timestamp string to datetime
+                        timestamp_str = audio_chunk.timestamp_start
+                        if isinstance(timestamp_str, str):
+                            from datetime import datetime
+                            timestamp = datetime.fromisoformat(timestamp_str)
+                        else:
+                            timestamp = timestamp_str
+                        
+                        # Determine source for database (map 'mic' to 'microphone')
+                        db_source = 'microphone' if source == 'mic' else 'system'
+                        
+                        # Create a new database connection in this thread (SQLite requirement)
+                        from ..storage.database import Database
+                        thread_db = Database(self.db.db_path)
+                        thread_db.connect()
+                        
+                        # Save transcript to database
+                        thread_db.add_transcript(
+                            session_id=session_id,
+                            timestamp=timestamp,
+                            text=result.get('text', ''),
+                            source=db_source
+                        )
+                        thread_db.disconnect()
+                        logger.info(f"Saved live transcript for session {session_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to save live transcript: {e}")
+                
+                # Print to console for debugging (per validation requirements)
+                print(f"[LIVE TRANSCRIPTION] {source}: {result.get('text', '')}")
+                
+                # Pass result to UI callback if provided
+                if self.live_transcription_ui_callback:
+                    self.live_transcription_ui_callback(result)
+            else:
+                logger.debug(f"No transcription result for chunk {chunk.chunk_id}")
+                
+        except Exception as e:
+            logger.error(f"Error in live transcription: {e}")
+    
     def _get_session_path(self, session_id: int) -> Path:
         """Get path for a session directory.
         
@@ -75,11 +165,12 @@ class SessionManager:
         """
         return self.base_path / f'session_{session_id:03d}'
     
-    def create_session(self, name: str) -> Session:
+    def create_session(self, name: str, enable_live_transcription: bool = True) -> Session:
         """Create a new session.
         
         Args:
             name: Session name/title
+            enable_live_transcription: Whether to enable live transcription
             
         Returns:
             Created Session instance
@@ -101,10 +192,12 @@ class SessionManager:
         )
         
         # Initialize components
+        live_callback = self.handle_live_transcription if enable_live_transcription else None
         session.dual_recorder = self.dual_recorder_factory(
             str(session_path),
             vad_aggressiveness=self.vad_aggressiveness,
-            vad_threshold=self.vad_threshold
+            vad_threshold=self.vad_threshold,
+            live_transcription_callback=live_callback
         )
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path), 
@@ -154,7 +247,8 @@ class SessionManager:
         session.dual_recorder = self.dual_recorder_factory(
             str(session_path),
             vad_aggressiveness=self.vad_aggressiveness,
-            vad_threshold=self.vad_threshold
+            vad_threshold=self.vad_threshold,
+            live_transcription_callback=self.handle_live_transcription
         )
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path),
@@ -171,17 +265,18 @@ class SessionManager:
         self._update_status(f'Loaded session {session_id}: {session.name}')
         return session
     
-    def start_session(self, name: str, auto_record: bool = True) -> Session:
+    def start_session(self, name: str, auto_record: bool = True, enable_live_transcription: bool = True) -> Session:
         """Create and start a new session.
         
         Args:
             name: Session name/title
             auto_record: Whether to automatically start recording
+            enable_live_transcription: Whether to enable live transcription
             
         Returns:
             Started Session instance
         """
-        session = self.create_session(name)
+        session = self.create_session(name, enable_live_transcription=enable_live_transcription)
         session.start()
         self.current_session = session
         

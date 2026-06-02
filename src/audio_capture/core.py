@@ -53,7 +53,8 @@ class ChunkedAudioRecorder:
         overlap_duration: int = 1,
         callback: Optional[Callable[[AudioChunk], None]] = None,
         vad_aggressiveness: int = 2,  # 0-3, higher = more aggressive filtering
-        vad_threshold: float = 0.30  # Minimum speech ratio to save chunk
+        vad_threshold: float = 0.30,  # Minimum speech ratio to save chunk
+        live_transcription_callback: Optional[Callable[[AudioChunk], None]] = None
     ):
         """Initialize the chunked audio recorder.
 
@@ -63,8 +64,10 @@ class ChunkedAudioRecorder:
             chunk_duration: Duration of each chunk in seconds.
             overlap_duration: Overlap duration between chunks in seconds.
             callback: Optional callback called after each chunk is saved.
-            vad_aggressiveness: VAD aggressiveness mode (0=least, 3=most aggressive).
+            vad_aggressiveness: VAD aggressiveness mode (0=3, 3=most aggressive).
             vad_threshold: Minimum ratio of frames with speech to save chunk (0.0-1.0).
+            live_transcription_callback: Optional callback triggered for live transcription
+                                         of each new audio chunk.
         """
         self.session_path = Path(session_path)
         self.source = source
@@ -73,6 +76,7 @@ class ChunkedAudioRecorder:
         self.callback = callback
         self.vad_aggressiveness = vad_aggressiveness
         self.vad_threshold = vad_threshold
+        self.live_transcription_callback = live_transcription_callback
         
         # Initialize VAD
         self._vad = webrtcvad.Vad(vad_aggressiveness)
@@ -235,6 +239,14 @@ class ChunkedAudioRecorder:
         
         logger.info(f"Saved chunk: {chunk_id} ({chunk.duration:.2f}s)")
         
+        # Call live transcription callback if provided
+        if self.live_transcription_callback:
+            print(f"[DEBUG] Live transcription callback triggered for chunk: {chunk.chunk_id} (source: {self.source})")
+            try:
+                self.live_transcription_callback(chunk)
+            except Exception as e:
+                logger.error(f"Error in live_transcription_callback: {e}")
+        
         return chunk
 
     def _save_chunk_from_array(self, audio_data: np.ndarray, start_time: datetime) -> Optional[AudioChunk]:
@@ -285,6 +297,14 @@ class ChunkedAudioRecorder:
         chunk.save_metadata()
         
         logger.info(f"Saved chunk: {chunk_id} ({chunk.duration:.2f}s)")
+        
+        # Call live transcription callback if provided
+        if self.live_transcription_callback:
+            print(f"[DEBUG] Live transcription callback triggered for chunk: {chunk.chunk_id} (source: {self.source})")
+            try:
+                self.live_transcription_callback(chunk)
+            except Exception as e:
+                logger.error(f"Error in live_transcription_callback: {e}")
         
         return chunk
     
@@ -519,7 +539,8 @@ class DualSourceChunkedRecorder:
         overlap_duration: int = 1,
         callback: Optional[Callable[[str, AudioChunk], None]] = None,
         vad_aggressiveness: int = 2,
-        vad_threshold: float = 0.30
+        vad_threshold: float = 0.30,
+        live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None
     ):
         """Initialize the dual source recorder.
         
@@ -531,6 +552,8 @@ class DualSourceChunkedRecorder:
                       Receives (source, chunk) as arguments.
             vad_aggressiveness: VAD aggressiveness mode (0-3).
             vad_threshold: Minimum ratio of speech frames to save chunk (0.0-1.0).
+            live_transcription_callback: Optional callback for live transcription.
+                                        Receives (source, chunk) as arguments.
         """
         self.session_path = Path(session_path)
         self.chunk_duration = chunk_duration
@@ -543,6 +566,13 @@ class DualSourceChunkedRecorder:
                     callback(source, chunk)
             return cb
         
+        # Create live transcription callback for each source
+        def make_live_callback(source: str):
+            def cb(chunk: AudioChunk):
+                if live_transcription_callback:
+                    live_transcription_callback(source, chunk)
+            return cb
+        
         # Create chunked recorders for both sources
         self.mic_recorder = ChunkedAudioRecorder(
             session_path=str(session_path),
@@ -551,7 +581,8 @@ class DualSourceChunkedRecorder:
             overlap_duration=overlap_duration,
             callback=make_callback('mic'),
             vad_aggressiveness=vad_aggressiveness,
-            vad_threshold=vad_threshold
+            vad_threshold=vad_threshold,
+            live_transcription_callback=make_live_callback('mic')
         )
         
         self.system_recorder = ChunkedAudioRecorder(
@@ -561,7 +592,8 @@ class DualSourceChunkedRecorder:
             overlap_duration=overlap_duration,
             callback=make_callback('system'),
             vad_aggressiveness=vad_aggressiveness,
-            vad_threshold=vad_threshold
+            vad_threshold=vad_threshold,
+            live_transcription_callback=make_live_callback('system')
         )
         
         self._is_running = False
@@ -595,7 +627,8 @@ def create_chunked_recorder(
     session_path: str,
     source: str = 'mic',
     chunk_duration: int = 10,
-    overlap_duration: int = 1
+    overlap_duration: int = 1,
+    live_transcription_callback: Optional[Callable[[AudioChunk], None]] = None
 ) -> ChunkedAudioRecorder:
     """Factory function to create a chunked audio recorder.
     
@@ -604,6 +637,7 @@ def create_chunked_recorder(
         source: Audio source ('mic' or 'system').
         chunk_duration: Duration of each chunk in seconds.
         overlap_duration: Overlap duration between chunks in seconds.
+        live_transcription_callback: Optional callback for live transcription.
         
     Returns:
         ChunkedAudioRecorder instance.
@@ -612,14 +646,16 @@ def create_chunked_recorder(
         session_path=session_path,
         source=source,
         chunk_duration=chunk_duration,
-        overlap_duration=overlap_duration
+        overlap_duration=overlap_duration,
+        live_transcription_callback=live_transcription_callback
     )
 
 
 def create_dual_source_recorder(
     session_path: str,
     chunk_duration: int = 10,
-    overlap_duration: int = 1
+    overlap_duration: int = 1,
+    live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None
 ) -> DualSourceChunkedRecorder:
     """Factory function to create a dual-source chunked recorder.
     
@@ -627,6 +663,8 @@ def create_dual_source_recorder(
         session_path: Base path for the session.
         chunk_duration: Duration of each chunk in seconds.
         overlap_duration: Overlap duration between chunks in seconds.
+        live_transcription_callback: Optional callback for live transcription.
+                                    Receives (source, chunk) as arguments.
         
     Returns:
         DualSourceChunkedRecorder instance.
@@ -634,5 +672,6 @@ def create_dual_source_recorder(
     return DualSourceChunkedRecorder(
         session_path=session_path,
         chunk_duration=chunk_duration,
-        overlap_duration=overlap_duration
+        overlap_duration=overlap_duration,
+        live_transcription_callback=live_transcription_callback
     )

@@ -527,3 +527,172 @@ Recovery Notes:
 - Ready for BU027 (next BU)
 - No changes to UI or transcription pipeline needed
 - Silent chunks are simply not saved - existing transcription code works unchanged
+
+---
+
+## BU027 - Live Transcription Callback
+
+Summary:
+Added a callback mechanism to the `ChunkedAudioRecorder` to trigger live transcription for each new audio chunk. The `live_transcription_callback` is called after each chunk is saved, receiving the `AudioChunk` object.
+
+Files Changed:
+
+- src/audio_capture/core.py (modified ChunkedAudioRecorder, DualSourceChunkedRecorder, and factory functions)
+
+Important Decisions:
+
+- Added `live_transcription_callback` parameter to `ChunkedAudioRecorder.__init__` with proper documentation
+- Callback is called in both `_save_chunk` and `_save_chunk_from_array` methods after chunk is successfully saved
+- Added debug print statements to verify callback is triggered during recording
+- `DualSourceChunkedRecorder` propagates the callback to both mic and system recorders, passing the source as first argument
+- Factory functions updated to accept the new callback parameter
+
+Recovery Notes:
+
+- Ready for BU028 to implement live transcription using this callback
+- Callback is non-blocking - exceptions are caught and logged but don't interrupt recording
+- Both mic and system audio chunks will trigger the callback when recorded
+
+---
+
+## BU028 - Real-time Transcription in SessionManager
+
+Summary:
+Implemented the logic in SessionManager to handle live transcription of audio chunks. Created a new LiveTranscriber class that wraps the Parakeet engine for real-time transcription, with deduplication logic to avoid repeated text at chunk boundaries. Live transcriptions are now saved to the database.
+
+Files Changed:
+
+- src/transcription/live.py (new)
+- src/app/session_manager.py (modified)
+
+Important Decisions:
+
+- Created LiveTranscriber class with transcribe_chunk() method that handles AudioChunk objects
+- Added handle_live_transcription() method to SessionManager that receives (source, chunk) from the callback
+- Pass live_transcription_callback to DualSourceChunkedRecorder in both create_session and load_session
+- Results are printed to console for debugging and passed to live_transcription_ui_callback for UI integration
+- LiveTranscriber maintains context and deduplicates between consecutive chunks
+- Live transcriptions are saved to the database using existing db.add_transcript() method
+
+Recovery Notes:
+
+- Ready for BU029 to display live transcriptions in UI
+- Transcription runs in the recording thread - may need threading adjustment for production
+- Model loading happens on first chunk - may cause initial delay
+
+---
+
+## BU029 - Display Live Transcriptions in UI
+
+Summary:
+Added live transcription display to the UI. Created a QGroupBox with QTextEdit to show transcriptions in real-time during recording. Transcriptions display with timestamp, source (Mic/System), and text.
+
+Files Changed:
+
+- src/app/window.py
+
+Important Decisions:
+
+- Added QTextEdit import
+- Added live_transcription_group with QTextEdit in _create_central_widget
+- Created _on_live_transcription callback method that receives dict with text, source, timestamp
+- Passed live_transcription_ui_callback to SessionManager initialization
+- Clear display on session start
+
+Recovery Notes:
+
+- Ready for BU030
+- Fix applied: LiveTranscriber now passes rolling context as initial_prompt to Parakeet engine for improved accuracy
+
+---
+
+## Fix - LiveTranscriber Rolling Context
+
+Summary:
+Fixed LiveTranscriber to pass rolling context as initial_prompt to the Parakeet engine for improved transcription accuracy. Previously context was stored but not used.
+
+Files Changed:
+
+- src/transcription/live.py
+
+Important Decisions:
+
+- Build initial_prompt from self._context before transcribing
+- Pass initial_prompt to self.engine.transcribe()
+- Include context in result dict for debugging
+
+---
+
+## BU030 - UI Layout for Live Transcriptions
+
+Summary:
+Changed the main window layout from vertical to horizontal split. Left side contains existing controls (title, session name, buttons, status, past sessions), right side contains live transcription display.
+
+Files Changed:
+
+- src/app/window.py
+
+Important Decisions:
+
+- Changed main layout from QVBoxLayout to QHBoxLayout
+- Created left_widget with QVBoxLayout for existing controls
+- Created right_widget with QVBoxLayout for live transcriptions
+- Both widgets use stretch factor 1 for equal width
+- Live transcription group moved to right side
+- Reduced margins from 40 to 20 for better space utilization
+
+Recovery Notes:
+
+- Ready for BU031
+- UI now has horizontal split layout with placeholder on right side
+
+---
+
+## BU031 - Live Transcription Checkbox
+
+Summary:
+Added checkbox to enable/disable live transcription. Also added a detachable window feature to pop out the live transcription display into a separate window.
+
+Files Changed:
+
+- src/app/window.py
+- src/app/session_manager.py
+
+Important Decisions:
+
+- Added QCheckBox import and widget to UI (enabled by default)
+- Modified create_session() to accept enable_live_transcription parameter
+- Modified start_session() to accept enable_live_transcription parameter
+- Callback is only passed to recorder when enabled
+- Added detach button to pop out transcription to separate window
+- Detached window syncs with main window display
+
+Recovery Notes:
+
+- Ready for BU032
+
+---
+
+## BU032 - Live Transcription Display
+
+Summary:
+Implemented chat-like UI to display live transcriptions. Transcriptions appear as bubbles with different styling for mic vs system audio. Uses thread-safe UI updates via QMetaObject.invokeMethod.
+
+Files Changed:
+
+- src/app/window.py
+
+Important Decisions:
+
+- Replaced QTextEdit with QScrollArea and container Widget
+- Created _create_transcription_view() method for scrollable chat view
+- Created _add_transcription_to_view() method with bubble styling:
+  - Mic: Left-aligned, blue background (#e3f2fd), 🎤 icon
+  - System: Right-aligned, green background (#e8f5e9), 🔊 icon
+- Added thread-safe updates via QMetaObject.invokeMethod with Qt.QueuedConnection
+- Updated detached window to use same chat-like view
+- Added _clear_transcription_view() to clear messages on new session
+
+Recovery Notes:
+
+- Ready for BU033

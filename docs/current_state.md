@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU027
-- Next BU: BU028
+- Current BU: BU033
+- Next BU: BU033
 
 ## Target Architecture
 
@@ -42,6 +42,12 @@ BU023 - Overlapping Audio Chunking
 BU024 - Transcription Deduplication and Context
 BU025 - Mono Recording
 BU026 - VAD Integration
+BU027 - Live Transcription Callback
+BU028 - Real-time Transcription in SessionManager
+BU029 - Display Live Transcriptions in UI
+BU030 - UI Layout for Live Transcriptions
+BU031 - Live Transcription Checkbox
+BU032 - Live Transcription Display
 
 ## In Progress BUs
 None
@@ -115,3 +121,8 @@ None
 - Context passed as initial_prompt to transcription engine
 - Duplicate text removal at chunk boundaries using overlap detection
 - _deduplicate_transcription() removes repeated phrases between consecutive chunks
+- LiveTranscriber class created in src/transcription/live.py for real-time transcription
+- handle_live_transcription() method in SessionManager processes audio chunks
+- live_transcription_callback passed to DualSourceChunkedRecorder in create_session and load_session
+- Transcription results saved to database using db.add_transcript()
+- Transcription results passed to live_transcription_ui_callback for UI updates

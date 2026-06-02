@@ -2,7 +2,8 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHBoxLayout, QPushButton, QLabel, QStatusBar,
                                 QMessageBox, QApplication, QListWidget, QGroupBox,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
-                                QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, QGridLayout, QSlider, QDialogButtonBox)
+                                QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
+                                QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QPixmap
 import logging
@@ -31,6 +32,13 @@ class MainWindow(QMainWindow):
         
         # UI state
         self._is_recording = False
+        
+        # Detached transcription window
+        self._detached_window = None
+        self._detached_display = None
+        self._detached_container = None
+        self._detached_layout = None
+        self._detached_scroll_area = None
         
         # VAD settings
         self._vad_threshold = 30  # Default 30%
@@ -95,7 +103,8 @@ class MainWindow(QMainWindow):
             self.session_manager = SessionManager(
                 base_path=sessions_path,
                 db_path='chronicle.db',
-                status_callback=self._on_status_update
+                status_callback=self._on_status_update,
+                live_transcription_ui_callback=self._on_live_transcription
             )
             self._update_ui_state()
             self._load_past_sessions()
@@ -730,10 +739,15 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Main layout
-        layout = QVBoxLayout(central_widget)
-        layout.setSpacing(20)
-        layout.setContentsMargins(40, 40, 40, 40)
+        # Main layout - horizontal split
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Left side widget - existing controls
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setSpacing(15)
         
         # Title
         title_label = QLabel('Chronicle')
@@ -742,7 +756,7 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(24)
         title_font.setBold(True)
         title_label.setFont(title_font)
-        layout.addWidget(title_label)
+        left_layout.addWidget(title_label)
         
         # Session name input area
         session_layout = QHBoxLayout()
@@ -754,10 +768,10 @@ class MainWindow(QMainWindow):
         session_layout.addWidget(self.session_name_label)
         session_layout.addWidget(self.session_name_input)
         session_layout.addStretch()
-        layout.addLayout(session_layout)
+        left_layout.addLayout(session_layout)
         
         # Spacer
-        layout.addStretch()
+        left_layout.addStretch()
         
         # Control buttons
         button_layout = QHBoxLayout()
@@ -793,10 +807,15 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.view_screenshots_button)
         button_layout.addStretch()
         
-        layout.addLayout(button_layout)
+        left_layout.addLayout(button_layout)
+        
+        # Live transcription checkbox
+        self.live_transcription_checkbox = QCheckBox('Enable live transcription')
+        self.live_transcription_checkbox.setChecked(True)
+        left_layout.addWidget(self.live_transcription_checkbox)
         
         # Spacer
-        layout.addStretch()
+        left_layout.addStretch()
         
         # Status display
         self.status_label = QLabel('Ready')
@@ -804,7 +823,7 @@ class MainWindow(QMainWindow):
         status_font = self.status_label.font()
         status_font.setPointSize(16)
         self.status_label.setFont(status_font)
-        layout.addWidget(self.status_label)
+        left_layout.addWidget(self.status_label)
         
         # Past Sessions list - using table for separate cells
         sessions_group = QGroupBox('Past Sessions')
@@ -823,10 +842,31 @@ class MainWindow(QMainWindow):
         self.sessions_list.cellChanged.connect(self._on_session_name_changed)
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
-        layout.addWidget(sessions_group)
+        left_layout.addWidget(sessions_group)
         
-        # Spacer at bottom
-        layout.addStretch()
+        # Right side widget - placeholder for live transcription
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        
+        # Live transcription display area
+        live_transcription_group = QGroupBox('Live Transcriptions')
+        live_transcription_layout = QVBoxLayout()
+        self.live_transcription_display = QTextEdit()
+        self.live_transcription_display.setReadOnly(True)
+        self.live_transcription_display.setPlaceholderText('Transcriptions will appear here during recording...')
+        live_transcription_layout.addWidget(self.live_transcription_display)
+        
+        # Detach button
+        self.detach_transcription_button = QPushButton('Detach Window')
+        self.detach_transcription_button.clicked.connect(self._on_detach_transcription)
+        live_transcription_layout.addWidget(self.detach_transcription_button)
+        
+        live_transcription_group.setLayout(live_transcription_layout)
+        right_layout.addWidget(live_transcription_group)
+        
+        # Add both sides to main layout
+        main_layout.addWidget(left_widget, 1)  # Stretch factor 1
+        main_layout.addWidget(right_widget, 1)  # Stretch factor 1
     
     def _create_status_bar(self):
         """Create the status bar."""
@@ -844,6 +884,109 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: red;")
         else:
             self.status_label.setStyleSheet("")
+    
+    def _on_live_transcription(self, result: dict):
+        """Handle live transcription results from the session manager.
+        
+        Args:
+            result: Dictionary with keys: text, source, timestamp_start
+        
+        Thread-safe: Uses QTimer.singleShot to update UI from any thread.
+        """
+        try:
+            text = result.get('text', '')
+            source = result.get('source', 'unknown')
+            timestamp = result.get('timestamp_start', result.get('timestamp', ''))
+            
+            if not text:
+                return
+            
+            # Format timestamp
+            time_str = ''
+            if timestamp:
+                if isinstance(timestamp, str):
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(timestamp)
+                        time_str = dt.strftime('%H:%M:%S')
+                    except:
+                        time_str = str(timestamp)
+                else:
+                    time_str = str(timestamp)
+            
+            # Format display text
+            source_label = 'Mic' if source == 'mic' else 'System'
+            if time_str:
+                display_text = f"[{time_str}] {source_label}: {text}"
+            else:
+                display_text = f"{source_label}: {text}"
+            
+            # Use thread-safe UI update via QTimer
+            QTimer.singleShot(0, lambda: self._append_transcription(display_text))
+            
+        except Exception as e:
+            logger.error(f"Failed to display live transcription: {e}")
+    
+    def _append_transcription(self, text: str):
+        """Append transcription text to the display."""
+        self.live_transcription_display.append(text)
+        # Auto-scroll to bottom
+        scrollbar = self.live_transcription_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        
+        # Also update detached window if it exists
+        if hasattr(self, '_detached_display') and self._detached_display:
+            self._detached_display.append(text)
+            scrollbar = self._detached_display.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+    
+    def _on_detach_transcription(self):
+        """Create a detached window for live transcriptions."""
+        if self._detached_window:
+            # Window already exists, just bring it to front
+            self._detached_window.show()
+            self._detached_window.activateWindow()
+            self._detached_window.raise_()
+            return
+        
+        # Create detached window
+        self._detached_window = QDialog(self)
+        self._detached_window.setWindowTitle('Live Transcriptions')
+        self._detached_window.resize(400, 500)
+        
+        layout = QVBoxLayout(self._detached_window)
+        
+        # Label
+        label = QLabel('Live Transcriptions')
+        label_font = label.font()
+        label_font.setPointSize(16)
+        label_font.setBold(True)
+        label.setFont(label_font)
+        layout.addWidget(label)
+        
+        # Text display
+        self._detached_display = QTextEdit()
+        self._detached_display.setReadOnly(True)
+        self._detached_display.setPlaceholderText('Transcriptions will appear here...')
+        
+        # Copy existing transcriptions
+        self._detached_display.setPlainText(self.live_transcription_display.toPlainText())
+        
+        layout.addWidget(self._detached_display)
+        
+        # Close button
+        close_button = QPushButton('Close')
+        close_button.clicked.connect(self._on_close_detached_window)
+        layout.addWidget(close_button)
+        
+        self._detached_window.show()
+    
+    def _on_close_detached_window(self):
+        """Close the detached transcription window."""
+        if self._detached_window:
+            self._detached_window.close()
+            self._detached_window = None
+            self._detached_display = None
 
     def _update_ui_state(self):
         """Update UI based on current session state."""
@@ -876,13 +1019,17 @@ class MainWindow(QMainWindow):
     def _on_start_session(self):
         """Handle start session button click."""
         try:
+            # Clear live transcription display for new session
+            self.live_transcription_display.clear()
+            
             # Generate session name with timestamp
             from datetime import datetime
             now = datetime.now()
             session_name = f"Session {now.strftime('%Y-%m-%d %H:%M')}"
             
             # Start session via manager (auto-starts recording)
-            self.session_manager.start_session(session_name, auto_record=True)
+            enable_live = self.live_transcription_checkbox.isChecked()
+            self.session_manager.start_session(session_name, auto_record=True, enable_live_transcription=enable_live)
             
             # Update UI
             self._update_ui_state()
@@ -890,6 +1037,21 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._on_status_update(f'Failed to start session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to start session: {str(e)}')
+    
+    def _clear_transcription_view(self):
+        """Clear all transcriptions from the view."""
+        if hasattr(self, 'live_transcription_layout') and self.live_transcription_layout:
+            # Remove all widgets except the stretch (last item)
+            while self.live_transcription_layout.count() > 1:
+                item = self.live_transcription_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        
+        if hasattr(self, '_detached_layout') and self._detached_layout:
+            while self._detached_layout.count() > 1:
+                item = self._detached_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
     
     def _on_stop_session(self):
         """Handle stop session button click."""
