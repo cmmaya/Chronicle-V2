@@ -20,7 +20,7 @@ class AudioRecorder:
         self.is_recording = False
         self.frames = []
         self.sample_rate = 44100
-        self.channels = 2
+        self.channels = 1  # Mono recording for efficiency
         self.device_index = None  # System default
         self.start_time = None
         self.process = None

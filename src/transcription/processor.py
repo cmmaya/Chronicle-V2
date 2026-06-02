@@ -7,13 +7,13 @@ from typing import Optional, List, Dict, Any, Set
 import glob as glob_module
 import threading
 
-from .parakeet import ParakeetV3, ParakeetError, ModelLoadError
+from .parakeet import ParakeetEngine, ParakeetError, ModelLoadError
 
 logger = logging.getLogger(__name__)
 
 
 class TranscriptionProcessor:
-    """Process audio files for transcription using Parakeet V3.
+    """Process audio files for transcription using Parakeet.
     
     Handles transcription of both microphone and system audio recordings,
     stores results in database with timestamps for synchronization.
@@ -22,18 +22,26 @@ class TranscriptionProcessor:
     SOURCE_MICROPHONE = 'microphone'
     SOURCE_SYSTEM = 'system'
     
+    # Maximum characters for context prompt (context limit)
+    MAX_CONTEXT_LENGTH = 2000
+    
     def __init__(self, 
                  session_path: str,
                  db=None,
                  model_path: Optional[str] = None,
-                 scorer_path: Optional[str] = None):
+                 scorer_path: Optional[str] = None,
+                 language: str = 'en'):
+
         """Initialize transcription processor.
         
         Args:
             session_path: Path to session directory containing audio files
             db: Database instance for storing transcripts (optional)
-            model_path: Path to Parakeet model file (optional)
-            scorer_path: Path to language model scorer (optional)
+            model_path: Parakeet ONNX model name/path. If None, ParakeetEngine defaults to
+                        'nemo-parakeet-tdt-0.6b-v3'.
+            scorer_path: Not used for Parakeet (kept for API compatibility)
+            language: Optional language code kept for API compatibility. Parakeet v3 can
+                      auto-detect supported languages.
         """
         self.session_path = Path(session_path)
         self.audio_path = self.session_path / 'audio'
@@ -41,7 +49,11 @@ class TranscriptionProcessor:
         self.mic_audio_path = self.audio_path / 'mic'
         self.system_audio_path = self.audio_path / 'system'
         self.db = db
-        self.parakeet = ParakeetV3(model_path=model_path, scorer_path=scorer_path)
+        self.whisper = ParakeetEngine(
+            model_path=model_path,
+            scorer_path=scorer_path,
+            language=language,
+        )
         self._is_loaded = False
         
         # Track processed chunks to avoid re-transcription
@@ -51,6 +63,11 @@ class TranscriptionProcessor:
         self._is_polling = False
         self._polling_thread: Optional[threading.Thread] = None
         self._stop_polling_event = threading.Event()
+        
+        # Context for deduplication and improved transcription
+        self._transcription_context: List[str] = []
+        self._last_transcript: Optional[str] = None  # Original text for deduplication
+        self._last_transcript_dedup: Optional[str] = None  # Deduplicated text for context
     
     def load_model(self) -> None:
         """Load Parakeet model.
@@ -62,7 +79,7 @@ class TranscriptionProcessor:
             return
         
         try:
-            self.parakeet.load()
+            self.whisper.load()
             self._is_loaded = True
             logger.info("TranscriptionProcessor model loaded")
         except ModelLoadError as e:
@@ -95,9 +112,21 @@ class TranscriptionProcessor:
             pattern = str(audio_dir / '*.wav')
             files.extend(glob_module.glob(pattern))
         
-        # Sort by modification time (oldest first)
-        files.sort(key=lambda f: Path(f).stat().st_mtime)
+        # Sort by timestamp in filename (YYYYMMDD_HHMMSS), not modification time
+        # This ensures chunks are processed in chronological order for deduplication
+        def get_timestamp_from_file(filepath: str) -> datetime:
+            try:
+                name = Path(filepath).stem
+                if len(name) >= 15:
+                    date_str = name[:15]
+                    return datetime.strptime(date_str, '%Y%m%d_%H%M%S')
+            except ValueError:
+                pass
+            # Fallback to modification time
+            return datetime.fromtimestamp(Path(filepath).stat().st_mtime)
         
+        files.sort(key=get_timestamp_from_file)
+
         return [Path(f) for f in files]
     
     def _get_source_from_filename(self, filepath: Path) -> str:
@@ -136,11 +165,12 @@ class TranscriptionProcessor:
         # Fallback: use file modification time
         return datetime.fromtimestamp(filepath.stat().st_mtime)
     
-    def transcribe_audio(self, audio_path: str) -> str:
+    def transcribe_audio(self, audio_path: str, initial_prompt: Optional[str] = None) -> str:
         """Transcribe a single audio file.
         
         Args:
             audio_path: Path to audio file
+            initial_prompt: Optional context argument kept for API compatibility
             
         Returns:
             Transcribed text string
@@ -152,7 +182,7 @@ class TranscriptionProcessor:
         if not self._is_loaded:
             self.load_model()
         
-        return self.parakeet.transcribe(audio_path)
+        return self.whisper.transcribe(audio_path, initial_prompt=initial_prompt)
     
     def process_microphone_audio(self, session_id: int) -> List[Dict[str, Any]]:
         """Process all microphone audio files for a session.
@@ -205,6 +235,125 @@ class TranscriptionProcessor:
         logger.info(f"Processed {len(results)} {source} audio files")
         return results
     
+    def _get_context_prompt(self) -> Optional[str]:
+        """Build context prompt from recent transcriptions.
+        
+        Returns:
+            Context string for Whisper initial_prompt, or None if no context
+        """
+        if not self._transcription_context:
+            return None
+        
+        # Join recent transcriptions, limiting to MAX_CONTEXT_LENGTH
+        context = ' '.join(self._transcription_context)
+        if len(context) > self.MAX_CONTEXT_LENGTH:
+            # Truncate to last MAX_CONTEXT_LENGTH characters
+            context = context[-self.MAX_CONTEXT_LENGTH:]
+        
+        return context
+    
+    def _deduplicate_transcription(self, new_text: str) -> str:
+        """Remove overlapping text from new transcription based on previous transcript.
+        
+        Uses a simpler algorithm to find and remove repeated phrases at the
+        beginning of the new text that appear at the end of the previous transcript.
+        
+        Args:
+            new_text: The newly transcribed text
+            
+        Returns:
+            Deduplicated text with overlapping content removed
+        """
+        if not self._last_transcript or not new_text:
+            return new_text
+        
+        # Get words from previous transcript
+        prev_words = self._last_transcript.split()
+        new_words = new_text.split()
+        
+        if len(prev_words) < 3 or len(new_words) < 3:
+            logger.debug(f"Deduplication skipped: prev_words={len(prev_words)}, new_words={len(new_words)}")
+            return new_text
+        
+        # Try to find overlap starting from longer phrases to shorter
+        # Check last 8, 6, 4, 3 words of previous transcript
+        for num_words in [min(8, len(prev_words)), min(6, len(prev_words)), 
+                          min(4, len(prev_words)), 3]:
+            # Get last N words from previous
+            phrase = ' '.join(prev_words[-num_words:]).lower()
+            
+            # Check if new text starts with similar phrase
+            new_lower = new_text.lower().strip()
+            
+            # Find this phrase in the beginning of new text
+            idx = new_lower.find(phrase)
+            if idx == 0:
+                # Found exact match at start - remove it
+                result_words = new_words[num_words:]
+                result = ' '.join(result_words)
+                logger.info(f"Deduplication: removed {num_words} words overlap. Before: {len(new_words)} words, After: {len(result_words)} words")
+                return result
+            
+            # Check for partial match (whitespace variations)
+            phrase_words = phrase.split()
+            if len(phrase_words) >= 3:
+                # Check if first 3+ words match
+                new_start = ' '.join(new_words[:num_words]).lower()
+                if self._words_similar(phrase, new_start):
+                    result_words = new_words[num_words:]
+                    result = ' '.join(result_words)
+                    logger.info(f"Deduplication: removed {num_words} words (partial match). Before: {len(new_words)} words, After: {len(result_words)} words")
+                    return result
+        
+        logger.debug(f"No overlap detected between transcripts")
+        return new_text
+    
+    def _words_similar(self, phrase1: str, phrase2: str, threshold: float = 0.7) -> bool:
+        """Check if two phrases are similar (70%+ word overlap).
+        
+        Args:
+            phrase1: First phrase
+            phrase2: Second phrase
+            threshold: Minimum similarity ratio (0-1)
+            
+        Returns:
+            True if phrases are similar
+        """
+        words1 = set(phrase1.split())
+        words2 = set(phrase2.split())
+        
+        if not words1 or not words2:
+            return False
+        
+        intersection = words1 & words2
+        max_len = max(len(words1), len(words2))
+        
+        return len(intersection) / max_len >= threshold
+    
+    def _update_context(self, text: str, original_text: str = None) -> None:
+        """Update transcription context with new text.
+        
+        Args:
+            text: The deduplicated text to add to context
+            original_text: The original text before deduplication (for next chunk comparison)
+        """
+        if not text:
+            return
+        
+        # Add deduplicated text to context for Whisper prompt
+        self._transcription_context.append(text)
+        
+        # Keep only last 5 transcriptions in context window
+        max_context_size = 5
+        if len(self._transcription_context) > max_context_size:
+            self._transcription_context = self._transcription_context[-max_context_size:]
+        
+        # Store original text (before deduplication) for next chunk's deduplication
+        # This is what we compare against to find overlaps
+        self._last_transcript = original_text if original_text else text
+        # Also store deduplicated version for reference
+        self._last_transcript_dedup = text
+    
     def _transcribe_and_store(self, 
                                audio_file: Path, 
                                session_id: int, 
@@ -221,16 +370,31 @@ class TranscriptionProcessor:
         """
         timestamp = self._extract_timestamp(audio_file)
         
+        # Get context prompt for improved transcription
+        context_prompt = self._get_context_prompt()
+        
+        if context_prompt:
+            logger.debug(f"Using context prompt ({len(context_prompt)} chars) for {audio_file.name}")
+        
         try:
-            # Transcribe audio
-            text = self.transcribe_audio(str(audio_file))
+            # Transcribe audio. Parakeet does not consume initial_prompt; the engine keeps this argument for API compatibility.
+            text = self.transcribe_audio(str(audio_file), initial_prompt=context_prompt)
+            
+            # Store original text before deduplication
+            original_text = text
+            
+            # Deduplicate based on previous transcript
+            deduplicated_text = self._deduplicate_transcription(text)
+            
+            # Update context for next transcription (pass original for comparison)
+            self._update_context(deduplicated_text, original_text)
             
             # Store in database if available
             if self.db:
                 self.db.add_transcript(
                     session_id=session_id,
                     timestamp=timestamp,
-                    text=text,
+                    text=deduplicated_text,
                     source=source
                 )
                 logger.info(f"Stored transcript for {audio_file.name}")
@@ -238,7 +402,7 @@ class TranscriptionProcessor:
             return {
                 'filepath': str(audio_file),
                 'timestamp': timestamp,
-                'text': text,
+                'text': deduplicated_text,
                 'source': source,
                 'session_id': session_id
             }
@@ -406,13 +570,24 @@ class TranscriptionProcessor:
         Returns:
             Dictionary with model metadata
         """
-        return self.parakeet.get_model_info()
+        return self.whisper.get_model_info()
     
     def unload_model(self) -> None:
         """Unload model to free memory."""
-        self.parakeet.unload()
+        self.whisper.unload()
         self._is_loaded = False
         logger.info("TranscriptionProcessor model unloaded")
+    
+    def reset_context(self) -> None:
+        """Reset transcription context and deduplication state.
+        
+        Useful when starting a new transcription session or processing
+        a different session's audio.
+        """
+        self._transcription_context.clear()
+        self._last_transcript = None
+        self._last_transcript_dedup = None
+        logger.info("Reset transcription context")
     
     def _polling_loop(self, session_id: int, poll_interval: float = 2.0) -> None:
         """Background polling loop for continuous chunk transcription.

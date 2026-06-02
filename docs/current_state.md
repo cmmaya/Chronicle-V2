@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU020
-- Next BU: BU021
+- Current BU: BU025
+- Next BU: BU026
 
 ## Target Architecture
 
@@ -36,6 +36,11 @@ BU017 - Trigger Summarization from UI
 BU018 - Display Summary in UI
 BU019 - Screenshot Button in UI
 BU020 - Display Screenshots in UI
+BU021 - Session Playback
+BU022 - Session Deletion
+BU023 - Overlapping Audio Chunking
+BU024 - Transcription Deduplication and Context
+BU025 - Mono Recording
 
 ## In Progress BUs
 None

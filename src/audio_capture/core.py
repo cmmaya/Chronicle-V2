@@ -69,12 +69,13 @@ class ChunkedAudioRecorder:
                 )
             self._system_recorder = SystemAudioRecorder(
                 session_path=str(session_path),
-                source=source
+                source=source,
+                channels=1  # Force mono recording
             )
             # Expose needed attributes from system recorder
             self._recorder = self._system_recorder
             self.sample_rate = self._system_recorder.sample_rate
-            self.channels = self._system_recorder.channels
+            self.channels = 1  # Force mono recording
         else:
             # Use AudioRecorder for microphone
             self._recorder = AudioRecorder(
