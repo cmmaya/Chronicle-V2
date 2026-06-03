@@ -176,7 +176,7 @@ def test_delete_conversation():
             pass  # Expected
         
         db.disconnect()
-        print("✓ Test delete conversation passed")
+        print("[PASS] Test delete conversation passed")
 
 
 def test_delete_message():
@@ -200,7 +200,7 @@ def test_delete_message():
         assert messages[0]['content'] == 'Message to keep'
         
         db.disconnect()
-        print("✓ Test delete message passed")
+        print("[PASS] Test delete message passed")
 
 
 def test_get_message():
@@ -222,7 +222,7 @@ def test_get_message():
         assert msg['role'] == 'user'
         
         db.disconnect()
-        print("✓ Test get message passed")
+        print("[PASS] Test get message passed")
 
 
 if __name__ == '__main__':
@@ -237,4 +237,4 @@ if __name__ == '__main__':
     test_delete_message()
     test_get_message()
     
-    print("\n✓ All tests passed!")
+    print("\n[PASS] All tests passed!")

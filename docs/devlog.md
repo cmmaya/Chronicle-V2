@@ -782,3 +782,387 @@ Recovery Notes:
   1. Live transcription was used during recording (transcripts saved in real-time)
   2. Batch processing found new audio files to transcribe
   3. Any transcripts exist in the database for the session
+
+---
+
+## BU034 - Assistant Conversation Storage
+
+Summary:
+Added SQLite tables and database methods for persisting assistant conversations and messages. Supports session-scoped conversations (linked to session_id) and global conversations (null session_id for all-session scope).
+
+Files Changed:
+
+- src/storage/database.py
+
+Important Decisions:
+
+- Used `CREATE TABLE IF NOT EXISTS` for schema creation
+- session_id is nullable to support both session-scoped and global conversations
+- Messages stored with role ('user', 'assistant', 'system') and plain text content only
+- Messages returned in chronological order (timestamp ASC)
+- Conversation updated_at timestamp automatically updated when messages are added
+- Delete conversation cascades to delete all associated messages
+
+Recovery Notes:
+
+- Ready for BU035 (assistant UI integration)
+- Plain text only - no screenshots or audio binaries stored
+- Schema migrations for existing databases not yet implemented (manual migration required)
+
+---
+
+## BU035 - Assistant Agent Options Config
+
+Summary:
+Added ASSISTANT_AGENTS configuration to config.py with two assistant agent options. Each agent has id, label, model, and system_instruction. Default agent is set to "chronicle_assistant".
+
+Files Changed:
+
+- src/config.py
+
+Important Decisions:
+
+- Defined 2 agents: "chronicle_assistant" (default) and "concise_helper"
+- Both agents use google/gemini-2.5-flash model
+- System instructions focus on session-grounded answers and clarification when context is ambiguous
+- Existing SUMMARIZATION config remains compatible (no changes needed)
+
+Recovery Notes:
+
+- Ready for BU036 (UI dropdown wiring)
+- Config structure allows easy addition of more agents
+- Default agent accessible via ASSISTANT_AGENTS["default"]
+
+---
+
+## BU036 - Assistant OpenRouter Client
+
+Summary:
+Created a minimal OpenRouter chat client for assistant answers. The client is separate from the existing summarization code and provides a focused interface for making chat completions.
+
+Files Changed:
+
+- src/assistant/openrouter_client.py (new)
+- src/assistant/__init__.py (new)
+- tests/test_openrouter_client.py (new)
+
+Important Decisions:
+
+- Created OpenRouterClient class with chat() method accepting api_key, model, messages, and optional temperature
+- Returns assistant text only (not full response object)
+- Raises clear custom exceptions: MissingAPIKeyError, APIRequestError, InvalidResponseError
+- Uses same API URL pattern as SummaryGenerator but is a separate focused client
+- Supports loading API key from environment variable (OPENROUTER_API_KEY)
+- Default temperature of 0.7 for assistant conversations
+- Uses lazy import for requests library to handle missing dependency gracefully
+
+Validation:
+
+- All 8 unit tests pass:
+  - test_missing_api_key_raises_error
+  - test_missing_model_raises_error
+  - test_empty_messages_raises_error
+  - test_successful_response_parsing
+  - test_missing_choices_raises_error
+  - test_http_error_raises_api_error
+  - test_import_openrouter_client
+  - test_import_exceptions
+
+Recovery Notes:
+
+- Ready for BU037 (UI dropdown wiring and integration)
+- Client can be imported without side effects
+- No summarization code was modified - this is a separate focused client
+
+---
+
+## BU037 - Assistant Context Models
+
+Summary:
+Created simple dataclasses for session context, search matches, and clarification candidates. Includes AssistantContext, SessionCandidate, TranscriptExcerpt, SummaryExcerpt, and ScreenshotReference classes with prompt text generation methods.
+
+Files Changed:
+
+- src/assistant/context_models.py (new)
+- src/assistant/__init__.py (updated exports)
+- tests/test_context_models.py (new)
+
+Important Decisions:
+
+- Used plain dataclasses (not abstraction framework) per BU specification
+- Included to_prompt_text methods for prompt construction
+- All primitive fields for serialization compatibility
+- is_empty() method for safe empty context checking
+
+Validation:
+
+- All 20 unit tests pass:
+  - Test constructing context models
+  - Test prompt text generation for transcript and summary excerpts
+  - Test empty context renders safely
+  - Full context rendering with sessions, transcripts, summaries, and screenshots
+
+---
+
+## BU038 - Single Session Assistant Retrieval
+
+Summary:
+Created AssistantContextRetriever class to build bounded context from SQLite-backed resources for a single session. Supports retrieving summaries, filtering transcripts by keyword matching, and finding screenshots near relevant transcript timestamps.
+
+Files Changed:
+
+- src/assistant/context.py (new)
+- tests/test_context_retriever.py (new)
+
+Important Decisions:
+
+- Used Protocol for database abstraction (DatabaseProtocol)
+- Keyword extraction filters stop words and extracts content words > 3 chars
+- Transcript filtering limits to top 5 keyword matches or most recent 20
+- Long transcripts truncated to 500 characters with "..." suffix
+- Screenshots matched within 60-second window of relevant transcript timestamps
+- Raises NotImplementedError with clear BU039 TODO if get_transcripts missing
+
+Definition of Done Satisfied:
+
+- [x] build_session_context returns deterministic context for explicit session_id
+- [x] Context includes summary text when available
+- [x] Context includes bounded transcript excerpts
+- [x] Context includes local screenshot references only
+
+Validation:
+
+- All 12 unit tests pass:
+  - Test context building returns valid AssistantContext
+  - Test empty database returns empty but valid context
+  - Test summary inclusion when available
+  - Test transcript filtering with keywords
+  - Test transcript filtering returns recent when no keywords
+  - Test long transcripts truncated
+  - Test screenshots near transcripts
+  - Test no transcripts means no screenshot filtering
+  - Test missing session uses default name
+  - Test keyword extraction filters stop words
+  - Test keyword extraction includes content words
+  - Test missing get_transcripts raises clear TODO error
+
+---
+
+## BU039
+
+Summary:
+Added safe read-only database search methods for transcript and summary search across sessions. These methods use parameterized SQL queries to prevent injection and return results with session metadata for context resolution.
+
+Files Changed:
+- src/storage/database.py - Added search_transcripts(), search_summaries(), find_sessions() methods
+- tests/test_database_search.py - New test file with 13 tests
+
+Important Decisions:
+- Used parameterized LIKE queries (not raw SQL from model input)
+- All search methods are read-only - no INSERT/UPDATE/DELETE operations
+- Results include session_name for context/resolver needs
+- get_transcripts(session_id) already existed from prior BU
+
+Recovery Notes:
+- BU039 blocks BU040 and BU041
+- No UI changes or assistant service logic included (out of scope)
+- No embeddings/vector database implemented (out of scope)
+
+---
+
+## BU040 - Assistant Session Resolver
+
+Summary:
+Created AssistantSessionResolver class to infer session scope from user questions. Resolves whether a question targets current session, selected session, all sessions, or returns ambiguous/needs_clarification when inference is not possible.
+
+Files Changed:
+- src/assistant/session_resolver.py (new)
+- src/assistant/__init__.py (updated exports)
+- tests/test_session_resolver.py (new, 18 tests)
+
+Important Decisions:
+- ScopeResolution enum with 5 outcomes: CURRENT_SESSION, SELECTED_SESSION, ALL_SESSIONS, AMBIGUOUS, NEEDS_CLARIFICATION
+- Cross-session patterns detected first (all sessions, previous sessions, compare, where did we discuss)
+- Database search via find_sessions for keyword-based session inference
+- Stop word filtering for search term extraction
+- Resolver never guesses when multiple candidates exist - returns AMBIGUOUS with candidates
+
+Definition of Done Satisfied:
+- [x] Resolver returns explicit structured outcomes
+- [x] Resolver never guesses when candidates are ambiguous
+- [x] Cross-session intent is detected before single-session inference
+- [x] Behavior is deterministic for active/selected/any scope inputs
+
+Validation:
+- All 18 unit tests pass
+
+Recovery Notes:
+- Ready for BU041 (Whitelisted Assistant Retrieval Tools)
+- No OpenRouter calls, UI code, or SQL outside database methods (out of scope)
+
+---
+
+## BU041 - Whitelisted Assistant Retrieval Tools
+
+Summary:
+Created AssistantRetrievalTools class with whitelisted retrieval methods for assistant queries. Provides controlled access to session data without exposing raw database or SQL execution capabilities.
+
+Files Changed:
+- src/assistant/tools.py (new)
+- tests/test_assistant_tools.py (new, 37 tests)
+
+Important Decisions:
+- Created 5 tool methods: find_sessions, get_session_context, search_transcripts, search_summaries, get_screenshots_near
+- All methods validate inputs and raise ValueError for empty queries or invalid parameters
+- Limits are capped at maximum values (50) to prevent oversized outputs
+- Methods delegate to AssistantContextRetriever or Database methods - no raw SQL execution
+- Error handling returns error dict instead of raising to allow graceful degradation
+
+Definition of Done Satisfied:
+- [x] Tool methods are importable and deterministic
+- [x] Tools cover explicit session and cross-session retrieval
+- [x] Tools enforce bounded query limits
+- [x] No raw SQL execution path exists
+
+Validation:
+- All 37 unit tests pass:
+  - Test each tool delegates to fake db/retriever
+  - Test empty query handling raises ValueError
+  - Test max limit is capped
+  - Test invalid session_id/timestamp raises ValueError
+  - Test exception handling returns error dict
+
+Recovery Notes:
+- Ready for BU042
+- No UI code, OpenRouter function-calling protocol, or model-generated SQL (out of scope)
+
+# BU042 Implementation Summary (Completed)
+
+## Summary:
+Created AssistantAnswerService in src/assistant/service.py that coordinates session resolution, context retrieval, OpenRouter answering, and conversation persistence.
+
+## Files Changed:
+- src/assistant/service.py (new file)
+- src/assistant/__init__.py (updated exports)
+- tests/test_assistant_service.py (new file)
+
+## Important Decisions:
+- Single ask() entrypoint hides retrieval, ambiguity handling, and OpenRouter complexity from UI
+- Ambiguous cases return clarification WITHOUT calling OpenRouter (saves API calls)
+- Single-session uses get_session_context for bounded context
+- All-session uses search tools for cross-session context
+- Conversation persistence via existing database create_conversation/add_message methods
+
+## Implementation Details:
+- ask(question, agent_id, explicit_scope, active_session_id, selected_session_id, conversation_id) -> AnswerResponse
+- Uses AssistantSessionResolver to determine scope (current_session, selected_session, all_sessions, ambiguous, needs_clarification)
+- Returns structured AnswerResponse with success/clarification/error states
+- Context converted to prompt text using _dict_to_context_prompt()
+- Messages built with system prompt (agent instruction + context), history, and current question
+- Persists user/assistant messages to database after successful answer
+
+## Definition of Done Satisfied:
+- [x] Service has one ask entrypoint for UI wiring
+- [x] Ambiguous session cases ask clarification instead of guessing
+- [x] Single-session and any-session scopes both produce answers
+- [x] Conversation persistence works through existing database methods
+
+## Validation:
+- All 10 unit tests pass:
+  - Test ambiguous resolver output returns clarification without OpenRouter call
+  - Test single-session path calls context retrieval and OpenRouter client
+  - Test all-session path uses search tools
+  - Test messages are saved after successful answer
+
+## Recovery Notes:
+- Ready for BU043 (blocks BU044, BU045, BU047)
+- No UI code, database schema changes, streaming, or screenshot image upload (out of scope)
+
+---
+
+## BU043 - Assistant UI Panel Skeleton
+
+Summary:
+Added an Assistant UI panel skeleton to the main window with agent selector, scope control, question input, Ask/Detach buttons, and read-only answer display.
+
+Files Changed:
+- src/app/window.py
+
+Important Decisions:
+- Agent dropdown populated from ASSISTANT_AGENTS config (chronicle_assistant, concise_helper)
+- Scope control provides two options: "Current Session" and "Any Session"
+- Ask and Detach buttons have placeholder handlers that display status messages
+- Panel visually separate from live transcription controls (on left side)
+
+Definition of Done Satisfied:
+- [x] Assistant panel appears in the UI
+- [x] Agent selector shows configured agents
+- [x] Scope control clearly distinguishes Current Session from Any Session
+- [x] Ask and Detach controls exist but do not perform backend actions yet
+
+Recovery Notes:
+- Ready for BU044 (Assistant Service Wiring)
+- No service wiring, OpenRouter calls, or database queries per BU043 scope
+- Buttons show status messages indicating they are not yet wired
+
+---
+
+## BU044 - Wire Assistant Ask Action
+
+Summary:
+Connected the assistant UI Ask button to AssistantAnswerService. The assistant panel is now fully functional - users can ask questions about their sessions and receive answers.
+
+Files Changed:
+- src/app/window.py
+
+Important Decisions:
+- Imported AssistantAnswerService and added to window.py
+- Instantiated service in _init_session_manager with session_manager.db
+- _on_ask_clicked reads question, agent_id, and scope (current_session/any_session)
+- Gets active_session_id from active session if recording, selected_session_id from table selection
+- Uses QTimer.singleShot to run query in background for UI responsiveness
+- Answer/clarification/error displayed in answer_display QTextEdit
+- Ask button disabled during processing, re-enabled in finally block
+
+Definition of Done Satisfied:
+- [x] Ask button calls AssistantAnswerService with correct scope
+- [x] Current Session scope passes active/selected session context
+- [x] Any Session scope passes explicit all-session intent
+- [x] Errors are shown in the assistant answer area without crashing UI
+
+Recovery Notes:
+- Ready for BU045 (next)
+- No detachable behavior implemented (out of scope per BU044)
+- No past conversation browser (out of scope)
+
+---
+
+## BU045 - Assistant Clarification Flow UI
+
+Summary:
+Added UI support for handling ambiguous session responses from the assistant. When the resolver finds multiple possible sessions, the assistant now displays candidate sessions in the UI for user selection instead of silently guessing.
+
+Files Changed:
+- src/app/window.py
+
+Important Decisions:
+- Added QAbstractItemView import for selection mode
+- Added candidate selection UI (QGroupBox with QListWidget and "Use Selected Session" button)
+- Added _display_candidates() to show session candidates with name and date
+- Added _clear_candidates() to hide candidate UI when no longer needed
+- Added _on_candidate_selected() to enable button when user selects a candidate
+- Added _on_use_candidate_clicked() to retry question with selected session
+- Candidates cleared on: new question, successful answer, or error
+- Original question stored in _current_question for retry after selection
+
+Definition of Done Satisfied:
+- [x] Ambiguous responses show candidate session choices
+- [x] Choosing a candidate retries the question against that session
+- [x] The UI does not silently pick among multiple candidates
+- [x] Candidate UI is cleared when no longer relevant
+
+Recovery Notes:
+- Ready for BU046 (next)
+- No resolver changes per BU045 scope
+- No conversation history browser (out of scope)
+- No multi-turn tool loop (out of scope)

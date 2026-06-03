@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU033 (completed)
-- Next BU: none
+- Current BU: None
+- Next BU: BU046
 
 ## Target Architecture
 
@@ -49,6 +49,18 @@ BU030 - UI Layout for Live Transcriptions
 BU031 - Live Transcription Checkbox
 BU032 - Live Transcription Display
 BU033 - Filtering Transcriptions
+BU034 - Assistant Conversation Storage
+BU035 - Assistant Agent Options Config
+BU036 - Assistant OpenRouter Client
+BU037 - Assistant Context Models
+BU038 - Single Session Assistant Retrieval
+BU039 - Assistant Database Search Methods
+BU040 - Assistant Session Resolver
+BU041 - Whitelisted Assistant Retrieval Tools
+BU042 - Assistant Answer Service
+BU043 - Assistant UI Panel Skeleton
+BU044 - Wire Assistant Ask Action
+BU045 - Assistant Clarification Flow UI
 
 ## In Progress BUs
 None
@@ -133,3 +145,20 @@ None
 - Transcriptions styled differently for mic (blue bubble) vs system (green bubble) audio
 - Added add_transcription_to_view() method for adding styled transcription bubbles
 - Added _create_transcription_view() method to create the scrollable transcription area
+- Added search_transcripts(query, limit, session_id) for parameterized transcript search
+- Added search_summaries(query, limit, session_id) for parameterized summary search
+- Added find_sessions(query, limit) for searching sessions by name, summary, or transcript content
+- All search methods use parameterized SQL to prevent injection
+- AssistantRetrievalTools class created in src/assistant/tools.py
+  - find_sessions(query, limit) - Search sessions by name, summary, or transcript
+  - get_session_context(session_id, question, transcript_limit) - Get bounded session context
+  - search_transcripts(query, limit, session_id) - Search transcripts by text
+  - search_summaries(query, limit, session_id) - Search summaries by content
+  - get_screenshots_near(session_id, timestamp, tolerance_seconds, limit) - Get screenshots near timestamp
+- All tools validate inputs and cap limits at maximum values
+- No raw SQL execution exposed to answer service
+- Tests added in tests/test_assistant_tools.py (37 tests passing)
+- Assistant UI panel skeleton added to main window with agent selector, scope control, question input, Ask/Detach buttons, and answer display
+- AssistantAnswerService wired to Ask button in main window
+- Ask button now calls service with question, agent_id, scope, active_session_id, and selected_session_id
+- Error handling displays in answer area without crashing UI

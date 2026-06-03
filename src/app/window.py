@@ -4,13 +4,16 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
-                                QFrame)
+                                QFrame, QAbstractItemView)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG
 from PySide6.QtGui import QAction, QPixmap, QColor
+from typing import Optional
 import logging
 
 from .session_manager import SessionManager
 from ..summarization import SummaryGenerator
+from ..config import ASSISTANT_AGENTS
+from ..assistant.service import AssistantAnswerService
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,11 @@ class MainWindow(QMainWindow):
         self._transcription_layout = None
         self._transcription_history = []  # Store transcriptions for detached window
         self._transcription_filter = 'all'  # Filter state: 'all', 'mic', or 'system'
+        
+        # Assistant panel state
+        self._current_question = None  # Store original question for retry
+        self._current_candidates = []  # Store current candidates for selection
+        self._candidate_list_widget = None  # List widget for candidate selection
         
         # Create UI components
         self._create_menu_bar()
@@ -111,6 +119,16 @@ class MainWindow(QMainWindow):
                 status_callback=self._on_status_update,
                 live_transcription_ui_callback=self._on_live_transcription
             )
+            
+            # Initialize Assistant Answer Service
+            self.assistant_service = AssistantAnswerService(
+                db=self.session_manager.db
+            )
+            
+            # Track active/selected session for assistant
+            self._active_session_id = None
+            self._selected_session_id = None
+            
             self._update_ui_state()
             self._load_past_sessions()
             self.status_label.setText('Ready')
@@ -131,6 +149,16 @@ class MainWindow(QMainWindow):
             for row, session in enumerate(sessions):
                 trans_status = session.get('transcription_status', 'none')
                 sum_status = session.get('summary_status', 'none')
+                
+                # FIX: Verify transcription status against actual transcripts in database
+                # This corrects cases where transcription_status is 'none' but transcripts exist
+                session_id = session['id']
+                if trans_status == 'none':
+                    actual_transcripts = self.session_manager.db.get_transcripts(session_id)
+                    if actual_transcripts:
+                        # Fix the inconsistent state in database
+                        self.session_manager.db.update_session(session_id, transcription_status='transcribed')
+                        trans_status = 'transcribed'
                 
                 # Session name (editable)
                 name_item = QTableWidgetItem(session['name'])
@@ -848,6 +876,96 @@ class MainWindow(QMainWindow):
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
         left_layout.addWidget(sessions_group)
+        
+        # Assistant panel
+        assistant_group = QGroupBox('Assistant')
+        assistant_layout = QVBoxLayout()
+        
+        # Agent selection row
+        agent_layout = QHBoxLayout()
+        agent_label = QLabel("Agent:")
+        agent_layout.addWidget(agent_label)
+        
+        self.agent_combo = QComboBox()
+        # Populate with agents from config
+        agents = ASSISTANT_AGENTS.get('agents', {})
+        default_agent_id = ASSISTANT_AGENTS.get('default', '')
+        for agent_id, agent_info in agents.items():
+            self.agent_combo.addItem(agent_info.get('label', agent_id), agent_id)
+        # Set default selection
+        default_index = self.agent_combo.findData(default_agent_id)
+        if default_index >= 0:
+            self.agent_combo.setCurrentIndex(default_index)
+        agent_layout.addWidget(self.agent_combo)
+        assistant_layout.addLayout(agent_layout)
+        
+        # Scope selection row
+        scope_layout = QHBoxLayout()
+        scope_label = QLabel("Scope:")
+        scope_layout.addWidget(scope_label)
+        
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("Current Session", "current")
+        self.scope_combo.addItem("Any Session", "any")
+        scope_layout.addWidget(self.scope_combo)
+        scope_layout.addStretch()
+        assistant_layout.addLayout(scope_layout)
+        
+        # Question input
+        question_label = QLabel("Question:")
+        assistant_layout.addWidget(question_label)
+        
+        self.question_input = QTextEdit()
+        self.question_input.setPlaceholderText("Ask a question about your sessions...")
+        self.question_input.setMaximumHeight(80)
+        assistant_layout.addWidget(self.question_input)
+        
+        # Ask and Detach buttons
+        button_layout = QHBoxLayout()
+        
+        self.ask_button = QPushButton("Ask")
+        self.ask_button.clicked.connect(self._on_ask_clicked)
+        button_layout.addWidget(self.ask_button)
+        
+        self.detach_assistant_button = QPushButton("Detach")
+        self.detach_assistant_button.clicked.connect(self._on_detach_assistant)
+        button_layout.addWidget(self.detach_assistant_button)
+        
+        button_layout.addStretch()
+        assistant_layout.addLayout(button_layout)
+        
+        # Answer display (read-only)
+        answer_label = QLabel("Answer:")
+        assistant_layout.addWidget(answer_label)
+        
+        self.answer_display = QTextEdit()
+        self.answer_display.setReadOnly(True)
+        self.answer_display.setPlaceholderText("Assistant responses will appear here...")
+        self.answer_display.setMaximumHeight(150)
+        assistant_layout.addWidget(self.answer_display)
+        
+        # Candidate session selection (initially hidden)
+        self.candidate_group = QGroupBox("Select a Session:")
+        candidate_layout = QVBoxLayout()
+        
+        self._candidate_list_widget = QListWidget()
+        self._candidate_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._candidate_list_widget.setMaximumHeight(100)
+        self._candidate_list_widget.itemClicked.connect(self._on_candidate_selected)
+        candidate_layout.addWidget(self._candidate_list_widget)
+        
+        # Use Selected Session button
+        self.use_candidate_button = QPushButton("Use Selected Session")
+        self.use_candidate_button.clicked.connect(self._on_use_candidate_clicked)
+        self.use_candidate_button.setEnabled(False)
+        candidate_layout.addWidget(self.use_candidate_button)
+        
+        self.candidate_group.setLayout(candidate_layout)
+        self.candidate_group.setVisible(False)  # Hidden by default
+        assistant_layout.addWidget(self.candidate_group)
+        
+        assistant_group.setLayout(assistant_layout)
+        left_layout.addWidget(assistant_group)
         
         # Right side widget - placeholder for live transcription
         right_widget = QWidget()
@@ -1837,6 +1955,198 @@ class MainWindow(QMainWindow):
                 self.session_manager.vad_aggressiveness = self._vad_aggressiveness
             
             self._on_status_update(f'VAD settings updated: {self._vad_threshold}% threshold, Mode {self._vad_aggressiveness}')
+    
+    def _on_ask_clicked(self):
+        """Handle the Ask button click - wires to AssistantAnswerService."""
+        # Get the question from the input
+        question = self.question_input.toPlainText().strip()
+        
+        if not question:
+            self.answer_display.setPlainText("Please enter a question.")
+            return
+        
+        # Clear previous candidates when asking a new question
+        self._clear_candidates()
+        
+        # Store the original question for potential retry
+        self._current_question = question
+        
+        # Get selected agent
+        agent_id = self.agent_combo.currentData()
+        
+        # Get scope from combo
+        scope_value = self.scope_combo.currentData()  # "current" or "any"
+        explicit_scope = "current_session" if scope_value == "current" else "any_session"
+        
+        # Get active session ID if there's an active session
+        active_session = self.session_manager.get_active_session()
+        active_session_id = active_session.id if active_session else None
+        
+        # Get selected session ID from the sessions table
+        selected_session_id = self._get_selected_session_id()
+        
+        # Disable the Ask button while processing
+        self.ask_button.setEnabled(False)
+        self.answer_display.setPlainText("Thinking...")
+        
+        # Run the assistant service call in the background using QTimer to keep UI responsive
+        QTimer.singleShot(50, lambda: self._run_assistant_query(
+            question=question,
+            agent_id=agent_id,
+            explicit_scope=explicit_scope,
+            active_session_id=active_session_id,
+            selected_session_id=selected_session_id
+        ))
+    
+    def _run_assistant_query(
+        self,
+        question: str,
+        agent_id: str,
+        explicit_scope: str,
+        active_session_id: Optional[int],
+        selected_session_id: Optional[int]
+    ):
+        """Execute the assistant query in the background."""
+        try:
+            # Call the assistant service
+            response = self.assistant_service.ask(
+                question=question,
+                agent_id=agent_id,
+                explicit_scope=explicit_scope,
+                active_session_id=active_session_id,
+                selected_session_id=selected_session_id
+            )
+            
+            # Handle the response
+            if response.success:
+                # Clear candidates on successful answer
+                self._clear_candidates()
+                self.answer_display.setPlainText(response.answer or "")
+                self._on_status_update("Answer received")
+            elif response.needs_clarification:
+                # Show clarification question and candidates
+                clarification_text = response.clarification_question or ""
+                self.answer_display.setPlainText(clarification_text)
+                
+                # Display candidates if available
+                if response.candidates:
+                    self._display_candidates(response.candidates)
+                else:
+                    # Hide candidate UI if no candidates
+                    self._clear_candidates()
+                    
+                self._on_status_update("Clarification needed")
+            else:
+                # Show error
+                error_text = response.error or "Unknown error occurred"
+                self.answer_display.setPlainText(f"Error: {error_text}")
+                self._on_status_update(f"Assistant error: {error_text}", is_error=True)
+                # Clear candidates on error
+                self._clear_candidates()
+                
+        except Exception as e:
+            logger.error(f"Assistant query failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.answer_display.setPlainText(f"Error: {str(e)}")
+            self._on_status_update(f"Assistant error: {str(e)}", is_error=True)
+            # Clear candidates on exception
+            self._clear_candidates()
+        
+        finally:
+            # Re-enable the Ask button
+            self.ask_button.setEnabled(True)
+    
+    def _get_selected_session_id(self) -> Optional[int]:
+        """Get the currently selected session ID from the sessions table."""
+        selected_indexes = self.sessions_list.selectedIndexes()
+        if selected_indexes:
+            # Get the row of the first selected item
+            row = selected_indexes[0].row()
+            item = self.sessions_list.item(row, 0)
+            if item:
+                return item.data(Qt.UserRole)
+        return None
+    
+    def _display_candidates(self, candidates: list):
+        """Display candidate sessions for user selection.
+        
+        Args:
+            candidates: List of candidate session dictionaries with session_id,
+                       session_name, and start_time keys.
+        """
+        from datetime import datetime
+        
+        self._current_candidates = candidates
+        self._candidate_list_widget.clear()
+        
+        for candidate in candidates:
+            session_name = candidate.get('session_name', 'Unknown')
+            session_id = candidate.get('session_id', 0)
+            start_time = candidate.get('start_time', 0)
+            
+            # Format display text
+            if start_time:
+                try:
+                    dt = datetime.fromtimestamp(start_time)
+                    display_text = f"{session_name} - {dt.strftime('%Y-%m-%d %H:%M')}"
+                except:
+                    display_text = f"{session_name} (ID: {session_id})"
+            else:
+                display_text = f"{session_name} (ID: {session_id})"
+            
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, session_id)
+            self._candidate_list_widget.addItem(item)
+        
+        self.candidate_group.setVisible(True)
+        self.use_candidate_button.setEnabled(False)
+    
+    def _clear_candidates(self):
+        """Clear candidate selection UI."""
+        self._current_candidates = []
+        self._current_question = None
+        self._candidate_list_widget.clear()
+        self.candidate_group.setVisible(False)
+        self.use_candidate_button.setEnabled(False)
+    
+    def _on_candidate_selected(self, item: QListWidgetItem):
+        """Handle candidate selection - enable the use button.
+        
+        Args:
+            item: The selected list widget item
+        """
+        self.use_candidate_button.setEnabled(item is not None)
+    
+    def _on_use_candidate_clicked(self):
+        """Handle the Use Selected Session button click - retry with selected session."""
+        selected_items = self._candidate_list_widget.selectedItems()
+        if not selected_items:
+            return
+        
+        item = selected_items[0]
+        selected_session_id = item.data(Qt.UserRole)
+        
+        if selected_session_id and self._current_question:
+            # Disable button during processing
+            self.use_candidate_button.setEnabled(False)
+            
+            # Get current settings
+            agent_id = self.agent_combo.currentData()
+            
+            # Run query with selected session (force current_session scope)
+            QTimer.singleShot(50, lambda: self._run_assistant_query(
+                question=self._current_question,
+                agent_id=agent_id,
+                explicit_scope="current_session",
+                active_session_id=None,
+                selected_session_id=selected_session_id
+            ))
+    
+    def _on_detach_assistant(self):
+        """Handle the Detach button click - placeholder for future detachable behavior."""
+        # TODO: Implement detachable window in future BU
+        self._on_status_update('Detach button clicked (not implemented yet)')
     
     def closeEvent(self, event):
         """Handle window close event."""

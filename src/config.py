@@ -1,5 +1,33 @@
 """Configuration settings for Chronicle application."""
 
+# Assistant Agent Settings
+ASSISTANT_AGENTS = {
+    # Default agent ID
+    "default": "chronicle_assistant",
+    
+    # Available agents: id -> {label, model, system_instruction}
+    "agents": {
+        "chronicle_assistant": {
+            "label": "Chronicle Assistant",
+            "model": "google/gemini-2.5-flash",
+            "system_instruction": (
+                "You are a helpful meeting assistant. Answer questions based only on the provided meeting transcript. "
+                "If the transcript does not contain enough information to answer a question, say so clearly and "
+                "suggest what additional information would be needed. Stay focused on the meeting content."
+            ),
+        },
+        "concise_helper": {
+            "label": "Concise Helper",
+            "model": "google/gemini-2.5-flash",
+            "system_instruction": (
+                "You are a brief and direct meeting assistant. Provide short, accurate answers based only on "
+                "the transcript. If unclear, ask a clarifying question. Prioritize key facts over elaboration."
+            ),
+        },
+    },
+}
+
+
 # Summarization Settings
 SUMMARIZATION = {
     # Model configuration

@@ -647,3 +647,118 @@ class Database:
             self.connection.commit()
         except sqlite3.Error as e:
             raise DatabaseError(f'Database reset failed: {str(e)}')
+
+    # Search Methods (read-only, parameterized queries)
+
+    def search_transcripts(self, query: str, limit: int = 10, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Search transcripts by text content using parameterized LIKE queries.
+
+        Args:
+            query: Search term to match against transcript text
+            limit: Maximum number of results to return
+            session_id: Optional session ID to limit search to a specific session
+
+        Returns:
+            List of transcript dictionaries with session metadata, sorted by timestamp
+
+        Raises:
+            DatabaseError: If search fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            search_pattern = f'%{query}%'
+            if session_id is not None:
+                cursor.execute('''
+                    SELECT t.*, s.name as session_name
+                    FROM transcripts t
+                    JOIN sessions s ON t.session_id = s.id
+                    WHERE t.session_id = ? AND t.text LIKE ?
+                    ORDER BY t.timestamp DESC
+                    LIMIT ?
+                ''', (session_id, search_pattern, limit))
+            else:
+                cursor.execute('''
+                    SELECT t.*, s.name as session_name
+                    FROM transcripts t
+                    JOIN sessions s ON t.session_id = s.id
+                    WHERE t.text LIKE ?
+                    ORDER BY t.timestamp DESC
+                    LIMIT ?
+                ''', (search_pattern, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Transcript search failed: {str(e)}')
+
+    def search_summaries(self, query: str, limit: int = 10, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Search summaries by content using parameterized LIKE queries.
+
+        Args:
+            query: Search term to match against summary content
+            limit: Maximum number of results to return
+            session_id: Optional session ID to limit search to a specific session
+
+        Returns:
+            List of summary dictionaries with session metadata, sorted by created_at
+
+        Raises:
+            DatabaseError: If search fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            search_pattern = f'%{query}%'
+            if session_id is not None:
+                cursor.execute('''
+                    SELECT su.*, s.name as session_name
+                    FROM summaries su
+                    JOIN sessions s ON su.session_id = s.id
+                    WHERE su.session_id = ? AND su.content LIKE ?
+                    ORDER BY su.created_at DESC
+                    LIMIT ?
+                ''', (session_id, search_pattern, limit))
+            else:
+                cursor.execute('''
+                    SELECT su.*, s.name as session_name
+                    FROM summaries su
+                    JOIN sessions s ON su.session_id = s.id
+                    WHERE su.content LIKE ?
+                    ORDER BY su.created_at DESC
+                    LIMIT ?
+                ''', (search_pattern, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Summary search failed: {str(e)}')
+
+    def find_sessions(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Find sessions by name, summary content, or transcript text.
+
+        Searches across session names, summary content, and transcript text
+        to find candidate sessions matching the query.
+
+        Args:
+            query: Search term to match against session names, summaries, or transcripts
+            limit: Maximum number of sessions to return
+
+        Returns:
+            List of session dictionaries with matched content preview
+
+        Raises:
+            DatabaseError: If search fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            search_pattern = f'%{query}%'
+            # Search across session names, summaries, and transcripts
+            cursor.execute('''
+                SELECT DISTINCT s.*,
+                       (SELECT su.content FROM summaries su WHERE su.session_id = s.id ORDER BY su.created_at DESC LIMIT 1) as matched_summary,
+                       (SELECT t.text FROM transcripts t WHERE t.session_id = s.id ORDER BY t.timestamp DESC LIMIT 1) as matched_transcript
+                FROM sessions s
+                LEFT JOIN summaries su ON s.id = su.session_id AND su.content LIKE ?
+                LEFT JOIN transcripts t ON s.id = t.session_id AND t.text LIKE ?
+                WHERE s.name LIKE ? OR su.content LIKE ? OR t.text LIKE ?
+                ORDER BY s.start_time DESC
+                LIMIT ?
+            ''', (search_pattern, search_pattern, search_pattern, search_pattern, search_pattern, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session search failed: {str(e)}')

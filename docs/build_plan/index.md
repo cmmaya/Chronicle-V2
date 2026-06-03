@@ -6,8 +6,8 @@
 | BU037 | Assistant Context Models | Pending | BU034 | BU038 |
 | BU038 | Single Session Assistant Retrieval | Pending | BU037 | BU039 |
 | BU039 | Assistant Database Search Methods | Pending | BU034 | BU040 |
-| BU040 | Assistant Session Resolver | Pending | BU037, BU039 | BU041 |
-| BU041 | Whitelisted Assistant Retrieval Tools | Pending | BU038, BU039, BU040 | BU042 |
+| BU040 | Assistant Session Resolver | Completed | BU037, BU039 | BU041 |
+| BU041 | Whitelisted Assistant Retrieval Tools | Completed | BU038, BU039, BU040 | BU042 |
 | BU042 | Assistant Answer Service | Pending | BU036, BU040, BU041 | BU043 |
 | BU043 | Assistant UI Panel Skeleton | Pending | BU035 | BU044 |
 | BU044 | Wire Assistant Ask Action | Pending | BU042, BU043 | BU045 |

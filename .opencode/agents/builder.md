@@ -22,6 +22,8 @@ Never rely on chat history.
 
 Repository documentation is your ONLY source of truth.
 
+Iterate until you are done or need human validation
+
 ==================================================
 CONTEXT RECOVERY
 ==================================================
