@@ -2,7 +2,7 @@
 
 ## Execution Status
 - Current BU: None
-- Next BU: BU046
+- Next BU: BU047
 
 ## Target Architecture
 
@@ -61,6 +61,7 @@ BU042 - Assistant Answer Service
 BU043 - Assistant UI Panel Skeleton
 BU044 - Wire Assistant Ask Action
 BU045 - Assistant Clarification Flow UI
+BU047 - Past Assistant Conversations UI
 
 ## In Progress BUs
 None

@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
-                                QFrame, QAbstractItemView)
+                                QFrame, QAbstractItemView, QSplitter)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG
 from PySide6.QtGui import QAction, QPixmap, QColor
 from typing import Optional
@@ -40,6 +40,9 @@ class MainWindow(QMainWindow):
         # Detached transcription window
         self._detached_window = None
         self._detached_display = None
+        
+        # Detached assistant window
+        self._detached_assistant_window = None
         
         # VAD settings
         self._vad_threshold = 30  # Default 30%
@@ -963,6 +966,14 @@ class MainWindow(QMainWindow):
         self.candidate_group.setLayout(candidate_layout)
         self.candidate_group.setVisible(False)  # Hidden by default
         assistant_layout.addWidget(self.candidate_group)
+        
+        # Past conversations button
+        self.past_conversations_button = QPushButton("Past Conversations")
+        self.past_conversations_button.clicked.connect(self._on_past_conversations_clicked)
+        assistant_layout.addWidget(self.past_conversations_button)
+        
+        # Past conversations dialog (created on demand)
+        self._past_conversations_dialog = None
         
         assistant_group.setLayout(assistant_layout)
         left_layout.addWidget(assistant_group)
@@ -2143,10 +2154,431 @@ class MainWindow(QMainWindow):
                 selected_session_id=selected_session_id
             ))
     
+    def _on_past_conversations_clicked(self):
+        """Show a dialog with past assistant conversations."""
+        # Get database instance
+        db = self.session_manager.db
+        
+        # Get all conversations
+        try:
+            conversations = db.list_conversations()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load conversations: {str(e)}")
+            return
+        
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Past Conversations")
+        dialog.resize(600, 500)
+        
+        main_layout = QVBoxLayout(dialog)
+        
+        if not conversations:
+            # No conversations yet
+            no_conv_label = QLabel("No past conversations yet.\nStart a new conversation with the Assistant!")
+            no_conv_label.setAlignment(Qt.AlignCenter)
+            main_layout.addWidget(no_conv_label)
+            
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            main_layout.addWidget(close_button)
+            
+            dialog.exec_()
+            return
+        
+        # Create split layout: list on left, messages on right
+        split_layout = QSplitter(Qt.Horizontal)
+        
+        # Left side: conversation list
+        list_widget = QListWidget()
+        list_widget.setMaximumWidth(200)
+        
+        # Right side: messages display
+        messages_scroll = QScrollArea()
+        messages_widget = QWidget()
+        messages_layout = QVBoxLayout(messages_widget)
+        messages_scroll.setWidget(messages_widget)
+        messages_scroll.setWidgetResizable(True)
+        
+        # Store conversation data
+        conversation_data = {}
+        
+        for conv in conversations:
+            conv_id = conv['id']
+            session_id = conv.get('session_id')
+            title = conv.get('title')
+            created_at = conv.get('created_at', 0)
+            updated_at = conv.get('updated_at', 0)
+            
+            # Format display text
+            from datetime import datetime
+            date_str = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M")
+            
+            if title:
+                display_text = f"{title}\n{date_str}"
+            else:
+                display_text = f"Conversation #{conv_id}\n{date_str}"
+            
+            # Add scope indicator
+            if session_id:
+                display_text += "\n(Session-specific)"
+            else:
+                display_text += "\n(All sessions)"
+            
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, conv_id)
+            list_widget.addItem(item)
+            
+            conversation_data[conv_id] = conv
+        
+        split_layout.addWidget(list_widget)
+        split_layout.addWidget(messages_scroll)
+        split_layout.setStretchFactor(0, 1)
+        split_layout.setStretchFactor(1, 2)
+        
+        main_layout.addWidget(split_layout)
+        
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.close)
+        main_layout.addWidget(close_button)
+        
+        # Handle selection
+        def on_selection_changed():
+            selected_items = list_widget.selectedItems()
+            if not selected_items:
+                return
+            
+            conv_id = selected_items[0].data(Qt.UserRole)
+            
+            # Clear previous messages
+            while messages_layout.count():
+                item = messages_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            
+            # Get messages for this conversation
+            try:
+                messages = db.get_messages(conv_id)
+            except Exception as e:
+                messages_label = QLabel(f"Error loading messages: {str(e)}")
+                messages_layout.addWidget(messages_label)
+                return
+            
+            if not messages:
+                no_msg_label = QLabel("No messages in this conversation.")
+                messages_layout.addWidget(no_msg_label)
+                return
+            
+            # Display messages
+            for msg in messages:
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                timestamp = msg.get('timestamp', 0)
+                time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
+                
+                # Create message bubble
+                msg_frame = QFrame()
+                msg_frame.setFrameShape(QFrame.StyledPanel)
+                msg_layout = QVBoxLayout(msg_frame)
+                
+                # Role label
+                role_label = QLabel(f"{role.capitalize()} - {time_str}")
+                role_font = role_label.font()
+                role_font.setBold(True)
+                role_label.setFont(role_font)
+                
+                if role == 'user':
+                    role_label.setStyleSheet("color: #0066cc;")
+                elif role == 'assistant':
+                    role_label.setStyleSheet("color: #008800;")
+                
+                msg_layout.addWidget(role_label)
+                
+                # Content
+                content_label = QLabel(content)
+                content_label.setWordWrap(True)
+                msg_layout.addWidget(content_label)
+                
+                messages_layout.addWidget(msg_frame)
+            
+            messages_layout.addStretch()
+        
+        list_widget.itemClicked.connect(on_selection_changed)
+        
+        dialog.exec_()
+    
     def _on_detach_assistant(self):
-        """Handle the Detach button click - placeholder for future detachable behavior."""
-        # TODO: Implement detachable window in future BU
-        self._on_status_update('Detach button clicked (not implemented yet)')
+        """Create a detached window for the assistant chat panel."""
+        if self._detached_assistant_window:
+            # Window already exists, just bring it to front
+            self._detached_assistant_window.show()
+            self._detached_assistant_window.activateWindow()
+            self._detached_assistant_window.raise_()
+            return
+        
+        # Create detached window with no parent (standalone window)
+        # This ensures it doesn't minimize when main window minimizes
+        self._detached_assistant_window = QDialog(None)  # No parent - standalone window
+        self._detached_assistant_window.setWindowTitle('Assistant Chat')
+        self._detached_assistant_window.resize(450, 600)
+        
+        # Set window flags: stay on top but not as modal
+        self._detached_assistant_window.setWindowFlags(
+            Qt.Window | 
+            Qt.WindowStaysOnTopHint | 
+            Qt.WindowCloseButtonHint | 
+            Qt.WindowMinimizeButtonHint
+        )
+        
+        # Prevent the detached window from activating the main window when minimized
+        self._detached_assistant_window.setAttribute(Qt.WA_QuitOnClose, False)
+        
+        # Create main layout
+        main_layout = QVBoxLayout(self._detached_assistant_window)
+        
+        # Title
+        title_label = QLabel('Assistant Chat')
+        title_font = title_label.font()
+        title_font.setPointSize(16)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        main_layout.addWidget(title_label)
+        
+        # Agent selector
+        agent_layout = QHBoxLayout()
+        agent_label = QLabel("Agent:")
+        agent_layout.addWidget(agent_label)
+        
+        # Create agent combo for detached window (copies main window's agents)
+        self._detached_agent_combo = QComboBox()
+        for i in range(self.agent_combo.count()):
+            self._detached_agent_combo.addItem(
+                self.agent_combo.itemText(i),
+                self.agent_combo.itemData(i)
+            )
+        agent_layout.addWidget(self._detached_agent_combo)
+        
+        # Scope selector
+        scope_label = QLabel("Scope:")
+        agent_layout.addWidget(scope_label)
+        
+        self._detached_scope_combo = QComboBox()
+        for i in range(self.scope_combo.count()):
+            self._detached_scope_combo.addItem(
+                self.scope_combo.itemText(i),
+                self.scope_combo.itemData(i)
+            )
+        agent_layout.addWidget(self._detached_scope_combo)
+        
+        agent_layout.addStretch()
+        main_layout.addLayout(agent_layout)
+        
+        # Question input
+        question_label = QLabel("Question:")
+        main_layout.addWidget(question_label)
+        
+        self._detached_question_input = QTextEdit()
+        self._detached_question_input.setPlaceholderText("Ask a question about your sessions...")
+        self._detached_question_input.setMaximumHeight(80)
+        main_layout.addWidget(self._detached_question_input)
+        
+        # Ask button
+        button_layout = QHBoxLayout()
+        
+        self._detached_ask_button = QPushButton("Ask")
+        self._detached_ask_button.clicked.connect(self._on_detached_ask_clicked)
+        button_layout.addWidget(self._detached_ask_button)
+        
+        button_layout.addStretch()
+        main_layout.addLayout(button_layout)
+        
+        # Answer display
+        answer_label = QLabel("Answer:")
+        main_layout.addWidget(answer_label)
+        
+        self._detached_answer_display = QTextEdit()
+        self._detached_answer_display.setReadOnly(True)
+        self._detached_answer_display.setPlaceholderText("Assistant responses will appear here...")
+        self._detached_answer_display.setMinimumHeight(150)
+        main_layout.addWidget(self._detached_answer_display)
+        
+        # Candidate session selection (initially hidden) - same as main window
+        self._detached_candidate_group = QGroupBox("Select a Session:")
+        candidate_layout = QVBoxLayout()
+        
+        self._detached_candidate_list = QListWidget()
+        self._detached_candidate_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._detached_candidate_list.setMaximumHeight(100)
+        self._detached_candidate_list.itemClicked.connect(self._on_detached_candidate_selected)
+        candidate_layout.addWidget(self._detached_candidate_list)
+        
+        self._detached_use_candidate_button = QPushButton("Use Selected Session")
+        self._detached_use_candidate_button.clicked.connect(self._on_detached_use_candidate)
+        self._detached_use_candidate_button.setEnabled(False)
+        candidate_layout.addWidget(self._detached_use_candidate_button)
+        
+        self._detached_candidate_group.setLayout(candidate_layout)
+        self._detached_candidate_group.setVisible(False)
+        main_layout.addWidget(self._detached_candidate_group)
+        
+        # Connect main window's answer display to also update detached window
+        # This keeps both windows in sync when main window gets an answer
+        
+        self._detached_assistant_window.show()
+    
+    def _on_detached_ask_clicked(self):
+        """Handle the Ask button click in the detached assistant window."""
+        # Get the question from the detached input
+        question = self._detached_question_input.toPlainText().strip()
+        
+        if not question:
+            self._detached_answer_display.setPlainText("Please enter a question.")
+            return
+        
+        # Clear previous candidates when asking a new question
+        self._detached_candidate_group.setVisible(False)
+        
+        # Store the original question for potential retry
+        self._current_question = question
+        
+        # Get selected agent
+        agent_id = self._detached_agent_combo.currentData()
+        
+        # Get scope from combo
+        scope_value = self._detached_scope_combo.currentData()
+        explicit_scope = "current_session" if scope_value == "current" else "any_session"
+        
+        # Get active session ID if there's an active session
+        active_session = self.session_manager.get_active_session()
+        active_session_id = active_session.id if active_session else None
+        
+        # Get selected session ID from the sessions table
+        selected_session_id = self._get_selected_session_id()
+        
+        # Disable the Ask button while processing
+        self._detached_ask_button.setEnabled(False)
+        self._detached_answer_display.setPlainText("Thinking...")
+        
+        # Run the assistant service call in the background
+        QTimer.singleShot(50, lambda: self._run_detached_assistant_query(
+            question=question,
+            agent_id=agent_id,
+            explicit_scope=explicit_scope,
+            active_session_id=active_session_id,
+            selected_session_id=selected_session_id
+        ))
+    
+    def _run_detached_assistant_query(
+        self,
+        question: str,
+        agent_id: str,
+        explicit_scope: str,
+        active_session_id: Optional[int],
+        selected_session_id: Optional[int]
+    ):
+        """Execute the assistant query in the background for detached window."""
+        try:
+            # Call the assistant service
+            response = self.assistant_service.ask(
+                question=question,
+                agent_id=agent_id,
+                explicit_scope=explicit_scope,
+                active_session_id=active_session_id,
+                selected_session_id=selected_session_id
+            )
+            
+            # Handle the response
+            if response.success:
+                # Clear candidates on successful answer
+                self._detached_candidate_group.setVisible(False)
+                self._detached_answer_display.setPlainText(response.answer or "")
+                # Also update main window's answer display to keep them in sync
+                self.answer_display.setPlainText(response.answer or "")
+                self._on_status_update("Answer received")
+            elif response.needs_clarification:
+                # Show clarification question and candidates
+                clarification_text = response.clarification_question or ""
+                self._detached_answer_display.setPlainText(clarification_text)
+                # Also show in main window
+                self.answer_display.setPlainText(clarification_text)
+                
+                # Display candidates in detached window
+                if response.candidates:
+                    self._display_detached_candidates(response.candidates)
+                else:
+                    self._detached_candidate_group.setVisible(False)
+                    
+                self._on_status_update("Clarification needed")
+            else:
+                # Show error
+                error_text = response.error or "Unknown error occurred"
+                self._detached_answer_display.setPlainText(f"Error: {error_text}")
+                self.answer_display.setPlainText(f"Error: {error_text}")
+                self._on_status_update(f"Assistant error: {error_text}", is_error=True)
+                # Clear candidates on error
+                self._detached_candidate_group.setVisible(False)
+                
+        except Exception as e:
+            logger.error(f"Assistant query failed (detached): {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            error_text = f"Error: {str(e)}"
+            self._detached_answer_display.setPlainText(error_text)
+            self.answer_display.setPlainText(error_text)
+            self._on_status_update(f"Assistant error: {str(e)}", is_error=True)
+            # Clear candidates on exception
+            self._detached_candidate_group.setVisible(False)
+        finally:
+            # Re-enable the Ask button
+            self._detached_ask_button.setEnabled(True)
+    
+    def _display_detached_candidates(self, candidates: list):
+        """Display candidate sessions in the detached window for selection."""
+        self._detached_candidate_list.clear()
+        
+        for candidate in candidates:
+            # Format: "Session name - YYYY-MM-DD HH:MM"
+            session_name = candidate.get('session_name', 'Unknown Session')
+            start_time = candidate.get('start_time', '')
+            display_text = f"{session_name} - {start_time}"
+            self._detached_candidate_list.addItem(display_text)
+        
+        # Store candidates for later use
+        self._current_candidates = candidates
+        
+        # Show the candidate group
+        self._detached_candidate_group.setVisible(True)
+    
+    def _on_detached_candidate_selected(self, item):
+        """Handle candidate selection in the detached window."""
+        self._detached_use_candidate_button.setEnabled(True)
+    
+    def _on_detached_use_candidate(self):
+        """Handle the Use Selected Session button in the detached window."""
+        selected_index = self._detached_candidate_list.currentRow()
+        
+        if selected_index >= 0 and selected_index < len(self._current_candidates):
+            selected_candidate = self._current_candidates[selected_index]
+            selected_session_id = selected_candidate.get('session_id')
+            
+            # Retry the question with the selected session
+            if selected_session_id and self._current_question:
+                # Disable button during processing
+                self._detached_use_candidate_button.setEnabled(False)
+                self._detached_answer_display.setPlainText("Thinking...")
+                
+                agent_id = self._detached_agent_combo.currentData()
+                scope_value = self._detached_scope_combo.currentData()
+                explicit_scope = "current_session" if scope_value == "current" else "any_session"
+                
+                QTimer.singleShot(50, lambda: self._run_detached_assistant_query(
+                    question=self._current_question,
+                    agent_id=agent_id,
+                    explicit_scope=explicit_scope,
+                    active_session_id=None,  # Explicit session selected
+                    selected_session_id=selected_session_id
+                ))
     
     def closeEvent(self, event):
         """Handle window close event."""
