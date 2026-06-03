@@ -148,6 +148,7 @@ class AssistantRetrievalTools:
         session_id: int,
         question: str,
         transcript_limit: int = DEFAULT_CONTEXT_TRANSCRIPT_LIMIT,
+        conversation_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Get bounded context for a specific session.
@@ -159,6 +160,7 @@ class AssistantRetrievalTools:
             session_id: ID of the session to retrieve context for.
             question: User question to filter relevant content.
             transcript_limit: Maximum transcripts to include (capped at 50).
+            conversation_id: Optional conversation ID to load prior chat history.
             
         Returns:
             Dictionary with session info, summaries, transcripts, and screenshot refs.
@@ -178,7 +180,9 @@ class AssistantRetrievalTools:
         transcript_limit = min(transcript_limit, MAX_TRANSCRIPT_LIMIT)
 
         try:
-            context = self._retriever.build_session_context(session_id, question)
+            context = self._retriever.build_session_context(
+                session_id, question, conversation_id
+            )
             return self._context_to_dict(context)
         except Exception as e:
             return {"error": f"Context retrieval failed: {str(e)}"}
@@ -365,6 +369,7 @@ class AssistantRetrievalTools:
             "transcripts": [],
             "summaries": [],
             "screenshots": [],
+            "conversation_history": [],
         }
 
         # Add sessions
@@ -403,6 +408,13 @@ class AssistantRetrievalTools:
                 "timestamp": sc.timestamp,
                 "filepath": sc.filepath,
                 "description": sc.description,
+            })
+
+        # Add conversation history
+        for turn in context.conversation_history:
+            result["conversation_history"].append({
+                "role": turn.role,
+                "content": turn.content,
             })
 
         return result

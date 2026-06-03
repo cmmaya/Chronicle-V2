@@ -143,7 +143,7 @@ class AssistantAnswerService:
             # Single session: use bounded context
             if session_ids:
                 context_text = self._get_single_session_context(
-                    session_ids[0], question
+                    session_ids[0], question, conversation_id
                 )
 
         # Step 5: Build messages for OpenRouter
@@ -182,10 +182,14 @@ class AssistantAnswerService:
             agent_id = ASSISTANT_AGENTS.get("default", "chronicle_assistant")
         return self._agents.get(agent_id)
 
-    def _get_single_session_context(self, session_id: int, question: str) -> str:
+    def _get_single_session_context(
+        self, session_id: int, question: str, conversation_id: Optional[int] = None
+    ) -> str:
         """Get bounded context for a single session."""
         try:
-            context = self._tools.get_session_context(session_id, question)
+            context = self._tools.get_session_context(
+                session_id, question, conversation_id=conversation_id
+            )
             if "error" in context:
                 return f"Error retrieving context: {context['error']}"
             
@@ -251,6 +255,14 @@ class AssistantAnswerService:
     def _dict_to_context_prompt(self, context: Dict[str, Any]) -> str:
         """Convert context dict to prompt-friendly text."""
         parts = []
+
+        # Add conversation history first (most relevant to current conversation)
+        if context.get("conversation_history"):
+            parts.append("## Conversation History")
+            for turn in context["conversation_history"]:
+                role_label = "User" if turn.get("role") == "user" else "Assistant"
+                parts.append(f"{role_label}: {turn.get('content', '')}")
+            parts.append("")
 
         if context.get("sessions"):
             parts.append("## Relevant Sessions")

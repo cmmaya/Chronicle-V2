@@ -590,6 +590,82 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Message retrieval failed: {str(e)}')
 
+    def get_recent_messages(self, conversation_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get recent messages for a conversation in chronological order.
+
+        Args:
+            conversation_id: ID of the conversation
+            limit: Maximum number of messages to return (default 20)
+
+        Returns:
+            List of message dictionaries, sorted by timestamp ascending
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT * FROM assistant_messages 
+                WHERE conversation_id = ?
+                ORDER BY timestamp ASC
+                LIMIT ?
+            ''', (conversation_id, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Message retrieval failed: {str(e)}')
+
+    def get_conversation_for_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Get the most recent conversation for a specific session.
+
+        Args:
+            session_id: ID of the session
+
+        Returns:
+            Conversation dictionary if exists, None otherwise
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT * FROM assistant_conversations 
+                WHERE session_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+            ''', (session_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation retrieval failed: {str(e)}')
+
+    def get_or_create_conversation(self, session_id: Optional[int] = None, title: Optional[str] = None) -> int:
+        """Get existing conversation for session or create a new one.
+
+        If session_id is provided, finds the most recent conversation for that session
+        and returns its ID. If none exists, creates a new conversation.
+
+        Args:
+            session_id: ID of the session (can be None for all-session scope)
+            title: Optional title for new conversation
+
+        Returns:
+            ID of the existing or newly created conversation
+
+        Raises:
+            DatabaseError: If operation fails
+        """
+        try:
+            if session_id is not None:
+                existing = self.get_conversation_for_session(session_id)
+                if existing:
+                    return existing['id']
+            # Create new conversation
+            return self.create_conversation(session_id=session_id, title=title)
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Get or create conversation failed: {str(e)}')
+
     def get_message(self, message_id: int) -> Dict[str, Any]:
         """Get a specific message by ID.
 

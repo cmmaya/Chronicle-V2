@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: None
-- Next BU: BU047
+- Current BU: BU050
+- Next BU: BU051
 
 ## Target Architecture
 
@@ -62,6 +62,9 @@ BU043 - Assistant UI Panel Skeleton
 BU044 - Wire Assistant Ask Action
 BU045 - Assistant Clarification Flow UI
 BU047 - Past Assistant Conversations UI
+BU048 - Session-Scoped Conversation Persistence
+BU049 - Assistant Context Loader
+BU050 - Assistant Conversation Writeback
 
 ## In Progress BUs
 None
@@ -163,3 +166,8 @@ None
 - AssistantAnswerService wired to Ask button in main window
 - Ask button now calls service with question, agent_id, scope, active_session_id, and selected_session_id
 - Error handling displays in answer area without crashing UI
+- Conversation history now loaded into assistant context for follow-up questions
+- Added ConversationTurn dataclass to context_models
+- Added conversation_history field to AssistantContext
+- Context retriever loads up to 10 recent conversation turns from database
+- Service passes conversation_id through to context retrieval for follow-up questions

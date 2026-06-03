@@ -68,6 +68,18 @@ class ScreenshotReference:
 
 
 @dataclass
+class ConversationTurn:
+    """Represents a single turn in the assistant conversation history."""
+    role: str  # 'user' or 'assistant'
+    content: str
+
+    def to_prompt_text(self) -> str:
+        """Format conversation turn for prompt inclusion."""
+        role_label = "User" if self.role == "user" else "Assistant"
+        return f"{role_label}: {self.content}"
+
+
+@dataclass
 class AssistantContext:
     """Complete context gathered for answering an assistant query."""
     query: str
@@ -75,10 +87,17 @@ class AssistantContext:
     transcripts: list[TranscriptExcerpt] = field(default_factory=list)
     summaries: list[SummaryExcerpt] = field(default_factory=list)
     screenshots: list[ScreenshotReference] = field(default_factory=list)
+    conversation_history: list[ConversationTurn] = field(default_factory=list)
 
     def to_prompt_text(self) -> str:
         """Render context as prompt text for LLM."""
         parts = []
+
+        if self.conversation_history:
+            parts.append("## Conversation History")
+            for turn in self.conversation_history:
+                parts.append(turn.to_prompt_text())
+            parts.append("")
 
         if self.sessions:
             parts.append("## Relevant Sessions")
@@ -116,4 +135,5 @@ class AssistantContext:
             and not self.transcripts
             and not self.summaries
             and not self.screenshots
+            and not self.conversation_history
         )

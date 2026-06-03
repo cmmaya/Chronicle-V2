@@ -1166,3 +1166,93 @@ Recovery Notes:
 - No resolver changes per BU045 scope
 - No conversation history browser (out of scope)
 - No multi-turn tool loop (out of scope)
+
+# BU048 - Session-Scoped Conversation Persistence
+
+Summary:
+Added database methods to persist assistant conversation turns independently from transcript storage. This enables follow-up questions that maintain chat context.
+
+Files Changed:
+- src/storage/database.py
+
+Implementation:
+- Confirmed existing assistant_conversations and assistant_messages schema already supports session_id, role, content, and timestamps
+- Added get_recent_messages(conversation_id, limit) - retrieves recent messages with a limit
+- Added get_conversation_for_session(session_id) - finds the most recent conversation for a session
+- Added get_or_create_conversation(session_id, title) - gets existing conversation or creates new one
+
+Validation:
+- Created test script verifying: conversation creation, message storage, message retrieval with limits, session-conversation mapping
+- All tests passed successfully
+- No syntax or runtime errors
+
+Definition of Done Satisfied:
+- [x] Database exposes minimal conversation persistence methods
+- [x] Messages can be stored without transcript content
+- [x] Messages can be retrieved by session in stable order
+- [x] No schema unrelated to assistant conversation is changed
+
+Next:
+- Ready for BU049
+
+---
+
+## BU049 - Assistant Context Loader
+
+Summary:
+Added conversation history loading to the assistant context. This enables follow-up questions to include prior chat turns in the prompt context.
+
+Files Changed:
+- src/assistant/context_models.py (added ConversationTurn dataclass, conversation_history field)
+- src/assistant/context.py (added _get_conversation_history method, updated build_session_context)
+- src/assistant/tools.py (updated get_session_context to accept conversation_id)
+- src/assistant/service.py (updated _get_single_session_context to pass conversation_id)
+
+Important Decisions:
+- Default limit of 10 conversation turns to bound context size
+- Empty conversation history handled gracefully (returns empty list, no error)
+- Conversation history rendered first in prompt context for highest relevance
+- Uses existing database get_messages method from BU048
+
+Definition of Done Satisfied:
+- [x] Recent assistant turns are available to prompt construction
+- [x] Context size is bounded (10 turns)
+- [x] No transcript or summary storage behavior changes
+- [x] Empty history is handled safely
+
+Validation:
+- All 37 assistant tools tests pass
+- All 12 context retriever tests pass
+- Import validation successful
+
+Next:
+- Ready for BU050
+
+---
+
+## BU050 - Assistant Conversation Writeback
+
+Summary:
+Verified that the assistant answer service already persists user questions and assistant answers after successful responses. This was implemented in BU042/BU049 - the `_persist_conversation` method creates conversations when needed, adds user questions and assistant answers, and is only called after successful OpenRouter API calls.
+
+Files Changed:
+- src/assistant/service.py (already implemented - verified existing code)
+
+Important Decisions:
+- Conversation persistence happens after successful answer generation only
+- Failed or empty responses are NOT persisted (method is only called after successful OpenRouter call)
+- Uses existing database create_conversation and add_message methods
+- Continues existing conversations if conversation_id is provided
+
+Definition of Done Satisfied:
+- [x] User and assistant turns are persisted per session
+- [x] Failed responses do not create misleading history
+- [x] Existing assistant answer flow still works
+- [x] No unrelated assistant behavior changes
+
+Validation:
+- All 10 unit tests pass
+- Implementation verified via code review of _persist_conversation method
+
+Next:
+- Ready for BU051

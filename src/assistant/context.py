@@ -8,6 +8,7 @@ from .context_models import (
     TranscriptExcerpt,
     SummaryExcerpt,
     ScreenshotReference,
+    ConversationTurn,
 )
 
 
@@ -18,12 +19,14 @@ class DatabaseProtocol(Protocol):
     def get_summaries(self, session_id: int) -> List[dict[str, Any]]: ...
     def get_screenshots(self, session_id: int) -> List[dict[str, Any]]: ...
     def get_transcripts(self, session_id: int) -> List[dict[str, Any]]: ...
+    def get_messages(self, conversation_id: int) -> List[dict[str, Any]]: ...
 
 
 # Default limits for context building
 DEFAULT_TRANSCRIPT_LIMIT = 20  # Maximum transcript excerpts to include
 DEFAULT_KEYWORD_MATCHES = 5    # Maximum keyword-matched excerpts
 MAX_TRANSCRIPT_LENGTH = 500    # Maximum characters per transcript excerpt
+DEFAULT_CONVERSATION_LIMIT = 10  # Maximum conversation turns to include
 
 
 class AssistantContextRetriever:
@@ -45,16 +48,18 @@ class AssistantContextRetriever:
         self,
         session_id: int,
         question: str,
+        conversation_id: Optional[int] = None,
     ) -> AssistantContext:
         """Build context for a specific session based on user question.
 
         Args:
             session_id: ID of the session to retrieve context for.
             question: User question to filter relevant content.
+            conversation_id: Optional conversation ID to load prior chat history.
 
         Returns:
             AssistantContext with session details, summaries, filtered
-            transcripts, and screenshot references.
+            transcripts, screenshot references, and conversation history.
         """
         # Get session info
         try:
@@ -84,12 +89,16 @@ class AssistantContextRetriever:
             session_id, session_name, transcripts
         )
 
+        # Get conversation history
+        conversation_history = self._get_conversation_history(conversation_id)
+
         return AssistantContext(
             query=question,
             sessions=[session_candidate],
             transcripts=transcripts,
             summaries=summaries,
             screenshots=screenshots,
+            conversation_history=conversation_history,
         )
 
     def _get_summaries(
@@ -278,3 +287,37 @@ class AssistantContextRetriever:
                     break  # Only include each screenshot once
 
         return nearby_screenshots
+
+    def _get_conversation_history(
+        self,
+        conversation_id: Optional[int],
+    ) -> List[ConversationTurn]:
+        """Retrieve recent conversation history for a conversation.
+
+        Args:
+            conversation_id: ID of the conversation to retrieve history for.
+
+        Returns:
+            List of ConversationTurn objects (most recent first).
+        """
+        if conversation_id is None:
+            return []
+
+        try:
+            message_rows = self._db.get_messages(conversation_id)
+        except (AttributeError, Exception):
+            # Database doesn't have get_messages method or other error
+            return []
+
+        if not message_rows:
+            return []
+
+        # Convert to ConversationTurn objects, limit to recent messages
+        turns = []
+        for row in message_rows[-DEFAULT_CONVERSATION_LIMIT:]:
+            role = row.get("role", "user")
+            content = row.get("content", "")
+            if content:
+                turns.append(ConversationTurn(role=role, content=content))
+
+        return turns
