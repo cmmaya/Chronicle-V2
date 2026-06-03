@@ -91,6 +91,29 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # La columna ya existe
 
+            # Assistant conversations and messages tables
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS assistant_conversations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER,
+                    title TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS assistant_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES assistant_conversations(id)
+                )
+            ''')
+            self.connection.commit()
+
         except sqlite3.Error as e:
             raise DatabaseError(f'Schema initialization failed: {str(e)}')
 
@@ -395,6 +418,216 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Summary deletion failed: {str(e)}')
 
+    # Assistant Conversation Methods
+
+    def create_conversation(self, session_id: Optional[int] = None, title: Optional[str] = None) -> int:
+        """Create a new assistant conversation.
+
+        Args:
+            session_id: ID of the session this conversation belongs to (can be None for all-session scope)
+            title: Optional conversation title
+
+        Returns:
+            ID of the created conversation
+
+        Raises:
+            DatabaseError: If creation fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            now = int(datetime.now().timestamp())
+            cursor.execute('''
+                INSERT INTO assistant_conversations (session_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+            ''', (session_id, title, now, now))
+            self.connection.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation creation failed: {str(e)}')
+
+    def get_conversation(self, conversation_id: int) -> Dict[str, Any]:
+        """Get a specific conversation by ID.
+
+        Args:
+            conversation_id: ID of the conversation
+
+        Returns:
+            Conversation dictionary
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('SELECT * FROM assistant_conversations WHERE id = ?', (conversation_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise DatabaseError(f'Conversation {conversation_id} not found')
+            return dict(row)
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation retrieval failed: {str(e)}')
+
+    def list_conversations(self, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """List conversations, optionally filtered by session_id.
+
+        Args:
+            session_id: Optional session ID to filter by. If None, returns all conversations.
+
+        Returns:
+            List of conversation dictionaries, sorted by updated_at descending
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            if session_id is not None:
+                cursor.execute('''
+                    SELECT * FROM assistant_conversations 
+                    WHERE session_id = ?
+                    ORDER BY updated_at DESC
+                ''', (session_id,))
+            else:
+                cursor.execute('SELECT * FROM assistant_conversations ORDER BY updated_at DESC')
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation listing failed: {str(e)}')
+
+    def update_conversation(self, conversation_id: int, **kwargs) -> None:
+        """Update a conversation's fields.
+
+        Args:
+            conversation_id: ID of the conversation to update
+            **kwargs: Fields to update (title, session_id)
+
+        Raises:
+            DatabaseError: If update fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            if 'title' in kwargs or 'session_id' in kwargs:
+                kwargs['updated_at'] = int(datetime.now().timestamp())
+            set_clause = ', '.join(f'{k} = ?' for k in kwargs)
+            values = list(kwargs.values())
+            cursor.execute(f'''
+                UPDATE assistant_conversations
+                SET {set_clause}
+                WHERE id = ?
+            ''', (*values, conversation_id))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation update failed: {str(e)}')
+
+    def delete_conversation(self, conversation_id: int) -> None:
+        """Delete a conversation and all its messages.
+
+        Args:
+            conversation_id: ID of the conversation to delete
+
+        Raises:
+            DatabaseError: If deletion fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM assistant_messages WHERE conversation_id = ?', (conversation_id,))
+            cursor.execute('DELETE FROM assistant_conversations WHERE id = ?', (conversation_id,))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation deletion failed: {str(e)}')
+
+    # Assistant Message Methods
+
+    def add_message(self, conversation_id: int, role: str, content: str) -> int:
+        """Add a message to a conversation.
+
+        Args:
+            conversation_id: ID of the conversation
+            role: Message role ('user' or 'assistant')
+            content: Message content (plain text)
+
+        Returns:
+            ID of the inserted message
+
+        Raises:
+            DatabaseError: If insertion fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            now = int(datetime.now().timestamp())
+            cursor.execute('''
+                INSERT INTO assistant_messages (conversation_id, role, content, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (conversation_id, role, content, now))
+            # Update conversation's updated_at timestamp
+            cursor.execute('''
+                UPDATE assistant_conversations SET updated_at = ? WHERE id = ?
+            ''', (now, conversation_id))
+            self.connection.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Message insertion failed: {str(e)}')
+
+    def get_messages(self, conversation_id: int) -> List[Dict[str, Any]]:
+        """Get all messages for a conversation in chronological order.
+
+        Args:
+            conversation_id: ID of the conversation
+
+        Returns:
+            List of message dictionaries, sorted by timestamp ascending
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT * FROM assistant_messages 
+                WHERE conversation_id = ?
+                ORDER BY timestamp ASC
+            ''', (conversation_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Message retrieval failed: {str(e)}')
+
+    def get_message(self, message_id: int) -> Dict[str, Any]:
+        """Get a specific message by ID.
+
+        Args:
+            message_id: ID of the message
+
+        Returns:
+            Message dictionary
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('SELECT * FROM assistant_messages WHERE id = ?', (message_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise DatabaseError(f'Message {message_id} not found')
+            return dict(row)
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Message retrieval failed: {str(e)}')
+
+    def delete_message(self, message_id: int) -> None:
+        """Delete a message.
+
+        Args:
+            message_id: ID of the message to delete
+
+        Raises:
+            DatabaseError: If deletion fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM assistant_messages WHERE id = ?', (message_id,))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Message deletion failed: {str(e)}')
+
     def reset_database(self) -> None:
         """Delete all data from all tables but keep the schema.
         
@@ -405,6 +638,8 @@ class Database:
         """
         try:
             cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM assistant_messages')
+            cursor.execute('DELETE FROM assistant_conversations')
             cursor.execute('DELETE FROM transcripts')
             cursor.execute('DELETE FROM screenshots')
             cursor.execute('DELETE FROM summaries')
