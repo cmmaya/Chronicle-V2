@@ -3,6 +3,8 @@ import logging
 import os
 from typing import List, Dict, Optional
 
+from ..config import get_selected_model
+
 logger = logging.getLogger(__name__)
 
 
@@ -110,9 +112,10 @@ class OpenRouterClient:
         if not messages:
             raise InvalidResponseError("Messages list cannot be empty")
         
-        model = model or self.model
+        # Use provided model, or fall back to instance model, or use selected model from config
+        model = model or self.model or get_selected_model()
         if not model:
-            raise InvalidResponseError("Model is required. Pass model parameter or set at initialization.")
+            raise InvalidResponseError("Model is required. Pass model parameter, set at initialization, or ensure a model is selected in settings.")
         
         temperature = temperature if temperature is not None else self.temperature
         

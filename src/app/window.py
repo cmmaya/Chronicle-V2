@@ -12,7 +12,7 @@ import logging
 
 from .session_manager import SessionManager
 from ..summarization import SummaryGenerator
-from ..config import ASSISTANT_AGENTS, SESSION
+from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
 from ..assistant.service import AssistantAnswerService
 
 logger = logging.getLogger(__name__)
@@ -771,6 +771,11 @@ class MainWindow(QMainWindow):
         vad_action.triggered.connect(self._show_vad_settings)
         settings_menu.addAction(vad_action)
         
+        # Model settings action
+        model_action = QAction('Model Settings...', self)
+        model_action.triggered.connect(self._show_model_settings)
+        settings_menu.addAction(model_action)
+        
         help_menu = menu_bar.addMenu('Help')
         
         # About action
@@ -926,6 +931,8 @@ class MainWindow(QMainWindow):
         self.scope_combo = QComboBox()
         self.scope_combo.addItem("Current Session", "current")
         self.scope_combo.addItem("Any Session", "any")
+        # Set default to "Any Session"
+        self.scope_combo.setCurrentIndex(1)
         scope_layout.addWidget(self.scope_combo)
         scope_layout.addStretch()
         assistant_layout.addLayout(scope_layout)
@@ -1986,6 +1993,57 @@ class MainWindow(QMainWindow):
                 self.session_manager.vad_aggressiveness = self._vad_aggressiveness
             
             self._on_status_update(f'VAD settings updated: {self._vad_threshold}% threshold, Mode {self._vad_aggressiveness}')
+    
+    def _show_model_settings(self):
+        """Show model settings dialog."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Model Settings')
+        dialog.setMinimumWidth(450)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Model selection
+        model_label = QLabel('Select Model:')
+        layout.addWidget(model_label)
+        
+        model_layout = QHBoxLayout()
+        self.model_combo = QComboBox()
+        
+        # Populate with allowed models from config
+        for model_id in ALLOWED_MODELS:
+            # Use the model ID as both display text and data
+            self.model_combo.addItem(model_id, model_id)
+        
+        # Set current selection to persisted model
+        current_model = get_selected_model()
+        current_index = self.model_combo.findData(current_model)
+        if current_index >= 0:
+            self.model_combo.setCurrentIndex(current_index)
+        
+        model_layout.addWidget(self.model_combo)
+        layout.addLayout(model_layout)
+        
+        # Description
+        desc_label = QLabel(
+            'Select the model used for summarization and assistant features.\n'
+            'Changes will persist across application restarts.'
+        )
+        desc_label.setStyleSheet('color: gray; font-size: 10pt;')
+        layout.addWidget(desc_label)
+        
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec():
+            selected_model = self.model_combo.currentData()
+            if selected_model:
+                set_selected_model(selected_model)
+                self._on_status_update(f'Model changed to: {selected_model}')
     
     def _on_new_chat_clicked(self):
         """Handle the New Chat button click - resets conversation context."""

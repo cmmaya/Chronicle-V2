@@ -1362,3 +1362,77 @@ Recovery Notes:
 - The checkbox was not connected to update the config, which was why auto-summary wasn't triggering
 - Also fixed the UI to verify and display actual summary status from the database
 
+---
+
+## BU054 - Assistant Model Setting
+
+Summary:
+Added persisted model selection setting for OpenRouter. Defined ALLOWED_MODELS list with 13 compatible models, DEFAULT_MODEL constant preserving current behavior, and get_selected_model()/set_selected_model() functions with validation.
+
+Files Changed:
+- src/config.py
+
+Important Decisions:
+- Default model set to google/gemini-2.5-flash to preserve existing behavior
+- set_selected_model() returns False for invalid model IDs instead of raising exception
+- Models include Google, DeepSeek, Anthropic, OpenAI, Meta Llama, and Mistral providers
+
+Recovery Notes:
+- This is a backend-only change; UI will be added in future BUs (BU055, BU056)
+
+---
+
+## BU055 - Model Selector UI
+
+Summary:
+Added a model selector UI to the application via Settings > Model Settings. The dialog allows users to select from the allowed models list and persists the selection in memory.
+
+Files Changed:
+- src/app/window.py
+
+Important Decisions:
+- Added ALLOWED_MODELS, get_selected_model, set_selected_model to imports from config
+- Added "Model Settings..." menu item to Settings menu
+- Implemented _show_model_settings() dialog with QComboBox populated from ALLOWED_MODELS
+- Dialog initializes with currently selected model via get_selected_model()
+- Changes are saved via set_selected_model() when user clicks OK
+
+Definition of Done Satisfied:
+- [x] Model selector is visible (via Settings > Model Settings)
+- [x] Selector options come from config (ALLOWED_MODELS)
+- [x] Selected value persists in memory (across dialog changes within session)
+- [x] No assistant/summarization behavior changes yet (BU056 will wire this)
+
+Next:
+- Ready for BU056 (Apply Selected Model To AI Calls)
+
+---
+
+## BU056 - Apply Selected Model To AI Calls
+
+Summary:
+Modified the assistant OpenRouter client to use the selected model from config settings. When no explicit model is passed, the client now falls back to `get_selected_model()` from config.
+
+Files Changed:
+- src/assistant/openrouter_client.py
+- src/assistant/service.py
+
+Important Decisions:
+- Priority order: explicit model parameter > instance model > selected model from config
+- Preserved backward compatibility - existing callers with explicit models work unchanged
+- Fixed service.py to not override with hardcoded agent model - now uses selected model by default
+
+Definition of Done Satisfied:
+- [x] AI client defaults to selected model
+- [x] Explicit model override still works
+- [x] Existing API shape remains stable
+- [x] No unrelated request behavior changes
+
+Validation:
+- Python syntax check passed
+- Import verification successful
+- Model selection functions verified working
+
+Next:
+- Ready for BU057
+

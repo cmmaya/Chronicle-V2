@@ -10,7 +10,7 @@ from .session_resolver import (
     ScopeResolution,
 )
 from .tools import AssistantRetrievalTools
-from ..config import ASSISTANT_AGENTS
+from ..config import ASSISTANT_AGENTS, get_selected_model
 from ..storage.database import Database
 
 
@@ -160,7 +160,8 @@ class AssistantAnswerService:
 
         # Step 6: Call OpenRouter API
         try:
-            answer = self._call_openrouter(messages, agent["model"])
+            # Use selected model from settings (don't pass explicit model)
+            answer = self._call_openrouter(messages)
         except Exception as e:
             return AnswerResponse(
                 success=False,
@@ -364,12 +365,17 @@ class AssistantAnswerService:
 
         return messages
 
-    def _call_openrouter(self, messages: List[Dict[str, str]], model: str) -> str:
+    def _call_openrouter(self, messages: List[Dict[str, str]], model: str = None) -> str:
         """Call OpenRouter API and return the answer."""
-        if self._openrouter_client is None:
-            self._openrouter_client = OpenRouterClient(model=model)
+        # Always use fresh selected model - don't cache the client with a fixed model
+        # This ensures model changes in settings are immediately applied
+        selected_model = get_selected_model()
+        effective_model = model or selected_model
+        
+        # Create new client each time to ensure fresh model selection
+        openrouter_client = OpenRouterClient(model=effective_model)
 
-        return self._openrouter_client.chat(messages, model=model)
+        return openrouter_client.chat(messages)
 
     def _persist_conversation(
         self,

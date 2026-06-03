@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU053
-- Next BU: BU054
+- Current BU: BU056
+- Next BU: BU057
 
 ## Target Architecture
 
@@ -69,6 +69,8 @@ BU050-1 - New Chat Button
 BU051 - Automatic Summary Setting
 BU052 - Auto Summary Toggle Button
 BU053 - Auto Summary On Stop
+BU054 - Assistant Model Setting
+BU055 - Model Selector UI
 
 ## In Progress BUs
 None
@@ -175,3 +177,5 @@ None
 - Added conversation_history field to AssistantContext
 - Context retriever loads up to 10 recent conversation turns from database
 - Service passes conversation_id through to context retrieval for follow-up questions
+- Added ALLOWED_MODELS list and DEFAULT_MODEL constant to config.py
+- Added get_selected_model() and set_selected_model() functions for model selection
