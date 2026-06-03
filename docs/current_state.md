@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU033
-- Next BU: BU033
+- Current BU: BU033 (completed)
+- Next BU: none
 
 ## Target Architecture
 
@@ -48,6 +48,7 @@ BU029 - Display Live Transcriptions in UI
 BU030 - UI Layout for Live Transcriptions
 BU031 - Live Transcription Checkbox
 BU032 - Live Transcription Display
+BU033 - Filtering Transcriptions
 
 ## In Progress BUs
 None

@@ -47,6 +47,7 @@ class MainWindow(QMainWindow):
         self._transcription_container = None
         self._transcription_layout = None
         self._transcription_history = []  # Store transcriptions for detached window
+        self._transcription_filter = 'all'  # Filter state: 'all', 'mic', or 'system'
         
         # Create UI components
         self._create_menu_bar()
@@ -884,6 +885,31 @@ class MainWindow(QMainWindow):
         Returns:
             QWidget: The widget containing the transcription view
         """
+        # Create wrapper widget to return
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.setSpacing(5)
+        
+        # Filter controls row
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        
+        filter_label = QLabel("Filter:")
+        filter_label.setFont(self.status_label.font())
+        filter_layout.addWidget(filter_label)
+        
+        # Filter combo box
+        self._transcription_filter_combo = QComboBox()
+        self._transcription_filter_combo.addItem("All", "all")
+        self._transcription_filter_combo.addItem("You (mic)", "mic")
+        self._transcription_filter_combo.addItem("Them (system)", "system")
+        self._transcription_filter_combo.currentIndexChanged.connect(self._on_transcription_filter_changed)
+        filter_layout.addWidget(self._transcription_filter_combo)
+        
+        filter_layout.addStretch()
+        wrapper_layout.addLayout(filter_layout)
+        
         # Create scroll area
         self._transcription_scroll_area = QScrollArea()
         self._transcription_scroll_area.setWidgetResizable(True)
@@ -899,10 +925,6 @@ class MainWindow(QMainWindow):
         self._transcription_layout.setContentsMargins(10, 10, 10, 10)
         self._transcription_layout.addStretch()  # Push content to top
         
-        # Create wrapper widget to return
-        wrapper = QWidget()
-        wrapper_layout = QVBoxLayout(wrapper)
-        wrapper_layout.setContentsMargins(0, 0, 0, 0)
         wrapper_layout.addWidget(self._transcription_scroll_area)
         
         return wrapper
@@ -919,6 +941,15 @@ class MainWindow(QMainWindow):
         bubble_frame = QFrame()
         bubble_frame.setFrameShape(QFrame.StyledPanel)
         bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        # Store the source as a property for filtering
+        bubble_frame.setProperty('source', source)
+        
+        # Check if this bubble should be visible based on current filter
+        if self._transcription_filter == 'mic' and source != 'mic':
+            bubble_frame.hide()
+        elif self._transcription_filter == 'system' and source != 'system':
+            bubble_frame.hide()
         
         # Set layout for the bubble
         bubble_layout = QVBoxLayout(bubble_frame)
@@ -1005,6 +1036,47 @@ class MainWindow(QMainWindow):
                 item = self._transcription_layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
+
+    def _on_transcription_filter_changed(self, index: int):
+        """Handle the transcription filter selection change.
+        
+        Args:
+            index: The index of the selected filter option
+        """
+        # Get the selected filter value from combo box
+        filter_value = self._transcription_filter_combo.currentData()
+        self._transcription_filter = filter_value
+        
+        # Update visibility of all transcription bubbles
+        self._update_transcription_filter()
+    
+    def _update_transcription_filter(self):
+        """Update the visibility of transcriptions based on the current filter."""
+        if not hasattr(self, '_transcription_layout') or not self._transcription_layout:
+            return
+        
+        # Iterate through all transcription bubble widgets
+        # The last item is the stretch, so we iterate up to count - 1
+        for i in range(self._transcription_layout.count() - 1):
+            item = self._transcription_layout.itemAt(i)
+            if item and item.widget():
+                bubble_frame = item.widget()
+                # Get the source stored in the bubble
+                source = bubble_frame.property('source')
+                
+                # Show or hide based on filter
+                if self._transcription_filter == 'all':
+                    bubble_frame.show()
+                elif self._transcription_filter == 'mic':
+                    if source == 'mic':
+                        bubble_frame.show()
+                    else:
+                        bubble_frame.hide()
+                elif self._transcription_filter == 'system':
+                    if source == 'system':
+                        bubble_frame.show()
+                    else:
+                        bubble_frame.hide()
 
     def _on_status_update(self, message: str, is_error: bool = False):
         """Handle status updates from the session manager."""
@@ -1108,18 +1180,22 @@ class MainWindow(QMainWindow):
             self._detached_window.raise_()
             return
         
-        # Create detached window with always-on-top flag
-        self._detached_window = QDialog(self)
+        # Create detached window with no parent (standalone window)
+        # This ensures it doesn't minimize when main window minimizes
+        self._detached_window = QDialog(None)  # No parent - standalone window
         self._detached_window.setWindowTitle('Live Transcriptions')
         self._detached_window.resize(400, 500)
         
-        # Set window flags: stay on top of other windows
+        # Set window flags: stay on top but not as modal
         self._detached_window.setWindowFlags(
             Qt.Window | 
             Qt.WindowStaysOnTopHint | 
             Qt.WindowCloseButtonHint | 
             Qt.WindowMinimizeButtonHint
         )
+        
+        # Prevent the detached window from activating the main window when minimized
+        self._detached_window.setAttribute(Qt.WA_QuitOnClose, False)
         
         layout = QVBoxLayout(self._detached_window)
         
@@ -1130,6 +1206,23 @@ class MainWindow(QMainWindow):
         label_font.setBold(True)
         label.setFont(label_font)
         layout.addWidget(label)
+        
+        # Filter controls row
+        filter_layout = QHBoxLayout()
+        
+        filter_label = QLabel("Filter:")
+        filter_layout.addWidget(filter_label)
+        
+        # Filter combo box for detached window
+        self._detached_filter_combo = QComboBox()
+        self._detached_filter_combo.addItem("All", "all")
+        self._detached_filter_combo.addItem("You (mic)", "mic")
+        self._detached_filter_combo.addItem("Them (system)", "system")
+        self._detached_filter_combo.currentIndexChanged.connect(self._on_detached_filter_changed)
+        filter_layout.addWidget(self._detached_filter_combo)
+        
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
         
         # Use same chat-like view as main window
         self._detached_scroll_area = QScrollArea()
@@ -1157,6 +1250,43 @@ class MainWindow(QMainWindow):
         
         self._detached_window.show()
     
+    def _on_detached_filter_changed(self, index: int):
+        """Handle the filter selection change in the detached window.
+        
+        Args:
+            index: The index of the selected filter option
+        """
+        self._update_detached_filter()
+    
+    def _update_detached_filter(self):
+        """Update the visibility of transcriptions in the detached window based on current filter."""
+        if not hasattr(self, '_detached_layout') or not self._detached_layout:
+            return
+        
+        filter_value = self._detached_filter_combo.currentData()
+        
+        # Iterate through all transcription bubble widgets
+        for i in range(self._detached_layout.count() - 1):
+            item = self._detached_layout.itemAt(i)
+            if item and item.widget():
+                bubble_frame = item.widget()
+                # Get the source stored in the bubble
+                source = bubble_frame.property('source')
+                
+                # Show or hide based on filter
+                if filter_value == 'all':
+                    bubble_frame.show()
+                elif filter_value == 'mic':
+                    if source == 'mic':
+                        bubble_frame.show()
+                    else:
+                        bubble_frame.hide()
+                elif filter_value == 'system':
+                    if source == 'system':
+                        bubble_frame.show()
+                    else:
+                        bubble_frame.hide()
+    
     def _add_transcription_to_detached(self, text: str):
         """Add a transcription to the detached window using chat-like bubbles.
         
@@ -1180,6 +1310,16 @@ class MainWindow(QMainWindow):
         bubble_frame = QFrame()
         bubble_frame.setFrameShape(QFrame.StyledPanel)
         bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        # Store the source as a property for filtering
+        bubble_frame.setProperty('source', source)
+        
+        # Check if this bubble should be visible based on current filter
+        filter_value = self._detached_filter_combo.currentData() if hasattr(self, '_detached_filter_combo') else 'all'
+        if filter_value == 'mic' and source != 'mic':
+            bubble_frame.hide()
+        elif filter_value == 'system' and source != 'system':
+            bubble_frame.hide()
         
         bubble_layout = QVBoxLayout(bubble_frame)
         bubble_layout.setContentsMargins(10, 8, 10, 8)
@@ -1250,6 +1390,7 @@ class MainWindow(QMainWindow):
             self._detached_scroll_area = None
             self._detached_container = None
             self._detached_layout = None
+            self._detached_filter_combo = None
 
     def _update_ui_state(self):
         """Update UI based on current session state."""

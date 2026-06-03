@@ -692,10 +692,13 @@ Important Decisions:
 - Word wrapping enabled for long transcriptions
 - Auto-scroll to bottom when new transcriptions are added
 - Updated _append_transcription() to parse formatted text and use the new chat-like view
+- Detached window now uses same chat-like interface as main UI
+- Detached window set as independent window (no parent) so it stays open when main window is minimized
+- Detached window stays on top of other windows (WindowStaysOnTopHint)
+- Detached window has WA_QuitOnClose=False to prevent app quit on close
 
 Recovery Notes:
 
 - Ready for BU033
-- The detach window still uses the simpler QTextEdit approach (not the chat-like view)
 
 ---
