@@ -594,8 +594,8 @@ Files Changed:
 Important Decisions:
 
 - Added QTextEdit import
-- Added live_transcription_group with QTextEdit in _create_central_widget
-- Created _on_live_transcription callback method that receives dict with text, source, timestamp
+- Added live_transcription_group with QTextEdit in \_create_central_widget
+- Created \_on_live_transcription callback method that receives dict with text, source, timestamp
 - Passed live_transcription_ui_callback to SessionManager initialization
 - Clear display on session start
 
@@ -617,7 +617,7 @@ Files Changed:
 
 Important Decisions:
 
-- Build initial_prompt from self._context before transcribing
+- Build initial_prompt from self.\_context before transcribing
 - Pass initial_prompt to self.engine.transcribe()
 - Include context in result dict for debugging
 
@@ -676,7 +676,7 @@ Recovery Notes:
 ## BU032 - Live Transcription Display
 
 Summary:
-Implemented chat-like UI to display live transcriptions. Transcriptions appear as bubbles with different styling for mic vs system audio. Uses thread-safe UI updates via QMetaObject.invokeMethod.
+Implemented a "chat-like" UI component to display live transcriptions in real-time. Transcriptions are displayed as styled bubbles in a scrollable area, with different visual styles for microphone (blue) and system (green) audio sources.
 
 Files Changed:
 
@@ -684,15 +684,18 @@ Files Changed:
 
 Important Decisions:
 
-- Replaced QTextEdit with QScrollArea and container Widget
-- Created _create_transcription_view() method for scrollable chat view
-- Created _add_transcription_to_view() method with bubble styling:
-  - Mic: Left-aligned, blue background (#e3f2fd), 🎤 icon
-  - System: Right-aligned, green background (#e8f5e9), 🔊 icon
-- Added thread-safe updates via QMetaObject.invokeMethod with Qt.QueuedConnection
-- Updated detached window to use same chat-like view
-- Added _clear_transcription_view() to clear messages on new session
+- Created _create_transcription_view() method with QScrollArea and QVBoxLayout for scrollable display
+- Created add_transcription_to_view() method to add styled transcription bubbles
+- Mic transcriptions displayed in blue bubbles with microphone emoji
+- System transcriptions displayed in green bubbles with speaker emoji
+- Each bubble shows source label, timestamp, and transcription text
+- Word wrapping enabled for long transcriptions
+- Auto-scroll to bottom when new transcriptions are added
+- Updated _append_transcription() to parse formatted text and use the new chat-like view
 
 Recovery Notes:
 
 - Ready for BU033
+- The detach window still uses the simpler QTextEdit approach (not the chat-like view)
+
+---

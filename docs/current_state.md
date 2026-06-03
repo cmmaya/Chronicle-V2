@@ -126,3 +126,8 @@ None
 - live_transcription_callback passed to DualSourceChunkedRecorder in create_session and load_session
 - Transcription results saved to database using db.add_transcript()
 - Transcription results passed to live_transcription_ui_callback for UI updates
+- Fixed QTimer thread safety issue: replaced QTimer.singleShot with QMetaObject.invokeMethod using Q_ARG for thread-safe UI updates from Python threading.Thread
+- Implemented chat-like transcription view with QScrollArea and QVBoxLayout
+- Transcriptions styled differently for mic (blue bubble) vs system (green bubble) audio
+- Added add_transcription_to_view() method for adding styled transcription bubbles
+- Added _create_transcription_view() method to create the scrollable transcription area

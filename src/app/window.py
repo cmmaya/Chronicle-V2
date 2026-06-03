@@ -3,9 +3,10 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QMessageBox, QApplication, QListWidget, QGroupBox,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
-                                QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox)
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QPixmap
+                                QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
+                                QFrame)
+from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG
+from PySide6.QtGui import QAction, QPixmap, QColor
 import logging
 
 from .session_manager import SessionManager
@@ -36,13 +37,15 @@ class MainWindow(QMainWindow):
         # Detached transcription window
         self._detached_window = None
         self._detached_display = None
-        self._detached_container = None
-        self._detached_layout = None
-        self._detached_scroll_area = None
         
         # VAD settings
         self._vad_threshold = 30  # Default 30%
         self._vad_aggressiveness = 2  # Default mode 2
+        
+        # Transcription view components (for chat-like display)
+        self._transcription_scroll_area = None
+        self._transcription_container = None
+        self._transcription_layout = None
         
         # Create UI components
         self._create_menu_bar()
@@ -848,13 +851,13 @@ class MainWindow(QMainWindow):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         
-        # Live transcription display area
+        # Live transcription display area - using chat-like view
         live_transcription_group = QGroupBox('Live Transcriptions')
         live_transcription_layout = QVBoxLayout()
-        self.live_transcription_display = QTextEdit()
-        self.live_transcription_display.setReadOnly(True)
-        self.live_transcription_display.setPlaceholderText('Transcriptions will appear here during recording...')
-        live_transcription_layout.addWidget(self.live_transcription_display)
+        
+        # Create the chat-like transcription view
+        transcription_view = self._create_transcription_view()
+        live_transcription_layout.addWidget(transcription_view)
         
         # Detach button
         self.detach_transcription_button = QPushButton('Detach Window')
@@ -873,6 +876,131 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('Ready')
+    
+    def _create_transcription_view(self) -> QWidget:
+        """Create a scrollable chat-like view for displaying live transcriptions.
+        
+        Returns:
+            QWidget: The widget containing the transcription view
+        """
+        # Create scroll area
+        self._transcription_scroll_area = QScrollArea()
+        self._transcription_scroll_area.setWidgetResizable(True)
+        self._transcription_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        # Create container widget
+        self._transcription_container = QWidget()
+        self._transcription_scroll_area.setWidget(self._transcription_container)
+        
+        # Create vertical layout for the container
+        self._transcription_layout = QVBoxLayout(self._transcription_container)
+        self._transcription_layout.setSpacing(10)
+        self._transcription_layout.setContentsMargins(10, 10, 10, 10)
+        self._transcription_layout.addStretch()  # Push content to top
+        
+        # Create wrapper widget to return
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.addWidget(self._transcription_scroll_area)
+        
+        return wrapper
+    
+    def add_transcription_to_view(self, text: str, source: str, timestamp: str = ''):
+        """Add a transcription to the chat-like view.
+        
+        Args:
+            text: The transcription text
+            source: The source ('mic' or 'system')
+            timestamp: Optional timestamp string
+        """
+        # Create a frame for each transcription bubble
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.StyledPanel)
+        bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        # Set layout for the bubble
+        bubble_layout = QVBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(10, 8, 10, 8)
+        bubble_layout.setSpacing(4)
+        
+        # Header with source and timestamp
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Source label
+        source_label = QLabel(f"{'🎤 Mic' if source == 'mic' else '🔊 System'}")
+        source_font = source_label.font()
+        source_font.setPointSize(10)
+        source_font.setBold(True)
+        source_label.setFont(source_font)
+        
+        # Timestamp label
+        time_label = QLabel(timestamp)
+        time_label.setStyleSheet("color: gray;")
+        time_font = time_label.font()
+        time_font.setPointSize(9)
+        time_label.setFont(time_font)
+        
+        header_layout.addWidget(source_label)
+        header_layout.addStretch()
+        header_layout.addWidget(time_label)
+        
+        bubble_layout.addLayout(header_layout)
+        
+        # Transcription text
+        text_label = QLabel(text)
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        
+        bubble_layout.addWidget(text_label)
+        
+        # Style based on source
+        if source == 'mic':
+            # Mic - left aligned with blue-ish background
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E3F2FD;
+                    border-radius: 10px;
+                    border: 1px solid #90CAF9;
+                }
+            """)
+            header_layout.insertStretch(0, 0)  # Left align
+        else:
+            # System - left aligned with green-ish background
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E8F5E9;
+                    border-radius: 10px;
+                    border: 1px solid #A5D6A7;
+                }
+            """)
+            header_layout.insertStretch(0, 0)  # Left align
+        
+        # Add to layout (before the stretch)
+        self._transcription_layout.insertWidget(
+            self._transcription_layout.count() - 1,  # Insert before stretch
+            bubble_frame
+        )
+        
+        # Auto-scroll to bottom
+        self._transcription_scroll_area.verticalScrollBar().setValue(
+            self._transcription_scroll_area.verticalScrollBar().maximum()
+        )
+        
+        # Also update detached window if it exists
+        if hasattr(self, '_detached_display') and self._detached_display:
+            # For detached window, we use the simpler QTextEdit approach
+            pass  # Detached window uses different display method
+    
+    def _clear_transcription_view(self):
+        """Clear all transcriptions from the chat-like view."""
+        if hasattr(self, '_transcription_layout') and self._transcription_layout:
+            # Remove all widgets except the stretch (last item)
+            while self._transcription_layout.count() > 1:
+                item = self._transcription_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
 
     def _on_status_update(self, message: str, is_error: bool = False):
         """Handle status updates from the session manager."""
@@ -921,18 +1049,44 @@ class MainWindow(QMainWindow):
             else:
                 display_text = f"{source_label}: {text}"
             
-            # Use thread-safe UI update via QTimer
-            QTimer.singleShot(0, lambda: self._append_transcription(display_text))
+            # Use thread-safe UI update via QMetaObject.invokeMethod
+            # This works correctly when called from any thread (Python threading.Thread)
+            QMetaObject.invokeMethod(
+                self,
+                "_append_transcription",
+                Qt.QueuedConnection,
+                Q_ARG(str, display_text)
+            )
             
         except Exception as e:
             logger.error(f"Failed to display live transcription: {e}")
     
+    @Slot(str)
     def _append_transcription(self, text: str):
-        """Append transcription text to the display."""
-        self.live_transcription_display.append(text)
-        # Auto-scroll to bottom
-        scrollbar = self.live_transcription_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        """Append transcription text to the display.
+        
+        This method is designed to be called via QMetaObject.invokeMethod
+        from any thread for thread-safe UI updates.
+        
+        Args:
+            text: The transcription text to append (format: "[HH:MM:SS] Source: text")
+        """
+        # Parse the formatted text to extract components
+        # Format: "[HH:MM:SS] Source: text" or "Source: text"
+        timestamp = ''
+        source = 'mic'  # Default to mic
+        clean_text = text
+        
+        import re
+        match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]\s+(Mic|System):\s+(.+)', text)
+        if match:
+            timestamp = match.group(1)
+            source_match = match.group(2).lower()
+            source = 'mic' if source_match == 'mic' else 'system'
+            clean_text = match.group(3)
+        
+        # Use the new chat-like view method
+        self.add_transcription_to_view(clean_text, source, timestamp)
         
         # Also update detached window if it exists
         if hasattr(self, '_detached_display') and self._detached_display:
@@ -1020,7 +1174,7 @@ class MainWindow(QMainWindow):
         """Handle start session button click."""
         try:
             # Clear live transcription display for new session
-            self.live_transcription_display.clear()
+            self._clear_transcription_view()
             
             # Generate session name with timestamp
             from datetime import datetime
@@ -1037,21 +1191,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._on_status_update(f'Failed to start session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to start session: {str(e)}')
-    
-    def _clear_transcription_view(self):
-        """Clear all transcriptions from the view."""
-        if hasattr(self, 'live_transcription_layout') and self.live_transcription_layout:
-            # Remove all widgets except the stretch (last item)
-            while self.live_transcription_layout.count() > 1:
-                item = self.live_transcription_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-        
-        if hasattr(self, '_detached_layout') and self._detached_layout:
-            while self._detached_layout.count() > 1:
-                item = self._detached_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
     
     def _on_stop_session(self):
         """Handle stop session button click."""
