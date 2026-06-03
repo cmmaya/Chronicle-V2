@@ -4,7 +4,6 @@ import os
 import base64
 from typing import Optional
 
-from ..config import get_selected_model
 from ..storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -41,6 +40,7 @@ class ScreenshotContextGenerator:
         "openai/gpt-5-mini",
         "qwen/qwen3-14b",
         "qwen/qwen3-32b",
+        "qwen/qwen3.5-flash-02-23",
     }
     
     # Fallback: check if model name contains certain patterns
@@ -136,6 +136,10 @@ class ScreenshotContextGenerator:
         
         return prompt
     
+    # Default vision model - hardcoded for screenshot context generation
+    DEFAULT_VISION_MODEL = "qwen/qwen3.5-flash-02-23"
+    FALLBACK_VISION_MODEL = "google/gemini-2.5-flash"
+    
     def generate_context(
         self,
         screenshot_path: str,
@@ -155,19 +159,40 @@ class ScreenshotContextGenerator:
             The generated context string.
             
         Raises:
-            ModelDoesNotSupportImagesError: If the selected model doesn't support images.
+            ModelDoesNotSupportImagesError: If no vision-capable model is available.
             FileNotFoundError: If the screenshot file doesn't exist.
             ScreenshotContextGeneratorError: If context generation fails.
         """
-        model_id = get_selected_model()
+        # Try primary model first, then fallback
+        model_id = self.DEFAULT_VISION_MODEL
         
-        if not self._model_supports_vision(model_id):
-            raise ModelDoesNotSupportImagesError(
-                f"The selected model '{model_id}' does not support image input. "
-                f"Please select a vision-capable model in Settings > Assistant Model. "
-                f"Supported models include: google/gemini-2.5-flash, anthropic/claude-3.5-haiku, etc."
+        try:
+            # Try primary model
+            context = self._generate_with_model(
+                screenshot_path, session_metadata, transcript_excerpt, store, model_id
             )
-        
+            return context
+        except Exception as primary_error:
+            # Try fallback model
+            try:
+                model_id = self.FALLBACK_VISION_MODEL
+                context = self._generate_with_model(
+                    screenshot_path, session_metadata, transcript_excerpt, store, model_id
+                )
+                return context
+            except Exception:
+                # Both models failed, raise the original error
+                raise primary_error
+    
+    def _generate_with_model(
+        self,
+        screenshot_path: str,
+        session_metadata: Optional[str],
+        transcript_excerpt: Optional[str],
+        store: bool,
+        model_id: str
+    ) -> str:
+        """Generate context using a specific model."""
         try:
             # Encode the image
             image_data = self._encode_image(screenshot_path)
@@ -201,6 +226,12 @@ class ScreenshotContextGenerator:
         except FileNotFoundError:
             raise
         except Exception as e:
+            error_msg = str(e)
+            # Check for specific OpenRouter errors
+            if "404" in error_msg or "No endpoints found" in error_msg:
+                raise ScreenshotContextGeneratorError(
+                    f"The selected model '{model_id}' does not support image input on OpenRouter."
+                ) from e
             logger.error(f"Failed to generate screenshot context: {e}")
             raise ScreenshotContextGeneratorError(f"Failed to generate context: {e}")
     

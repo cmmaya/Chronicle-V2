@@ -734,16 +734,27 @@ class MainWindow(QMainWindow):
             # Text area for context display
             context_text = QTextEdit()
             context_text.setReadOnly(True)
-            context_text.setPlaceholderText("Click 'Give Context' to generate AI context for screenshots...")
             context_text.setMaximumHeight(100)
+            
+            # Check if summary exists - required for context generation
+            summaries = self.session_manager.db.get_summaries(session_id)
+            has_summary = summaries and len(summaries) > 0
+            
+            if has_summary:
+                context_text.setPlaceholderText("Click 'Give Context' to generate AI context for screenshots...")
+            else:
+                context_text.setPlaceholderText("Generate a summary first before generating screenshot context.")
             layout.addWidget(context_text)
             
             # Buttons
             button_layout = QHBoxLayout()
             
-            # Give Context button - enabled only if there are screenshots
+            # Give Context button - enabled only if there are screenshots AND summary exists
             give_context_button = QPushButton("Give Context")
-            give_context_button.setEnabled(True)
+            give_context_button.setEnabled(has_summary and len(screenshots) > 0)
+            
+            if not has_summary:
+                give_context_button.setToolTip("Generate a summary first before generating screenshot context")
             
             # Close button
             close_button = QPushButton("Close")
@@ -767,7 +778,7 @@ class MainWindow(QMainWindow):
                     # Create context generator
                     context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
                     
-                    # Build session metadata
+                    # Get session metadata including summary
                     session = self.session_manager.db.get_session(session_id)
                     session_metadata = f"Session: {session_name}"
                     if session:
@@ -775,15 +786,41 @@ class MainWindow(QMainWindow):
                         if created_at:
                             session_metadata += f" | Date: {created_at}"
                     
+                    # Add summary to metadata if available
+                    if has_summary:
+                        summary = summaries[0]
+                        summary_content = summary.get('content', '')
+                        if summary_content:
+                            session_metadata += f"\n\nSummary:\n{summary_content[:500]}"
+                    
+                    # Get all transcripts for finding nearest ones
+                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
+                    
                     # Generate context for each screenshot
                     all_contexts = []
                     for screenshot in screenshots:
                         filepath = screenshot.get('filepath', '')
+                        screenshot_timestamp = screenshot.get('timestamp', 0)
+                        
                         if filepath:
+                            # Find 2 nearest transcripts to this screenshot timestamp
+                            transcript_excerpt = ""
+                            if all_transcripts:
+                                # Sort by absolute time difference to find nearest
+                                sorted_transcripts = sorted(
+                                    all_transcripts,
+                                    key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
+                                )
+                                nearest_2 = sorted_transcripts[:2]
+                                transcript_excerpt = " | ".join(
+                                    t.get('text', '')[:200] for t in nearest_2 if t.get('text')
+                                )
+                            
                             try:
                                 context = context_gen.generate_context(
                                     screenshot_path=filepath,
                                     session_metadata=session_metadata,
+                                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
                                     store=True
                                 )
                                 all_contexts.append(context)
