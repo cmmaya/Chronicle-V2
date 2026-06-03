@@ -9,9 +9,11 @@ from ..audio_capture.core import DualSourceChunkedRecorder
 from ..screenshots.capture import ScreenshotCapture
 from ..transcription.processor import TranscriptionProcessor
 from ..transcription.live import LiveTranscriber
+from ..summarization import SummaryGenerator
 
 from .session import Session
 from .timeline import Timeline
+from ..config import SESSION
 
 logger = logging.getLogger(__name__)
 
@@ -322,8 +324,60 @@ class SessionManager:
             except Exception as e:
                 self._update_status(f'Auto transcription failed: {str(e)}', is_error=True)
         
+        # Auto-generate summary if enabled (after transcriptions are processed)
+        if SESSION.get('auto_summary_after_stop', False):
+            try:
+                self._auto_generate_summary(session)
+            except Exception as e:
+                self._update_status(f'Auto summary failed: {str(e)}', is_error=True)
+        
         self._update_status(f'Stopped session {session.id}: {session.name}')
         return session
+    
+    def _auto_generate_summary(self, session: Session) -> None:
+        """Automatically generate a summary for a session if conditions are met.
+        
+        Args:
+            session: The session to generate a summary for
+        """
+        session_id = session.id
+        
+        # Check if summary already exists
+        existing_summaries = session.db.get_summaries(session_id)
+        if existing_summaries:
+            self._update_status(f'Summary already exists for session {session_id}, skipping auto-summary')
+            return
+        
+        # Get transcripts from database
+        transcripts = session.db.get_transcripts(session_id)
+        
+        if not transcripts:
+            self._update_status(f'No transcripts found for session {session_id}, cannot auto-summarize')
+            return
+        
+        # Combine all transcript text
+        full_transcript = ' '.join(
+            t.get('text', '') for t in transcripts if t.get('text')
+        )
+        
+        if not full_transcript.strip():
+            self._update_status(f'No transcript text found for session {session_id}, cannot auto-summarize')
+            return
+        
+        self._update_status(f'Auto-generating summary for session {session_id}...')
+        
+        # Create summary generator and generate summary
+        summary_gen = SummaryGenerator(db=session.db)
+        summary_gen.generate_and_store(
+            transcript=full_transcript,
+            session_id=session_id,
+            summary_type='full'
+        )
+        
+        # Update summary status in database
+        session.db.update_session(session_id, summary_status='summarized')
+        
+        self._update_status(f'Auto-summary completed for session {session_id}')
     
     def get_active_session(self) -> Optional[Session]:
         """Get the currently active session.

@@ -12,7 +12,7 @@ import logging
 
 from .session_manager import SessionManager
 from ..summarization import SummaryGenerator
-from ..config import ASSISTANT_AGENTS
+from ..config import ASSISTANT_AGENTS, SESSION
 from ..assistant.service import AssistantAnswerService
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         self._current_question = None  # Store original question for retry
         self._current_candidates = []  # Store current candidates for selection
         self._candidate_list_widget = None  # List widget for candidate selection
+        self._current_conversation_id = None  # Store conversation ID for follow-up questions
         
         # Create UI components
         self._create_menu_bar()
@@ -162,6 +163,15 @@ class MainWindow(QMainWindow):
                         # Fix the inconsistent state in database
                         self.session_manager.db.update_session(session_id, transcription_status='transcribed')
                         trans_status = 'transcribed'
+                
+                # FIX: Verify summary status against actual summaries in database
+                # This corrects cases where summary_status is 'none' but summaries exist
+                if sum_status == 'none':
+                    actual_summaries = self.session_manager.db.get_summaries(session_id)
+                    if actual_summaries:
+                        # Fix the inconsistent state in database
+                        self.session_manager.db.update_session(session_id, summary_status='summarized')
+                        sum_status = 'summarized'
                 
                 # Session name (editable)
                 name_item = QTableWidgetItem(session['name'])
@@ -850,6 +860,12 @@ class MainWindow(QMainWindow):
         self.live_transcription_checkbox.setChecked(True)
         left_layout.addWidget(self.live_transcription_checkbox)
         
+        # Auto summary checkbox
+        self.auto_summary_checkbox = QCheckBox('Auto-generate summary after session stop')
+        self.auto_summary_checkbox.setChecked(SESSION.get('auto_summary_after_stop', False))
+        self.auto_summary_checkbox.toggled.connect(lambda checked: SESSION.__setitem__('auto_summary_after_stop', checked))
+        left_layout.addWidget(self.auto_summary_checkbox)
+        
         # Spacer
         left_layout.addStretch()
         
@@ -929,6 +945,10 @@ class MainWindow(QMainWindow):
         self.ask_button = QPushButton("Ask")
         self.ask_button.clicked.connect(self._on_ask_clicked)
         button_layout.addWidget(self.ask_button)
+        
+        self.new_chat_button = QPushButton("New Chat")
+        self.new_chat_button.clicked.connect(self._on_new_chat_clicked)
+        button_layout.addWidget(self.new_chat_button)
         
         self.detach_assistant_button = QPushButton("Detach")
         self.detach_assistant_button.clicked.connect(self._on_detach_assistant)
@@ -1967,6 +1987,14 @@ class MainWindow(QMainWindow):
             
             self._on_status_update(f'VAD settings updated: {self._vad_threshold}% threshold, Mode {self._vad_aggressiveness}')
     
+    def _on_new_chat_clicked(self):
+        """Handle the New Chat button click - resets conversation context."""
+        self._current_conversation_id = None
+        self.question_input.clear()
+        self.answer_display.setPlainText("")
+        self._clear_candidates()
+        self._on_status_update("New conversation started")
+    
     def _on_ask_clicked(self):
         """Handle the Ask button click - wires to AssistantAnswerService."""
         # Get the question from the input
@@ -2025,7 +2053,8 @@ class MainWindow(QMainWindow):
                 agent_id=agent_id,
                 explicit_scope=explicit_scope,
                 active_session_id=active_session_id,
-                selected_session_id=selected_session_id
+                selected_session_id=selected_session_id,
+                conversation_id=self._current_conversation_id
             )
             
             # Handle the response
@@ -2033,6 +2062,9 @@ class MainWindow(QMainWindow):
                 # Clear candidates on successful answer
                 self._clear_candidates()
                 self.answer_display.setPlainText(response.answer or "")
+                # Save conversation_id for follow-up questions
+                if response.conversation_id:
+                    self._current_conversation_id = response.conversation_id
                 self._on_status_update("Answer received")
             elif response.needs_clarification:
                 # Show clarification question and candidates
@@ -2390,6 +2422,10 @@ class MainWindow(QMainWindow):
         self._detached_ask_button.clicked.connect(self._on_detached_ask_clicked)
         button_layout.addWidget(self._detached_ask_button)
         
+        self._detached_new_chat_button = QPushButton("New Chat")
+        self._detached_new_chat_button.clicked.connect(self._on_new_chat_clicked)
+        button_layout.addWidget(self._detached_new_chat_button)
+        
         button_layout.addStretch()
         main_layout.addLayout(button_layout)
         
@@ -2466,7 +2502,8 @@ class MainWindow(QMainWindow):
             agent_id=agent_id,
             explicit_scope=explicit_scope,
             active_session_id=active_session_id,
-            selected_session_id=selected_session_id
+            selected_session_id=selected_session_id,
+            conversation_id=self._current_conversation_id
         ))
     
     def _run_detached_assistant_query(
@@ -2475,7 +2512,8 @@ class MainWindow(QMainWindow):
         agent_id: str,
         explicit_scope: str,
         active_session_id: Optional[int],
-        selected_session_id: Optional[int]
+        selected_session_id: Optional[int],
+        conversation_id: Optional[int]
     ):
         """Execute the assistant query in the background for detached window."""
         try:
@@ -2485,7 +2523,8 @@ class MainWindow(QMainWindow):
                 agent_id=agent_id,
                 explicit_scope=explicit_scope,
                 active_session_id=active_session_id,
-                selected_session_id=selected_session_id
+                selected_session_id=selected_session_id,
+                conversation_id=conversation_id
             )
             
             # Handle the response
@@ -2495,6 +2534,9 @@ class MainWindow(QMainWindow):
                 self._detached_answer_display.setPlainText(response.answer or "")
                 # Also update main window's answer display to keep them in sync
                 self.answer_display.setPlainText(response.answer or "")
+                # Save conversation_id for follow-up questions
+                if response.conversation_id:
+                    self._current_conversation_id = response.conversation_id
                 self._on_status_update("Answer received")
             elif response.needs_clarification:
                 # Show clarification question and candidates

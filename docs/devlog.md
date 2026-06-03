@@ -1256,3 +1256,109 @@ Validation:
 
 Next:
 - Ready for BU051
+
+---
+
+## BU050-1 - New Chat Button
+
+Summary:
+Added a "New Chat" button to the assistant panel that resets the conversation context, allowing users to start fresh conversations without previous context.
+
+Files Changed:
+- src/app/window.py (added _current_conversation_id state, _on_new_chat_clicked method, New Chat buttons in main and detached windows)
+
+Important Decisions:
+- Button placed next to "Ask" button for easy access
+- Clicking clears: conversation_id, question input, answer display, and candidate UI
+- Status message confirms new conversation started
+- Both main window and detached assistant window have the button
+
+Definition of Done Satisfied:
+- [x] New Chat button appears in assistant panel
+- [x] Clicking clears current conversation context
+- [x] Next question starts fresh conversation
+
+Validation:
+- Python syntax check passed (py_compile)
+- Existing tests still pass
+
+Next:
+- Ready for BU051
+
+---
+
+## BU051 - Automatic Summary Setting
+
+Summary:
+Added a persisted setting to control whether a summary is generated after a session stops. The setting is stored in the SESSION configuration dictionary with a default value of False.
+
+Files Changed:
+- src/config.py (added SESSION config dict with auto_summary_after_stop setting)
+
+Important Decisions:
+- Default value is False (no auto-summary on stop)
+- Setting accessible via SESSION['auto_summary_after_stop']
+- No UI, database, or session lifecycle changes (out of scope per BU specification)
+
+Definition of Done Satisfied:
+- [x] Auto-summary default exists (False)
+- [x] Setting is accessible from app code
+- [x] No session lifecycle behavior changes
+- [x] No model calls added
+
+Validation:
+- Setting can be imported: `from src.config import SESSION`
+- Value verified: SESSION['auto_summary_after_stop'] returns False
+
+Next:
+- Ready for BU052
+
+---
+
+## BU052 - Auto Summary Toggle Button
+
+Summary:
+Added a UI toggle/checkbox to control automatic summary generation after session stops. The checkbox is initialized from the SESSION config setting and allows users to enable/disable auto-summary without code changes.
+
+Files Changed:
+- src/app/window.py (added import for SESSION, added auto_summary_checkbox widget)
+
+Important Decisions:
+- Checkbox placed after live transcription checkbox for logical grouping
+- Initial state reflects config default (False)
+- Checkbox uses QCheckBox widget with descriptive label
+
+Definition of Done Satisfied:
+- [x] Auto Summary control is visible
+- [x] Control reflects persisted/default setting
+- [x] Toggling does not break existing session controls
+- [x] Manual summarization still works
+
+Validation:
+- Python syntax check passed (py_compile)
+- No runtime errors in import
+
+Next:
+- Ready for BU053
+
+---
+
+## BU053 - Auto Summary On Stop
+
+Summary:
+Implemented auto-summary on session stop. Modified session_manager.py to automatically generate summary when a session stops and the auto-summary setting is enabled. Also connected the UI checkbox to update the config.
+
+Files Changed:
+- src/app/session_manager.py
+- src/app/window.py
+
+Important Decisions:
+- Added _auto_generate_summary method that checks for existing summaries and transcripts before generating
+- Connected auto_summary_checkbox.toggled signal to update SESSION config dictionary
+- Added summary status verification in _load_past_sessions to fix inconsistent database state
+- Updated summary_status in database after auto-summary completes
+
+Recovery Notes:
+- The checkbox was not connected to update the config, which was why auto-summary wasn't triggering
+- Also fixed the UI to verify and display actual summary status from the database
+

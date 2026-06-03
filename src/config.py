@@ -24,6 +24,16 @@ ASSISTANT_AGENTS = {
                 "the transcript. If unclear, ask a clarifying question. Prioritize key facts over elaboration."
             ),
         },
+        "research_helper": {
+            "label": "Research Helper",
+            "model": "google/gemini-2.5-flash",
+            "system_instruction": (
+                "You are a research assistant. If the question is about meeting transcripts, summaries, "
+                "or session content, answer based on the provided context. If the question is about general "
+                "knowledge or not related to the meeting transcripts, answer using your own knowledge base. "
+                "Clearly indicate when you're using general knowledge vs transcript content."
+            ),
+        },
     },
 }
 
@@ -44,4 +54,12 @@ SUMMARIZATION = {
     "max_tokens": 2500,
     "temperature": 0.0,
     "top_p": 0.2,
+}
+
+
+# Session Settings
+SESSION = {
+    # Auto-generate summary after session stops
+    # When True, a summary will be generated automatically when the session is stopped
+    "auto_summary_after_stop": False,
 }

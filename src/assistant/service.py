@@ -132,21 +132,30 @@ class AssistantAnswerService:
                 error=f"Agent '{agent_id}' not found.",
             )
 
-        # Step 4: Retrieve context based on scope
+        # Step 4: Determine if question requires session context
+        # Research Helper can answer general knowledge questions without session context
+        needs_session_context = self._needs_session_context(agent_id, question, resolution.scope)
+
+        # Step 5: Retrieve context based on scope
         context_text = ""
         session_ids = resolution.session_ids
 
-        if resolution.scope == ScopeResolution.ALL_SESSIONS:
-            # Cross-session: use search tools
-            context_text = self._get_all_sessions_context(question)
+        if needs_session_context:
+            if resolution.scope == ScopeResolution.ALL_SESSIONS:
+                # Cross-session: use search tools
+                context_text = self._get_all_sessions_context(question)
+            else:
+                # Single session: use bounded context
+                if session_ids:
+                    context_text = self._get_single_session_context(
+                        session_ids[0], question, conversation_id
+                    )
         else:
-            # Single session: use bounded context
-            if session_ids:
-                context_text = self._get_single_session_context(
-                    session_ids[0], question, conversation_id
-                )
+            # For research_helper with general knowledge questions, use minimal context
+            # Just include conversation history, no session data needed
+            context_text = ""
 
-        # Step 5: Build messages for OpenRouter
+        # Step 6: Build messages for OpenRouter
         messages = self._build_messages(agent, context_text, question, conversation_id)
 
         # Step 6: Call OpenRouter API
@@ -181,6 +190,36 @@ class AssistantAnswerService:
         if agent_id is None:
             agent_id = ASSISTANT_AGENTS.get("default", "chronicle_assistant")
         return self._agents.get(agent_id)
+
+    def _needs_session_context(
+        self,
+        agent_id: str,
+        question: str,
+        scope: ScopeResolution,
+    ) -> bool:
+        """
+        Determine if a question requires session/transcript context.
+        
+        For research_helper, questions NOT about meetings can be answered
+        with general knowledge. For other agents, always require context.
+        """
+        # Non-research agents always need session context
+        if agent_id != "research_helper":
+            return True
+        
+        # Research helper: check if scope indicates session interest
+        # If user explicitly selected a session or asked about sessions, use context
+        if scope in (ScopeResolution.CURRENT_SESSION, ScopeResolution.SELECTED_SESSION):
+            return True
+        
+        # For ALL_SESSIONS or ambiguous cases, also use context to search transcripts
+        if scope == ScopeResolution.ALL_SESSIONS:
+            return True
+        
+        # For research_helper with no specific session context requested,
+        # we allow general knowledge questions
+        # But still include any available context from conversation history
+        return False
 
     def _get_single_session_context(
         self, session_id: int, question: str, conversation_id: Optional[int] = None

@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU050
-- Next BU: BU051
+- Current BU: BU053
+- Next BU: BU054
 
 ## Target Architecture
 
@@ -65,6 +65,10 @@ BU047 - Past Assistant Conversations UI
 BU048 - Session-Scoped Conversation Persistence
 BU049 - Assistant Context Loader
 BU050 - Assistant Conversation Writeback
+BU050-1 - New Chat Button
+BU051 - Automatic Summary Setting
+BU052 - Auto Summary Toggle Button
+BU053 - Auto Summary On Stop
 
 ## In Progress BUs
 None
