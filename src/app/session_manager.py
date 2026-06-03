@@ -451,7 +451,8 @@ class SessionManager:
         result = session.process_transcriptions()
         
         # Update transcription status in database
-        if result:
+        # Check if there are any transcripts in the database (from live transcription or batch processing)
+        if self.db.get_transcripts(session.id):
             self.db.update_session(session.id, transcription_status='transcribed')
             self._update_status(f'Transcription completed for session {session.id}')
         

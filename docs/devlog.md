@@ -702,3 +702,83 @@ Recovery Notes:
 - Ready for BU033
 
 ---
+
+## BU033
+
+Summary:
+Added controls to filter live transcriptions by source (All, Mic only, System only). Filter works in both main window and detached transcription window.
+
+Files Changed:
+- src/app/window.py
+
+Important Decisions:
+- Used QComboBox for filter selection in both main and detached windows
+- Stored source as Qt property on bubble frame for efficient filtering
+- Filter applies both to new transcriptions and existing ones
+- Detached window has independent filter control
+
+Recovery Notes:
+- Filter state tracked via `_transcription_filter` variable
+- Main window filter combo available via `_transcription_filter_combo`
+- Detached window filter combo available via `_detached_filter_combo`
+
+---
+
+## Database Structure
+
+SQLite database: `chronicle.db`
+
+### Tables:
+
+**sessions**
+- id (INTEGER PRIMARY KEY)
+- name (TEXT)
+- start_time (INTEGER)
+- end_time (INTEGER)
+- status (TEXT)
+- transcription_status (TEXT DEFAULT 'none')
+- summary_status (TEXT DEFAULT 'none')
+
+**transcripts**
+- id (INTEGER PRIMARY KEY)
+- session_id (INTEGER FOREIGN KEY)
+- timestamp (INTEGER)
+- text (TEXT)
+- source (TEXT) - 'microphone' or 'system'
+
+**screenshots**
+- id (INTEGER PRIMARY KEY)
+- session_id (INTEGER FOREIGN KEY)
+- timestamp (INTEGER)
+- filepath (TEXT)
+- description (TEXT)
+
+**summaries**
+- id (INTEGER PRIMARY KEY)
+- session_id (INTEGER FOREIGN KEY)
+- summary_type (TEXT)
+- content (TEXT)
+- model_used (TEXT)
+- created_at (INTEGER)
+
+---
+
+## Fix - Live Transcription Status Not Updated
+
+Summary:
+Fixed bug where transcription_status was not updated to 'transcribed' when session ends with live transcription enabled. The previous code checked `if result:` which is always truthy (dictionary exists), but when live transcription already saved transcripts to the database, the batch processing found no new files and returned empty lists.
+
+Files Changed:
+
+- src/app/session_manager.py
+
+Important Decisions:
+
+- Changed condition from `if result:` to `if self.db.get_transcripts(session.id):` to check if there are any transcripts in the database, regardless of whether they came from live transcription or batch processing
+
+Recovery Notes:
+
+- This ensures transcription_status is correctly updated to 'transcribed' when:
+  1. Live transcription was used during recording (transcripts saved in real-time)
+  2. Batch processing found new audio files to transcribe
+  3. Any transcripts exist in the database for the session

@@ -58,6 +58,7 @@ None
 
 ## Known Issues
 - The UI does not yet exist for most features. The backend functionality is largely in place, but there is no way for a user to interact with it.
+- Fixed: Live transcription session ending did not update transcription_status to 'transcribed' in database
 
 ## Working Memory
 - Fresh repository
