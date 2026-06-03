@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
         self._transcription_scroll_area = None
         self._transcription_container = None
         self._transcription_layout = None
+        self._transcription_history = []  # Store transcriptions for detached window
         
         # Create UI components
         self._create_menu_bar()
@@ -994,7 +995,10 @@ class MainWindow(QMainWindow):
             pass  # Detached window uses different display method
     
     def _clear_transcription_view(self):
-        """Clear all transcriptions from the chat-like view."""
+        """Clear all transcriptions from the view."""
+        # Clear history
+        self._transcription_history = []
+        
         if hasattr(self, '_transcription_layout') and self._transcription_layout:
             # Remove all widgets except the stretch (last item)
             while self._transcription_layout.count() > 1:
@@ -1071,6 +1075,9 @@ class MainWindow(QMainWindow):
         Args:
             text: The transcription text to append (format: "[HH:MM:SS] Source: text")
         """
+        # Store in history for detached window
+        self._transcription_history.append(text)
+        
         # Parse the formatted text to extract components
         # Format: "[HH:MM:SS] Source: text" or "Source: text"
         timestamp = ''
@@ -1089,10 +1096,8 @@ class MainWindow(QMainWindow):
         self.add_transcription_to_view(clean_text, source, timestamp)
         
         # Also update detached window if it exists
-        if hasattr(self, '_detached_display') and self._detached_display:
-            self._detached_display.append(text)
-            scrollbar = self._detached_display.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+        if hasattr(self, '_detached_window') and self._detached_window:
+            self._add_transcription_to_detached(text)
     
     def _on_detach_transcription(self):
         """Create a detached window for live transcriptions."""
@@ -1103,10 +1108,18 @@ class MainWindow(QMainWindow):
             self._detached_window.raise_()
             return
         
-        # Create detached window
+        # Create detached window with always-on-top flag
         self._detached_window = QDialog(self)
         self._detached_window.setWindowTitle('Live Transcriptions')
         self._detached_window.resize(400, 500)
+        
+        # Set window flags: stay on top of other windows
+        self._detached_window.setWindowFlags(
+            Qt.Window | 
+            Qt.WindowStaysOnTopHint | 
+            Qt.WindowCloseButtonHint | 
+            Qt.WindowMinimizeButtonHint
+        )
         
         layout = QVBoxLayout(self._detached_window)
         
@@ -1118,22 +1131,115 @@ class MainWindow(QMainWindow):
         label.setFont(label_font)
         layout.addWidget(label)
         
-        # Text display
-        self._detached_display = QTextEdit()
-        self._detached_display.setReadOnly(True)
-        self._detached_display.setPlaceholderText('Transcriptions will appear here...')
+        # Use same chat-like view as main window
+        self._detached_scroll_area = QScrollArea()
+        self._detached_scroll_area.setWidgetResizable(True)
+        self._detached_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
-        # Copy existing transcriptions
-        self._detached_display.setPlainText(self.live_transcription_display.toPlainText())
+        self._detached_container = QWidget()
+        self._detached_scroll_area.setWidget(self._detached_container)
         
-        layout.addWidget(self._detached_display)
+        self._detached_layout = QVBoxLayout(self._detached_container)
+        self._detached_layout.setSpacing(10)
+        self._detached_layout.setContentsMargins(10, 10, 10, 10)
+        self._detached_layout.addStretch()
+        
+        layout.addWidget(self._detached_scroll_area)
         
         # Close button
         close_button = QPushButton('Close')
         close_button.clicked.connect(self._on_close_detached_window)
         layout.addWidget(close_button)
         
+        # Copy existing transcriptions from history
+        for text in self._transcription_history:
+            self._add_transcription_to_detached(text)
+        
         self._detached_window.show()
+    
+    def _add_transcription_to_detached(self, text: str):
+        """Add a transcription to the detached window using chat-like bubbles.
+        
+        Args:
+            text: The transcription text (format: "[HH:MM:SS] Source: text")
+        """
+        # Parse the formatted text
+        import re
+        timestamp = ''
+        source = 'mic'
+        clean_text = text
+        
+        match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]\s+(Mic|System):\s+(.+)', text)
+        if match:
+            timestamp = match.group(1)
+            source_match = match.group(2).lower()
+            source = 'mic' if source_match == 'mic' else 'system'
+            clean_text = match.group(3)
+        
+        # Create bubble frame
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.StyledPanel)
+        bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        bubble_layout = QVBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(10, 8, 10, 8)
+        bubble_layout.setSpacing(4)
+        
+        # Header
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        source_label = QLabel(f"{'🎤 Mic' if source == 'mic' else '🔊 System'}")
+        source_font = source_label.font()
+        source_font.setPointSize(10)
+        source_font.setBold(True)
+        source_label.setFont(source_font)
+        
+        time_label = QLabel(timestamp)
+        time_label.setStyleSheet("color: gray;")
+        time_font = time_label.font()
+        time_font.setPointSize(9)
+        time_label.setFont(time_font)
+        
+        header_layout.addWidget(source_label)
+        header_layout.addStretch()
+        header_layout.addWidget(time_label)
+        
+        bubble_layout.addLayout(header_layout)
+        
+        # Text
+        text_label = QLabel(clean_text)
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble_layout.addWidget(text_label)
+        
+        # Style based on source
+        if source == 'mic':
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E3F2FD;
+                    border-radius: 10px;
+                    border: 1px solid #90CAF9;
+                }
+            """)
+        else:
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E8F5E9;
+                    border-radius: 10px;
+                    border: 1px solid #A5D6A7;
+                }
+            """)
+        
+        self._detached_layout.insertWidget(
+            self._detached_layout.count() - 1,
+            bubble_frame
+        )
+        
+        # Auto-scroll
+        self._detached_scroll_area.verticalScrollBar().setValue(
+            self._detached_scroll_area.verticalScrollBar().maximum()
+        )
     
     def _on_close_detached_window(self):
         """Close the detached transcription window."""
@@ -1141,6 +1247,9 @@ class MainWindow(QMainWindow):
             self._detached_window.close()
             self._detached_window = None
             self._detached_display = None
+            self._detached_scroll_area = None
+            self._detached_container = None
+            self._detached_layout = None
 
     def _update_ui_state(self):
         """Update UI based on current session state."""
