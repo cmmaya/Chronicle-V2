@@ -14,6 +14,7 @@ from .session_manager import SessionManager
 from ..summarization import SummaryGenerator
 from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
 from ..assistant.service import AssistantAnswerService
+from ..screenshots.context_generator import ScreenshotContextGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -725,10 +726,89 @@ class MainWindow(QMainWindow):
             scroll_area.setWidget(grid_widget)
             layout.addWidget(scroll_area)
             
+            # Context generation section
+            context_label = QLabel("Screenshot Context:")
+            context_label.setFont(header_font)
+            layout.addWidget(context_label)
+            
+            # Text area for context display
+            context_text = QTextEdit()
+            context_text.setReadOnly(True)
+            context_text.setPlaceholderText("Click 'Give Context' to generate AI context for screenshots...")
+            context_text.setMaximumHeight(100)
+            layout.addWidget(context_text)
+            
+            # Buttons
+            button_layout = QHBoxLayout()
+            
+            # Give Context button - enabled only if there are screenshots
+            give_context_button = QPushButton("Give Context")
+            give_context_button.setEnabled(True)
+            
             # Close button
             close_button = QPushButton("Close")
             close_button.clicked.connect(dialog.close)
-            layout.addWidget(close_button)
+            
+            button_layout.addWidget(give_context_button)
+            button_layout.addStretch()
+            button_layout.addWidget(close_button)
+            
+            layout.addLayout(button_layout)
+            
+            # Store references for the callback
+            def on_give_context():
+                """Generate context for screenshots."""
+                give_context_button.setEnabled(False)
+                give_context_button.setText("Generating...")
+                context_text.setPlainText("Generating context...")
+                QApplication.processEvents()
+                
+                try:
+                    # Create context generator
+                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
+                    
+                    # Build session metadata
+                    session = self.session_manager.db.get_session(session_id)
+                    session_metadata = f"Session: {session_name}"
+                    if session:
+                        created_at = session.get('created_at', '')
+                        if created_at:
+                            session_metadata += f" | Date: {created_at}"
+                    
+                    # Generate context for each screenshot
+                    all_contexts = []
+                    for screenshot in screenshots:
+                        filepath = screenshot.get('filepath', '')
+                        if filepath:
+                            try:
+                                context = context_gen.generate_context(
+                                    screenshot_path=filepath,
+                                    session_metadata=session_metadata,
+                                    store=True
+                                )
+                                all_contexts.append(context)
+                            except Exception as e:
+                                logger.warning(f"Failed to generate context for {filepath}: {e}")
+                                all_contexts.append(f"[Error: {str(e)}]")
+                    
+                    # Display all contexts
+                    if all_contexts:
+                        context_text.setPlainText("\n\n---\n\n".join(all_contexts))
+                        self._on_status_update(f"Generated context for {len(all_contexts)} screenshot(s)")
+                    else:
+                        context_text.setPlainText("No context could be generated.")
+                        
+                except Exception as e:
+                    logger.error(f"Failed to generate screenshot context: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    context_text.setPlainText(f"Error generating context: {str(e)}")
+                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
+                finally:
+                    give_context_button.setEnabled(True)
+                    give_context_button.setText("Give Context")
+            
+            give_context_button.clicked.connect(on_give_context)
             
             dialog.exec()
             

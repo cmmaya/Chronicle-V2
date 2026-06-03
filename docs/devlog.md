@@ -1436,3 +1436,78 @@ Validation:
 Next:
 - Ready for BU057
 
+---
+
+## BU057 - Screenshot AI Context Field
+
+Summary:
+Added storage support for AI-generated screenshot context. Added a new `context` column to the screenshots table via migration (idempotent), and added methods to update and retrieve screenshot context.
+
+Files Changed:
+- src/storage/database.py
+
+Important Decisions:
+- Added `context` column to screenshots table with migration (uses CREATE TABLE IF NOT EXISTS + ALTER TABLE with try/except for idempotency)
+- Separated from existing `description` column which serves a different purpose (user-provided descriptions)
+- Added `update_screenshot_context(screenshot_id, context)` method to update context by screenshot ID
+- Added `get_screenshot(screenshot_id)` method to retrieve a specific screenshot by ID (includes context)
+- Existing `get_screenshots(session_id)` continues to work unchanged (returns all screenshot fields including context)
+
+Definition of Done Satisfied:
+- [x] Screenshot context can be persisted
+- [x] Existing screenshot listing still works
+- [x] Migration is idempotent
+- [x] No AI dependency introduced
+
+Next:
+- Ready for BU058
+
+---
+
+## BU058 - Screenshot Context Generator
+
+**Date:** 2026-06-03
+
+**Goal:** Generate concise AI context for one screenshot and store it.
+
+**Context:** This BU adds the backend action behind the screenshot-context button without changing gallery layout.
+
+**Implemented:**
+- Created `src/screenshots/context_generator.py` with:
+  - `ScreenshotContextGenerator` service class
+  - `ScreenshotContextGeneratorError` base exception
+  - `ModelDoesNotSupportImagesError` exception for clear error messages
+  - `generate_context(screenshot_path, session_metadata, transcript_excerpt, store)` - main public method
+  - Vision model detection via `_model_supports_vision()` with known models and pattern matching
+  - Image encoding to base64 data URI
+  - Context storage via database
+
+- Added `get_screenshot_by_filepath(filepath)` method to `src/storage/database.py` to retrieve screenshots by path
+
+**Validation:**
+- Syntax verified (no compile errors)
+- Uses existing OpenRouter client from BU054
+- Uses existing database method from BU057
+- Vision model check returns clear error if model doesn't support images
+- No external screenshot sync (uses local API only)
+
+**Definition of Done Satisfied:**
+- [x] Generator has a minimal public method
+- [x] Generated context is saved locally
+- [x] Unsupported AI-image capability fails clearly
+- [x] No screenshot data is synced externally
+
+**Allowed Files:**
+- src/screenshots/context_generator.py
+- docs/current_state.md
+- docs/devlog.md
+
+**Out of Scope:**
+- Gallery UI
+- Bulk context generation
+- OCR pipeline
+- Uploading screenshots to Notion
+
+**Next:**
+- Ready for BU059 - Screenshot Context UI Button
+

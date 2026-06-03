@@ -91,6 +91,13 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # La columna ya existe
 
+            # Migración: agregar columna context para contexto de IA si no existe
+            try:
+                cursor.execute("ALTER TABLE screenshots ADD COLUMN context TEXT")
+                self.connection.commit()
+            except sqlite3.OperationalError:
+                pass  # La columna ya existe
+
             # Assistant conversations and messages tables
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS assistant_conversations (
@@ -210,6 +217,68 @@ class Database:
             self.connection.commit()
         except sqlite3.Error as e:
             raise DatabaseError(f'Screenshot description update failed: {str(e)}')
+
+    def update_screenshot_context(self, screenshot_id: int, context: str) -> None:
+        """Update the AI-generated context of a screenshot.
+
+        Args:
+            screenshot_id: ID of the screenshot
+            context: New AI-generated context text
+
+        Raises:
+            DatabaseError: If update fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'UPDATE screenshots SET context = ? WHERE id = ?',
+                (context, screenshot_id)
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot context update failed: {str(e)}')
+
+    def get_screenshot(self, screenshot_id: int) -> Dict[str, Any]:
+        """Get a specific screenshot by ID.
+
+        Args:
+            screenshot_id: ID of the screenshot
+
+        Returns:
+            Screenshot dictionary
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('SELECT * FROM screenshots WHERE id = ?', (screenshot_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise DatabaseError(f'Screenshot {screenshot_id} not found')
+            return dict(row)
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot retrieval failed: {str(e)}')
+
+    def get_screenshot_by_filepath(self, filepath: str) -> Optional[Dict[str, Any]]:
+        """Get a screenshot by its file path.
+
+        Args:
+            filepath: Path to the screenshot file
+
+        Returns:
+            Screenshot dictionary or None if not found
+
+        Raises:
+            DatabaseError: If retrieval fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('SELECT * FROM screenshots WHERE filepath = ?', (filepath,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot retrieval failed: {str(e)}')
 
 
     def add_transcript(self, session_id: int, timestamp: datetime, text: str, source: str) -> int:

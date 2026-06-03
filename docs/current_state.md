@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU056
-- Next BU: BU057
+- Current BU: BU058
+- Next BU: BU059
 
 ## Target Architecture
 
@@ -71,6 +71,9 @@ BU052 - Auto Summary Toggle Button
 BU053 - Auto Summary On Stop
 BU054 - Assistant Model Setting
 BU055 - Model Selector UI
+BU056 - 
+BU057 - Screenshot AI Context Field
+BU058 - Screenshot Context Generator
 
 ## In Progress BUs
 None
