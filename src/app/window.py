@@ -282,23 +282,13 @@ class MainWindow(QMainWindow):
             self._answer_layout.setContentsMargins(5, 5, 5, 5)
             self._answer_layout.addStretch()
             
-            # Display messages in the scroll area
+            # Display messages in the conversation view using the same method as new messages
             for msg in messages:
                 role = msg.get('role', 'unknown')
                 content = msg.get('content', '')
                 
-                # Create a label for this message
-                msg_label = QLabel(f"{role}: {content}")
-                msg_label.setWordWrap(True)
-                msg_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                
-                # Style based on role
-                if role == 'user':
-                    msg_label.setStyleSheet("background-color: #e3f2fd; padding: 5px; border-radius: 3px;")
-                else:
-                    msg_label.setStyleSheet("background-color: #f1f8e9; padding: 5px; border-radius: 3px;")
-                
-                self._answer_layout.insertWidget(self._answer_layout.count() - 1, msg_label)
+                # Use the same method as new messages to ensure proper formatting
+                self._add_message_to_conversation(role, content)
             
             # Update the scroll area
             self._answer_scroll_area.setWidget(self._answer_container)
@@ -3208,6 +3198,12 @@ Keywords: {keywords_str}"""
                 self.scope_combo.itemText(i),
                 self.scope_combo.itemData(i)
             )
+        # Preserve the current selection from main window
+        self._detached_scope_combo.setCurrentIndex(self.scope_combo.currentIndex())
+        # Sync scope changes back to main window
+        self._detached_scope_combo.currentIndexChanged.connect(
+            lambda idx: self.scope_combo.setCurrentIndex(idx)
+        )
         agent_layout.addWidget(self._detached_scope_combo)
         
         agent_layout.addStretch()
