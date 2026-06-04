@@ -114,27 +114,112 @@ class ScreenshotContextGenerator:
         
         return f"data:{mime_type};base64,{image_data}"
     
-    def _build_prompt(self, session_metadata: Optional[str] = None, 
+    def _build_prompt(self, summary: Optional[str] = None, 
                       transcript_excerpt: Optional[str] = None) -> str:
         """Build the prompt for context generation.
         
         Args:
-            session_metadata: Optional session metadata (e.g., session name, date).
-            transcript_excerpt: Optional transcript excerpt near the screenshot.
+            summary: Session summary.
+            transcript_excerpt: Transcript excerpt from around the screenshot time.
             
         Returns:
             Formatted prompt string.
         """
-        prompt = "Describe this screenshot concisely in 1-3 sentences. "
-        prompt += "Focus on the main content, UI elements, and any text visible."
+        prompt = """You are analyzing a screenshot captured during a recorded session.
+
+You will receive:
+
+- A screenshot image.
+- A session summary.
+- A transcript excerpt from approximately 40 seconds around the screenshot timestamp.
+
+Your task is to create concise contextual metadata that will help future AI systems understand why this screenshot matters and retrieve it when answering questions about the session.
+
+Instructions:
+
+- Use the transcript as the primary source of truth.
+- Use the session summary for broader context.
+- Use the image to identify important visual information.
+- Extract only meaningful visible text.
+- Focus on what was happening at the moment the screenshot was taken.
+- Do not speculate or invent details.
+- Keep the summary concise but information-dense.
+- Return ONLY valid JSON.
+- Do not include markdown or code fences.
+
+Return exactly this schema:
+
+{
+  "summary": "",
+  "visible_text": [],
+  "keywords": []
+}
+
+Field requirements:
+
+summary:
+A concise paragraph (50-150 words) describing:
+- What is visible on screen.
+- What was being discussed.
+- Why the screenshot is relevant to the conversation.
+- The most important entities, topics, or actions occurring at that moment.
+
+visible_text:
+Important text visible in the screenshot that may help future retrieval. Exclude insignificant UI elements.
+
+keywords:
+5-15 keywords or short phrases useful for semantic search. Include people, products, projects, topics, technologies, websites, documents, and concepts when relevant.
+
+The JSON must always be valid and all fields must always be present."""
         
-        if session_metadata:
-            prompt += f"\n\nSession context: {session_metadata}"
+        if summary:
+            prompt += f"\n\nSESSION SUMMARY:\n{summary}"
         
         if transcript_excerpt:
-            prompt += f"\n\nNearby transcript: {transcript_excerpt}"
+            prompt += f"\n\nTRANSCRIPT EXCERPT:\n{transcript_excerpt}"
         
         return prompt
+    
+    def _parse_response(self, response: str) -> dict:
+        """Parse the JSON response from the model.
+        
+        Args:
+            response: The raw response string from the model.
+            
+        Returns:
+            Dictionary with the parsed fields.
+        """
+        import json
+        import re
+        
+        # Try to extract JSON from the response
+        json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        # Try to find JSON array or object in the response
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                result = json.loads(json_match.group())
+                # Ensure all required fields exist
+                return {
+                    "summary": result.get("summary", ""),
+                    "visible_text": result.get("visible_text", []),
+                    "keywords": result.get("keywords", [])
+                }
+            except json.JSONDecodeError:
+                pass
+        
+        # If JSON parsing fails, create a simple response
+        return {
+            "summary": response[:500] if response else "",
+            "visible_text": [],
+            "keywords": []
+        }
     
     # Default vision model - hardcoded for screenshot context generation
     DEFAULT_VISION_MODEL = "qwen/qwen3.5-flash-02-23"
@@ -143,20 +228,21 @@ class ScreenshotContextGenerator:
     def generate_context(
         self,
         screenshot_path: str,
-        session_metadata: Optional[str] = None,
+        summary: Optional[str] = None,
         transcript_excerpt: Optional[str] = None,
         store: bool = True
-    ) -> str:
+    ) -> dict:
         """Generate AI context for a screenshot.
         
         Args:
             screenshot_path: Path to the screenshot image file.
-            session_metadata: Optional session metadata (e.g., session name).
-            transcript_excerpt: Optional transcript excerpt near the screenshot.
-            store: If True, store the generated context in the database.
+            summary: Meeting summary.
+            transcript_excerpt: Transcript excerpt from around the screenshot time.
+            store: If True, store the context in the database.
             
         Returns:
-            The generated context string.
+            Dictionary with fields: image_description, discussion_context, 
+            relationship_to_conversation, key_entities, confidence
             
         Raises:
             ModelDoesNotSupportImagesError: If no vision-capable model is available.
@@ -169,7 +255,7 @@ class ScreenshotContextGenerator:
         try:
             # Try primary model
             context = self._generate_with_model(
-                screenshot_path, session_metadata, transcript_excerpt, store, model_id
+                screenshot_path, summary, transcript_excerpt, store, model_id
             )
             return context
         except Exception as primary_error:
@@ -177,7 +263,7 @@ class ScreenshotContextGenerator:
             try:
                 model_id = self.FALLBACK_VISION_MODEL
                 context = self._generate_with_model(
-                    screenshot_path, session_metadata, transcript_excerpt, store, model_id
+                    screenshot_path, summary, transcript_excerpt, store, model_id
                 )
                 return context
             except Exception:
@@ -187,18 +273,18 @@ class ScreenshotContextGenerator:
     def _generate_with_model(
         self,
         screenshot_path: str,
-        session_metadata: Optional[str],
+        summary: Optional[str],
         transcript_excerpt: Optional[str],
         store: bool,
         model_id: str
-    ) -> str:
+    ) -> dict:
         """Generate context using a specific model."""
         try:
             # Encode the image
             image_data = self._encode_image(screenshot_path)
             
             # Build the prompt
-            prompt = self._build_prompt(session_metadata, transcript_excerpt)
+            prompt = self._build_prompt(summary, transcript_excerpt)
             
             # Create messages with image
             messages = [
@@ -215,7 +301,10 @@ class ScreenshotContextGenerator:
             from ..assistant.openrouter_client import OpenRouterClient
             
             client = OpenRouterClient(model=model_id)
-            context = client.chat(messages=messages)
+            response = client.chat(messages=messages)
+            
+            # Parse the JSON response
+            context = self._parse_response(response)
             
             # Store in database if requested and we have a screenshot ID
             if store:
@@ -235,12 +324,12 @@ class ScreenshotContextGenerator:
             logger.error(f"Failed to generate screenshot context: {e}")
             raise ScreenshotContextGeneratorError(f"Failed to generate context: {e}")
     
-    def _store_context(self, screenshot_path: str, context: str) -> None:
+    def _store_context(self, screenshot_path: str, context: dict) -> None:
         """Store the generated context in the database.
         
         Args:
             screenshot_path: Path to the screenshot.
-            context: The generated context string.
+            context: Dictionary with fields: summary, visible_text, keywords
         """
         try:
             # Find the screenshot by path
@@ -248,8 +337,19 @@ class ScreenshotContextGenerator:
             
             if screenshot:
                 screenshot_id = screenshot["id"]
-                self.database.update_screenshot_context(screenshot_id, context)
-                logger.info(f"Stored context for screenshot {screenshot_id}")
+                
+                # Store the structured fields
+                import json
+                visible_text_json = json.dumps(context.get('visible_text', []))
+                keywords_json = json.dumps(context.get('keywords', []))
+                
+                self.database.update_screenshot_ai_context(
+                    screenshot_id,
+                    context.get('summary', ''),
+                    visible_text_json,
+                    keywords_json
+                )
+                logger.info(f"Stored AI context for screenshot {screenshot_id}")
             else:
                 logger.warning(f"Screenshot not found in database: {screenshot_path}")
         except Exception as e:

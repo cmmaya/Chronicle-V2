@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+import os
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -16,6 +17,7 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         try:
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            
             self.connection = sqlite3.connect(self.db_path)
             self.connection.row_factory = sqlite3.Row
             self._initialize_schema()
@@ -27,6 +29,25 @@ class Database:
         if self.connection:
             self.connection.close()
             self.connection = None
+
+    def recreate_database(self) -> None:
+        """Delete and recreate the database from scratch.
+        
+        WARNING: This will delete ALL data. Use reset_database() to keep
+        schema but delete data, or this method to start completely fresh.
+        
+        Raises:
+            DatabaseError: If recreation fails
+        """
+        # Close existing connection if any
+        self.disconnect()
+        
+        # Delete existing database file
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        
+        # Reconnect (which will create fresh schema)
+        self.connect()
 
     def _initialize_schema(self):
         try:
@@ -91,9 +112,21 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # La columna ya existe
 
-            # Migración: agregar columna context para contexto de IA si no existe
+            # Migración: agregar columnas para contexto estructurado de screenshots (nuevo formato)
             try:
-                cursor.execute("ALTER TABLE screenshots ADD COLUMN context TEXT")
+                cursor.execute("ALTER TABLE screenshots ADD COLUMN ai_summary TEXT")
+                self.connection.commit()
+            except sqlite3.OperationalError:
+                pass  # La columna ya existe
+            
+            try:
+                cursor.execute("ALTER TABLE screenshots ADD COLUMN visible_text TEXT")
+                self.connection.commit()
+            except sqlite3.OperationalError:
+                pass  # La columna ya existe
+            
+            try:
+                cursor.execute("ALTER TABLE screenshots ADD COLUMN keywords TEXT")
                 self.connection.commit()
             except sqlite3.OperationalError:
                 pass  # La columna ya existe
@@ -218,25 +251,41 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Screenshot description update failed: {str(e)}')
 
-    def update_screenshot_context(self, screenshot_id: int, context: str) -> None:
-        """Update the AI-generated context of a screenshot.
+    def update_screenshot_ai_context(
+        self,
+        screenshot_id: int,
+        ai_summary: str,
+        visible_text: str,
+        keywords: str
+    ) -> None:
+        """Update the AI context fields of a screenshot.
 
         Args:
             screenshot_id: ID of the screenshot
-            context: New AI-generated context text
+            ai_summary: Concise summary of the screenshot context
+            visible_text: JSON array of important visible text
+            keywords: JSON array of keywords for semantic search
 
         Raises:
             DatabaseError: If update fails
         """
         try:
             cursor = self.connection.cursor()
-            cursor.execute(
-                'UPDATE screenshots SET context = ? WHERE id = ?',
-                (context, screenshot_id)
-            )
+            cursor.execute('''
+                UPDATE screenshots SET 
+                    ai_summary = ?,
+                    visible_text = ?,
+                    keywords = ?
+                WHERE id = ?
+            ''', (
+                ai_summary,
+                visible_text,
+                keywords,
+                screenshot_id
+            ))
             self.connection.commit()
         except sqlite3.Error as e:
-            raise DatabaseError(f'Screenshot context update failed: {str(e)}')
+            raise DatabaseError(f'Screenshot AI context update failed: {str(e)}')
 
     def get_screenshot(self, screenshot_id: int) -> Dict[str, Any]:
         """Get a specific screenshot by ID.

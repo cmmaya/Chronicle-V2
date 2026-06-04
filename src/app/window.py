@@ -740,10 +740,42 @@ class MainWindow(QMainWindow):
             summaries = self.session_manager.db.get_summaries(session_id)
             has_summary = summaries and len(summaries) > 0
             
+            # Load existing context from database if any screenshot has it
+            existing_context_parts = []
+            for screenshot in screenshots:
+                ai_summary = screenshot.get('ai_summary', '')
+                visible_text = screenshot.get('visible_text', '')
+                keywords = screenshot.get('keywords', '')
+                
+                if ai_summary:  # If there's existing context
+                    import json
+                    try:
+                        visible_text_list = json.loads(visible_text) if visible_text else []
+                    except:
+                        visible_text_list = []
+                    
+                    try:
+                        keywords_list = json.loads(keywords) if keywords else []
+                    except:
+                        keywords_list = []
+                    
+                    visible_text_str = ", ".join(visible_text_list) if visible_text_list else "None"
+                    keywords_str = ", ".join(keywords_list) if keywords_list else "None"
+                    
+                    existing_context_parts.append(f"""Screenshot: {screenshot.get('filepath', '')}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}""")
+            
             if has_summary:
                 context_text.setPlaceholderText("Click 'Give Context' to generate AI context for screenshots...")
             else:
                 context_text.setPlaceholderText("Generate a summary first before generating screenshot context.")
+            
+            # If there's existing context, display it
+            if existing_context_parts:
+                context_text.setPlainText("\n\n".join(existing_context_parts))
+            
             layout.addWidget(context_text)
             
             # Buttons
@@ -778,26 +810,17 @@ class MainWindow(QMainWindow):
                     # Create context generator
                     context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
                     
-                    # Get session metadata including summary
-                    session = self.session_manager.db.get_session(session_id)
-                    session_metadata = f"Session: {session_name}"
-                    if session:
-                        created_at = session.get('created_at', '')
-                        if created_at:
-                            session_metadata += f" | Date: {created_at}"
-                    
-                    # Add summary to metadata if available
+                    # Get summary for context generation
+                    summary_content = ""
                     if has_summary:
                         summary = summaries[0]
                         summary_content = summary.get('content', '')
-                        if summary_content:
-                            session_metadata += f"\n\nSummary:\n{summary_content[:500]}"
                     
                     # Get all transcripts for finding nearest ones
                     all_transcripts = self.session_manager.db.get_transcripts(session_id)
                     
                     # Generate context for each screenshot
-                    all_contexts = []
+                    context_display_parts = []
                     for screenshot in screenshots:
                         filepath = screenshot.get('filepath', '')
                         screenshot_timestamp = screenshot.get('timestamp', 0)
@@ -819,19 +842,42 @@ class MainWindow(QMainWindow):
                             try:
                                 context = context_gen.generate_context(
                                     screenshot_path=filepath,
-                                    session_metadata=session_metadata,
+                                    summary=summary_content if summary_content else None,
                                     transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
                                     store=True
                                 )
-                                all_contexts.append(context)
+                                
+                                # Format the context for display
+                                ai_summary = context.get('summary', 'N/A')
+                                visible_text = context.get('visible_text', [])
+                                keywords = context.get('keywords', [])
+                                
+                                # Format visible text as string
+                                if isinstance(visible_text, list):
+                                    visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                                else:
+                                    visible_text_str = str(visible_text) if visible_text else "None"
+                                
+                                # Format keywords as string
+                                if isinstance(keywords, list):
+                                    keywords_str = ", ".join(keywords) if keywords else "None"
+                                else:
+                                    keywords_str = str(keywords) if keywords else "None"
+                                
+                                screenshot_entry = f"""Screenshot: {filepath}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}"""
+                                
+                                context_display_parts.append(screenshot_entry)
                             except Exception as e:
                                 logger.warning(f"Failed to generate context for {filepath}: {e}")
-                                all_contexts.append(f"[Error: {str(e)}]")
+                                context_display_parts.append(f"[Error for {filepath}: {str(e)}]")
                     
                     # Display all contexts
-                    if all_contexts:
-                        context_text.setPlainText("\n\n---\n\n".join(all_contexts))
-                        self._on_status_update(f"Generated context for {len(all_contexts)} screenshot(s)")
+                    if context_display_parts:
+                        context_text.setPlainText("\n\n".join(context_display_parts))
+                        self._on_status_update(f"Generated context for {len(context_display_parts)} screenshot(s)")
                     else:
                         context_text.setPlainText("No context could be generated.")
                         
