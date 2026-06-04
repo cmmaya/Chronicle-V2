@@ -1511,3 +1511,140 @@ Next:
 **Next:**
 - Ready for BU059 - Screenshot Context UI Button
 
+---
+
+## BU059 - Screenshot Context UI Button (Fix - Selection Support)
+
+**Date:** 2026-06-04
+
+**Summary:**
+Fixed the screenshot context UI to support selecting individual screenshots. Previously, clicking "Give Context" would generate context for all screenshots at once. Now users can:
+
+1. Click on any screenshot in the gallery to select it
+2. See the context for the selected screenshot displayed in the context panel
+3. Use "Give Context to Selected" to generate context for just the selected screenshot
+4. Use "Give Context to All" to generate context for all screenshots
+
+**Files Changed:**
+- src/app/window.py
+
+**Implementation Details:**
+- Added selection highlighting (blue border) when clicking on a screenshot
+- Created `get_context_for_screenshot()` function to retrieve formatted context for a specific screenshot
+- Created `update_selection()` function to handle visual selection state
+- Replaced single "Give Context" button with two buttons:
+  - "Give Context to Selected" - enabled when a screenshot is selected and summary exists
+  - "Give Context to All" - enabled when screenshots and summary exist
+- Updated placeholder text to reflect new workflow
+- Double-click still opens fullscreen view
+
+**Important Decisions:**
+- Selected screenshot context is displayed automatically when selection changes
+- "Give Context to Selected" button is enabled when user clicks on a screenshot
+- Both buttons work with or without existing context (can regenerate)
+
+**Next:**
+- Ready for BU060
+
+---
+
+## BU060 - Pause Resume Session Lifecycle
+
+**Date:** 2026-06-04
+
+**Summary:**
+Implemented pause/resume behavior in session lifecycle without changing UI. The Session class already had pause() and resume() methods that update status, but SessionManager didn't expose them. Added pause_session() and resume_session() methods to SessionManager that coordinate audio recording suspension/resumption while keeping all data associated with the same session_id.
+
+**Files Changed:**
+- src/app/session_manager.py
+
+**Implementation Details:**
+- Added `pause_session()` method:
+  - Checks for active session
+  - Stops audio recording (suspends capture)
+  - Updates session status to 'paused' via Session.pause()
+  - Returns boolean for success/failure
+  
+- Added `resume_session()` method:
+  - Checks for paused session
+  - Updates session status to 'active' via Session.resume()
+  - Restarts audio recording into the same session folder
+  - Returns boolean for success/failure
+
+**Important Decisions:**
+- Preserved existing Session.pause()/resume() which handle database status updates
+- Audio recording stops on pause and restarts on resume - no new audio chunks created during pause
+- All data (transcripts, screenshots) continues to associate with same session_id
+
+**Next:**
+- Ready for BU061 - Pause Button UI
+
+---
+
+## BU061 - Pause Button UI
+
+**Date:** 2026-06-04
+
+**Summary:**
+Added pause/resume button to the active session controls in the UI. The button is enabled only while a session is active or paused, and toggles between "Pause Session" and "Resume Session" states.
+
+**Files Changed:**
+- src/app/window.py
+
+**Implementation Details:**
+- Added Session import to window.py
+- Created pause_button with "Pause Session" text, placed between stop and screenshot buttons
+- Added _on_pause_resume_session() handler that:
+  - Calls pause_session() when session is active, updates button to "Resume Session"
+  - Calls resume_session() when session is paused, updates button to "Pause Session"
+- Updated _update_ui_state() to handle pause button state:
+  - STATUS_ACTIVE: button enabled with "Pause Session" text
+  - STATUS_PAUSED: button enabled with "Resume Session" text
+  - STATUS_PROCESSING: button disabled
+  - Otherwise: button disabled
+- Also fixed _update_ui_state() to use Session.STATUS_* constants instead of string literals
+
+**Important Decisions:**
+- Pause button placed between Stop and Screenshot buttons for logical flow
+- Button text changes to indicate the action that will happen on next click
+- Screenshots remain enabled during pause (pause only affects audio recording)
+
+**Next:**
+- Ready for BU062
+
+---
+
+## BU062 - Home Layout Shell
+
+**Date:** 2026-06-04
+
+**Summary:**
+Refactored the home UI into a three-panel layout with left session history, center current chat/session area, and right live transcription panel.
+
+**Files Changed:**
+- src/app/window.py
+
+**Implementation Details:**
+- Created three-column layout using QHBoxLayout:
+  - Left panel: Session History (Past Sessions table)
+  - Center panel: Current session/chat area (title, session controls, assistant panel)
+  - Right panel: Live Transcriptions (unchanged behavior)
+- Changed group box title from "Past Sessions" to "Session History" for the left panel
+- Center panel gets stretch factor 2 for wider display
+- All existing controls remain functional and usable
+- Live transcription remains available during active sessions
+
+**Important Decisions:**
+- Preserved all existing functionality - only repositioned widgets
+- Center panel is wider (stretch factor 2) to accommodate session controls and assistant
+- Left panel (session history) and right panel (live transcriptions) have equal width (stretch factor 1)
+
+**Definition of Done Satisfied:**
+- [x] Left session history area exists
+- [x] Center chat/current session area exists
+- [x] Existing controls remain usable
+- [x] Live transcription remains available during active sessions
+
+**Next:**
+- Ready for BU063
+

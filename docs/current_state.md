@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU058
-- Next BU: BU059
+- Current BU: BU062
+- Next BU: BU063
 
 ## Target Architecture
 
@@ -74,6 +74,10 @@ BU055 - Model Selector UI
 BU056 - 
 BU057 - Screenshot AI Context Field
 BU058 - Screenshot Context Generator
+BU059 - Screenshot Context UI Button (Fixed - Selection Support)
+BU060 - Pause Resume Session Lifecycle
+BU061 - Pause Button UI
+BU062 - Home Layout Shell
 
 ## In Progress BUs
 None

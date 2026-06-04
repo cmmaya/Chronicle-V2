@@ -11,6 +11,7 @@ from typing import Optional
 import logging
 
 from .session_manager import SessionManager
+from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
 from ..assistant.service import AssistantAnswerService
@@ -690,6 +691,78 @@ class MainWindow(QMainWindow):
             grid_layout = QGridLayout(grid_widget)
             grid_layout.setSpacing(10)
             
+            # Store references to screenshot widgets for selection highlighting
+            screenshot_labels = []
+            time_labels = []
+            selected_screenshot_index = [None]  # Use list to allow mutation in closure
+            
+            def get_context_for_screenshot(idx):
+                """Get formatted context string for a specific screenshot."""
+                if idx is None or idx >= len(screenshots):
+                    return ""
+                screenshot = screenshots[idx]
+                ai_summary = screenshot.get('ai_summary', '')
+                visible_text = screenshot.get('visible_text', '')
+                keywords = screenshot.get('keywords', '')
+                
+                if not ai_summary:
+                    return ""
+                
+                import json
+                try:
+                    visible_text_list = json.loads(visible_text) if visible_text else []
+                except:
+                    visible_text_list = []
+                
+                try:
+                    keywords_list = json.loads(keywords) if keywords else []
+                except:
+                    keywords_list = []
+                
+                visible_text_str = ", ".join(visible_text_list) if visible_text_list else "None"
+                keywords_str = ", ".join(keywords_list) if keywords_list else "None"
+                
+                # Get just the filename for display
+                import os
+                filename = os.path.basename(screenshot.get('filepath', ''))
+                
+                return f"""Screenshot: {filename}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}"""
+            
+            def update_selection(new_index):
+                """Update the selected screenshot and refresh the display."""
+                # Remove highlight from previous selection
+                old_index = selected_screenshot_index[0]
+                if old_index is not None and old_index < len(screenshot_labels):
+                    screenshot_labels[old_index].setStyleSheet("")
+                    time_labels[old_index].setStyleSheet("")
+                
+                # Set new selection
+                selected_screenshot_index[0] = new_index
+                
+                if new_index is not None:
+                    # Add highlight to new selection
+                    screenshot_labels[new_index].setStyleSheet("border: 3px solid #0078d4;")
+                    time_labels[new_index].setStyleSheet("border: 3px solid #0078d4; border-top: none;")
+                    
+                    # Show context for selected screenshot
+                    context = get_context_for_screenshot(new_index)
+                    if context:
+                        context_text.setPlainText(context)
+                    else:
+                        context_text.setPlainText("No context available for this screenshot. Click 'Give Context to Selected' to generate it.")
+                else:
+                    context_text.setPlainText("")
+            
+            def on_screenshot_clicked(idx):
+                """Handle screenshot click - select it and show context."""
+                update_selection(idx)
+                # Enable the "Give Context to Selected" button when a screenshot is selected
+                if has_summary and idx is not None:
+                    give_context_selected_button.setEnabled(True)
+            
             # Add screenshots to the grid
             from datetime import datetime
             for idx, screenshot in enumerate(screenshots):
@@ -699,6 +772,12 @@ class MainWindow(QMainWindow):
                 # Convert timestamp to readable format
                 dt = datetime.fromtimestamp(timestamp)
                 time_str = dt.strftime('%H:%M:%S')
+                
+                # Create container widget for screenshot and timestamp
+                container = QWidget()
+                container_layout = QVBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(2)
                 
                 # Create label with image
                 image_label = QLabel()
@@ -713,18 +792,40 @@ class MainWindow(QMainWindow):
                 
                 image_label.setAlignment(Qt.AlignCenter)
                 image_label.setCursor(Qt.PointingHandCursor)
-                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp: self._show_full_image(fp, ts)
+                
+                # Store reference for selection highlighting
+                screenshot_labels.append(image_label)
+                
+                # Click to select (not fullscreen)
+                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp, i=idx: (
+                    event.accept(),
+                    on_screenshot_clicked(i)
+                )
+                
+                # Double-click for fullscreen
+                image_label.mouseDoubleClickEvent = lambda event, fp=filepath, ts=timestamp: (
+                    event.accept(),
+                    self._show_full_image(fp, ts)
+                )
                 
                 # Timestamp label
                 time_label = QLabel(f"Captured at: {time_str}")
                 time_label.setAlignment(Qt.AlignCenter)
+                time_labels.append(time_label)
+                
+                container_layout.addWidget(image_label)
+                container_layout.addWidget(time_label)
                 
                 # Add to grid (2 columns)
-                grid_layout.addWidget(image_label, idx // 2 * 2, idx % 2)
-                grid_layout.addWidget(time_label, idx // 2 * 2 + 1, idx % 2)
+                grid_layout.addWidget(container, idx // 2, idx % 2)
             
             scroll_area.setWidget(grid_widget)
             layout.addWidget(scroll_area)
+            
+            # Selection hint
+            selection_hint = QLabel("Click on a screenshot to select it and view its context")
+            selection_hint.setStyleSheet("color: gray; font-style: italic;")
+            layout.addWidget(selection_hint)
             
             # Context generation section
             context_label = QLabel("Screenshot Context:")
@@ -740,70 +841,141 @@ class MainWindow(QMainWindow):
             summaries = self.session_manager.db.get_summaries(session_id)
             has_summary = summaries and len(summaries) > 0
             
-            # Load existing context from database if any screenshot has it
-            existing_context_parts = []
-            for screenshot in screenshots:
-                ai_summary = screenshot.get('ai_summary', '')
-                visible_text = screenshot.get('visible_text', '')
-                keywords = screenshot.get('keywords', '')
-                
-                if ai_summary:  # If there's existing context
-                    import json
-                    try:
-                        visible_text_list = json.loads(visible_text) if visible_text else []
-                    except:
-                        visible_text_list = []
-                    
-                    try:
-                        keywords_list = json.loads(keywords) if keywords else []
-                    except:
-                        keywords_list = []
-                    
-                    visible_text_str = ", ".join(visible_text_list) if visible_text_list else "None"
-                    keywords_str = ", ".join(keywords_list) if keywords_list else "None"
-                    
-                    existing_context_parts.append(f"""Screenshot: {screenshot.get('filepath', '')}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}""")
-            
+            # Initial message based on summary availability
             if has_summary:
-                context_text.setPlaceholderText("Click 'Give Context' to generate AI context for screenshots...")
+                context_text.setPlaceholderText("Select a screenshot and click 'Give Context to Selected' to generate context, or 'Give Context to All' for all screenshots...")
             else:
                 context_text.setPlaceholderText("Generate a summary first before generating screenshot context.")
-            
-            # If there's existing context, display it
-            if existing_context_parts:
-                context_text.setPlainText("\n\n".join(existing_context_parts))
             
             layout.addWidget(context_text)
             
             # Buttons
             button_layout = QHBoxLayout()
             
-            # Give Context button - enabled only if there are screenshots AND summary exists
-            give_context_button = QPushButton("Give Context")
-            give_context_button.setEnabled(has_summary and len(screenshots) > 0)
+            # Give Context to Selected button - requires a screenshot to be selected
+            give_context_selected_button = QPushButton("Give Context to Selected")
+            give_context_selected_button.setEnabled(False)  # Disabled until a screenshot is selected
             
             if not has_summary:
-                give_context_button.setToolTip("Generate a summary first before generating screenshot context")
+                give_context_selected_button.setToolTip("Generate a summary first before generating screenshot context")
+            else:
+                give_context_selected_button.setToolTip("Generate context for the currently selected screenshot")
+            
+            # Give Context to All button - generates context for all screenshots
+            give_context_all_button = QPushButton("Give Context to All")
+            give_context_all_button.setEnabled(has_summary and len(screenshots) > 0)
+            
+            if not has_summary:
+                give_context_all_button.setToolTip("Generate a summary first before generating screenshot context")
             
             # Close button
             close_button = QPushButton("Close")
             close_button.clicked.connect(dialog.close)
             
-            button_layout.addWidget(give_context_button)
+            button_layout.addWidget(give_context_selected_button)
+            button_layout.addWidget(give_context_all_button)
             button_layout.addStretch()
             button_layout.addWidget(close_button)
             
             layout.addLayout(button_layout)
             
-            # Store references for the callback
-            def on_give_context():
-                """Generate context for screenshots."""
-                give_context_button.setEnabled(False)
-                give_context_button.setText("Generating...")
-                context_text.setPlainText("Generating context...")
+            # Store references for the callbacks
+            def on_give_context_selected():
+                """Generate context for the selected screenshot."""
+                selected_idx = selected_screenshot_index[0]
+                if selected_idx is None:
+                    QMessageBox.information(self, 'No Selection', 'Please select a screenshot first.')
+                    return
+                
+                give_context_selected_button.setEnabled(False)
+                give_context_selected_button.setText("Generating...")
+                context_text.setPlainText("Generating context for selected screenshot...")
+                QApplication.processEvents()
+                
+                try:
+                    # Create context generator
+                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
+                    
+                    # Get summary for context generation
+                    summary_content = ""
+                    if has_summary:
+                        summary = summaries[0]
+                        summary_content = summary.get('content', '')
+                    
+                    # Get all transcripts for finding nearest ones
+                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
+                    
+                    # Generate context for selected screenshot only
+                    screenshot = screenshots[selected_idx]
+                    filepath = screenshot.get('filepath', '')
+                    screenshot_timestamp = screenshot.get('timestamp', 0)
+                    
+                    if not filepath:
+                        context_text.setPlainText("Invalid screenshot filepath.")
+                        return
+                    
+                    # Find 2 nearest transcripts to this screenshot timestamp
+                    transcript_excerpt = ""
+                    if all_transcripts:
+                        sorted_transcripts = sorted(
+                            all_transcripts,
+                            key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
+                        )
+                        nearest_2 = sorted_transcripts[:2]
+                        transcript_excerpt = " | ".join(
+                            t.get('text', '')[:200] for t in nearest_2 if t.get('text')
+                        )
+                    
+                    context = context_gen.generate_context(
+                        screenshot_path=filepath,
+                        summary=summary_content if summary_content else None,
+                        transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
+                        store=True
+                    )
+                    
+                    # Format the context for display
+                    ai_summary = context.get('summary', 'N/A')
+                    visible_text = context.get('visible_text', [])
+                    keywords = context.get('keywords', [])
+                    
+                    # Format visible text as string
+                    if isinstance(visible_text, list):
+                        visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                    else:
+                        visible_text_str = str(visible_text) if visible_text else "None"
+                    
+                    # Format keywords as string
+                    if isinstance(keywords, list):
+                        keywords_str = ", ".join(keywords) if keywords else "None"
+                    else:
+                        keywords_str = str(keywords) if keywords else "None"
+                    
+                    # Get just the filename for display
+                    import os
+                    filename = os.path.basename(filepath)
+                    
+                    context_text.setPlainText(f"""Screenshot: {filename}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}""")
+                    
+                    self._on_status_update(f"Generated context for selected screenshot")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to generate screenshot context: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    context_text.setPlainText(f"Error generating context: {str(e)}")
+                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
+                finally:
+                    give_context_selected_button.setEnabled(True)
+                    give_context_selected_button.setText("Give Context to Selected")
+            
+            def on_give_context_all():
+                """Generate context for all screenshots."""
+                give_context_all_button.setEnabled(False)
+                give_context_all_button.setText("Generating...")
+                context_text.setPlainText("Generating context for all screenshots...")
                 QApplication.processEvents()
                 
                 try:
@@ -829,7 +1001,6 @@ Keywords: {keywords_str}""")
                             # Find 2 nearest transcripts to this screenshot timestamp
                             transcript_excerpt = ""
                             if all_transcripts:
-                                # Sort by absolute time difference to find nearest
                                 sorted_transcripts = sorted(
                                     all_transcripts,
                                     key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
@@ -864,7 +1035,11 @@ Keywords: {keywords_str}""")
                                 else:
                                     keywords_str = str(keywords) if keywords else "None"
                                 
-                                screenshot_entry = f"""Screenshot: {filepath}
+                                # Get just the filename for display
+                                import os
+                                filename = os.path.basename(filepath)
+                                
+                                screenshot_entry = f"""Screenshot: {filename}
 Summary: {ai_summary}
 Visible Text: {visible_text_str}
 Keywords: {keywords_str}"""
@@ -872,7 +1047,7 @@ Keywords: {keywords_str}"""
                                 context_display_parts.append(screenshot_entry)
                             except Exception as e:
                                 logger.warning(f"Failed to generate context for {filepath}: {e}")
-                                context_display_parts.append(f"[Error for {filepath}: {str(e)}]")
+                                context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
                     
                     # Display all contexts
                     if context_display_parts:
@@ -888,10 +1063,12 @@ Keywords: {keywords_str}"""
                     context_text.setPlainText(f"Error generating context: {str(e)}")
                     QMessageBox.warning(self, 'Context Generation Failed', str(e))
                 finally:
-                    give_context_button.setEnabled(True)
-                    give_context_button.setText("Give Context")
+                    give_context_all_button.setEnabled(True)
+                    give_context_all_button.setText("Give Context to All")
             
-            give_context_button.clicked.connect(on_give_context)
+            # Connect buttons to handlers
+            give_context_selected_button.clicked.connect(on_give_context_selected)
+            give_context_all_button.clicked.connect(on_give_context_all)
             
             dialog.exec()
             
@@ -953,100 +1130,18 @@ Keywords: {keywords_str}"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Main layout - horizontal split
+        # Main layout - three column split: left (history), center (chat/session), right (live transcription)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(20)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         
-        # Left side widget - existing controls
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setSpacing(15)
-        
-        # Title
-        title_label = QLabel('Chronicle')
-        title_label.setAlignment(Qt.AlignCenter)
-        title_font = title_label.font()
-        title_font.setPointSize(24)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        left_layout.addWidget(title_label)
-        
-        # Session name input area
-        session_layout = QHBoxLayout()
-        session_layout.addStretch()
-        self.session_name_label = QLabel('Session Name:')
-        self.session_name_label.setFont(title_font)
-        self.session_name_input = QLabel('New Session')
-        self.session_name_input.setFont(title_font)
-        session_layout.addWidget(self.session_name_label)
-        session_layout.addWidget(self.session_name_input)
-        session_layout.addStretch()
-        left_layout.addLayout(session_layout)
-        
-        # Spacer
-        left_layout.addStretch()
-        
-        # Control buttons
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(20)
-        
-        self.start_button = QPushButton('Start Session')
-        self.start_button.setMinimumSize(150, 50)
-        self.start_button.setFont(title_font)
-        self.start_button.clicked.connect(self._on_start_session)
-        
-        self.stop_button = QPushButton('Stop Session')
-        self.stop_button.setMinimumSize(150, 50)
-        self.stop_button.setFont(title_font)
-        self.stop_button.clicked.connect(self._on_stop_session)
-        self.stop_button.setEnabled(False)
-        
-        self.screenshot_button = QPushButton('Take Screenshot')
-        self.screenshot_button.setMinimumSize(150, 50)
-        self.screenshot_button.setFont(title_font)
-        self.screenshot_button.clicked.connect(self._on_take_screenshot)
-        self.screenshot_button.setEnabled(False)
-        
-        self.view_screenshots_button = QPushButton('View Screenshots')
-        self.view_screenshots_button.setMinimumSize(150, 50)
-        self.view_screenshots_button.setFont(title_font)
-        self.view_screenshots_button.clicked.connect(self._on_view_screenshots)
-        self.view_screenshots_button.setEnabled(False)
-        
-        button_layout.addStretch()
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)
-        button_layout.addWidget(self.screenshot_button)
-        button_layout.addWidget(self.view_screenshots_button)
-        button_layout.addStretch()
-        
-        left_layout.addLayout(button_layout)
-        
-        # Live transcription checkbox
-        self.live_transcription_checkbox = QCheckBox('Enable live transcription')
-        self.live_transcription_checkbox.setChecked(True)
-        left_layout.addWidget(self.live_transcription_checkbox)
-        
-        # Auto summary checkbox
-        self.auto_summary_checkbox = QCheckBox('Auto-generate summary after session stop')
-        self.auto_summary_checkbox.setChecked(SESSION.get('auto_summary_after_stop', False))
-        self.auto_summary_checkbox.toggled.connect(lambda checked: SESSION.__setitem__('auto_summary_after_stop', checked))
-        left_layout.addWidget(self.auto_summary_checkbox)
-        
-        # Spacer
-        left_layout.addStretch()
-        
-        # Status display
-        self.status_label = QLabel('Ready')
-        self.status_label.setAlignment(Qt.AlignCenter)
-        status_font = self.status_label.font()
-        status_font.setPointSize(16)
-        self.status_label.setFont(status_font)
-        left_layout.addWidget(self.status_label)
+        # ========== LEFT PANEL: Session History ==========
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(10)
         
         # Past Sessions list - using table for separate cells
-        sessions_group = QGroupBox('Past Sessions')
+        sessions_group = QGroupBox('Session History')
         sessions_layout = QVBoxLayout()
         self.sessions_list = QTableWidget()
         self.sessions_list.setColumnCount(4)
@@ -1063,6 +1158,100 @@ Keywords: {keywords_str}"""
         sessions_layout.addWidget(self.sessions_list)
         sessions_group.setLayout(sessions_layout)
         left_layout.addWidget(sessions_group)
+        
+        # ========== CENTER PANEL: Current Chat/Current Session Area ==========
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setSpacing(15)
+        
+        # Title
+        title_label = QLabel('Chronicle')
+        title_label.setAlignment(Qt.AlignCenter)
+        title_font = title_label.font()
+        title_font.setPointSize(24)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        center_layout.addWidget(title_label)
+        
+        # Session name input area
+        session_layout = QHBoxLayout()
+        session_layout.addStretch()
+        self.session_name_label = QLabel('Session Name:')
+        self.session_name_label.setFont(title_font)
+        self.session_name_input = QLabel('New Session')
+        self.session_name_input.setFont(title_font)
+        session_layout.addWidget(self.session_name_label)
+        session_layout.addWidget(self.session_name_input)
+        session_layout.addStretch()
+        center_layout.addLayout(session_layout)
+        
+        # Spacer
+        center_layout.addStretch()
+        
+        # Control buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(20)
+        
+        self.start_button = QPushButton('Start Session')
+        self.start_button.setMinimumSize(150, 50)
+        self.start_button.setFont(title_font)
+        self.start_button.clicked.connect(self._on_start_session)
+        
+        self.stop_button = QPushButton('Stop Session')
+        self.stop_button.setMinimumSize(150, 50)
+        self.stop_button.setFont(title_font)
+        self.stop_button.clicked.connect(self._on_stop_session)
+        self.stop_button.setEnabled(False)
+        
+        self.pause_button = QPushButton('Pause Session')
+        self.pause_button.setMinimumSize(150, 50)
+        self.pause_button.setFont(title_font)
+        self.pause_button.clicked.connect(self._on_pause_resume_session)
+        self.pause_button.setEnabled(False)
+        
+        self.screenshot_button = QPushButton('Take Screenshot')
+        self.screenshot_button.setMinimumSize(150, 50)
+        self.screenshot_button.setFont(title_font)
+        self.screenshot_button.clicked.connect(self._on_take_screenshot)
+        self.screenshot_button.setEnabled(False)
+        
+        self.view_screenshots_button = QPushButton('View Screenshots')
+        self.view_screenshots_button.setMinimumSize(150, 50)
+        self.view_screenshots_button.setFont(title_font)
+        self.view_screenshots_button.clicked.connect(self._on_view_screenshots)
+        self.view_screenshots_button.setEnabled(False)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.pause_button)
+        button_layout.addWidget(self.screenshot_button)
+        button_layout.addWidget(self.view_screenshots_button)
+        button_layout.addStretch()
+        
+        center_layout.addLayout(button_layout)
+        
+        # Live transcription checkbox
+        self.live_transcription_checkbox = QCheckBox('Enable live transcription')
+        self.live_transcription_checkbox.setChecked(True)
+        center_layout.addWidget(self.live_transcription_checkbox)
+        
+        # Auto summary checkbox
+        self.auto_summary_checkbox = QCheckBox('Auto-generate summary after session stop')
+        self.auto_summary_checkbox.setChecked(SESSION.get('auto_summary_after_stop', False))
+        self.auto_summary_checkbox.toggled.connect(lambda checked: SESSION.__setitem__('auto_summary_after_stop', checked))
+        center_layout.addWidget(self.auto_summary_checkbox)
+        
+        # Spacer
+        center_layout.addStretch()
+        
+        # Status display
+        self.status_label = QLabel('Ready')
+        self.status_label.setAlignment(Qt.AlignCenter)
+        status_font = self.status_label.font()
+        status_font.setPointSize(16)
+        self.status_label.setFont(status_font)
+        center_layout.addWidget(self.status_label)
         
         # Assistant panel
         assistant_group = QGroupBox('Assistant')
@@ -1166,11 +1355,11 @@ Keywords: {keywords_str}"""
         self._past_conversations_dialog = None
         
         assistant_group.setLayout(assistant_layout)
-        left_layout.addWidget(assistant_group)
+        center_layout.addWidget(assistant_group)
         
-        # Right side widget - placeholder for live transcription
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
+        # ========== RIGHT PANEL: Live Transcriptions (unchanged) ==========
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
         
         # Live transcription display area - using chat-like view
         live_transcription_group = QGroupBox('Live Transcriptions')
@@ -1188,9 +1377,10 @@ Keywords: {keywords_str}"""
         live_transcription_group.setLayout(live_transcription_layout)
         right_layout.addWidget(live_transcription_group)
         
-        # Add both sides to main layout
-        main_layout.addWidget(left_widget, 1)  # Stretch factor 1
-        main_layout.addWidget(right_widget, 1)  # Stretch factor 1
+        # Add all three panels to main layout
+        main_layout.addWidget(left_panel, 1)   # Stretch factor 1
+        main_layout.addWidget(center_panel, 2)  # Stretch factor 2 (wider center)
+        main_layout.addWidget(right_panel, 1)   # Stretch factor 1
     
     def _create_status_bar(self):
         """Create the status bar."""
@@ -1718,21 +1908,34 @@ Keywords: {keywords_str}"""
             
         active_session = self.session_manager.get_active_session()
         
-        if active_session and active_session.status == 'active':
+        if active_session and active_session.status == Session.STATUS_ACTIVE:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
+            self.pause_button.setEnabled(True)
+            self.pause_button.setText('Pause Session')
             self.screenshot_button.setEnabled(True)
             self.view_screenshots_button.setEnabled(True)
             self._is_recording = True
             self.session_name_input.setText(active_session.name)
-        elif active_session and active_session.status == 'processing':
+        elif active_session and active_session.status == Session.STATUS_PAUSED:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.pause_button.setEnabled(True)
+            self.pause_button.setText('Resume Session')
+            self.screenshot_button.setEnabled(True)
+            self.view_screenshots_button.setEnabled(True)
+            self._is_recording = False
+            self.session_name_input.setText(active_session.name)
+        elif active_session and active_session.status == Session.STATUS_PROCESSING:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
             self.screenshot_button.setEnabled(False)
             self.view_screenshots_button.setEnabled(False)
         else:
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
+            self.pause_button.setEnabled(False)
             self.screenshot_button.setEnabled(False)
             # Enable View Screenshots button if there are past sessions
             sessions = self.session_manager.db.list_sessions()
@@ -1783,6 +1986,26 @@ Keywords: {keywords_str}"""
             self._on_status_update(f'Failed to stop session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to stop session: {str(e)}')
             self._update_ui_state()
+    
+    def _on_pause_resume_session(self):
+        """Handle pause/resume button click."""
+        try:
+            active_session = self.session_manager.get_active_session()
+            if not active_session:
+                return
+            
+            if active_session.status == Session.STATUS_ACTIVE:
+                self.session_manager.pause_session()
+                self.pause_button.setText('Resume Session')
+                self._on_status_update(f"Session '{active_session.name}' paused")
+            elif active_session.status == Session.STATUS_PAUSED:
+                self.session_manager.resume_session()
+                self.pause_button.setText('Pause Session')
+                self._on_status_update(f"Session '{active_session.name}' resumed")
+            
+            self._update_ui_state()
+        except Exception as e:
+            self._on_status_update(f'Failed to pause/resume: {str(e)}', is_error=True)
     
     def _on_take_screenshot(self):
         """Handle take screenshot button click."""

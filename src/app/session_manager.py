@@ -289,6 +289,59 @@ class SessionManager:
         self._update_status(f'Started session {session.id}: {session.name}')
         return session
     
+    def pause_session(self) -> bool:
+        """Pause the current session.
+        
+        Pauses audio recording while keeping the session active.
+        All data continues to be associated with the same session_id.
+        
+        Returns:
+            True if paused successfully, False if no active session
+        """
+        if not self.current_session:
+            self._update_status('No active session to pause', is_error=True)
+            return False
+        
+        if self.current_session.status != Session.STATUS_ACTIVE:
+            self._update_status(f'Session is not active (status: {self.current_session.status})', is_error=True)
+            return False
+        
+        # Stop recording (suspends audio capture)
+        if self.current_session.dual_recorder and self.current_session.dual_recorder.is_running:
+            self.stop_recording(label='main')
+        
+        # Update session status to paused
+        self.current_session.pause()
+        
+        self._update_status(f'Session {self.current_session.id} paused')
+        return True
+    
+    def resume_session(self) -> bool:
+        """Resume a paused session.
+        
+        Resumes audio recording into the same session folder.
+        No new session is created.
+        
+        Returns:
+            True if resumed successfully, False if no paused session
+        """
+        if not self.current_session:
+            self._update_status('No active session to resume', is_error=True)
+            return False
+        
+        if self.current_session.status != Session.STATUS_PAUSED:
+            self._update_status(f'Session is not paused (status: {self.current_session.status})', is_error=True)
+            return False
+        
+        # Update session status to active
+        self.current_session.resume()
+        
+        # Resume recording
+        self.start_recording(label='main')
+        
+        self._update_status(f'Session {self.current_session.id} resumed')
+        return True
+    
     def stop_session(self, auto_transcribe: bool = True) -> Optional[Session]:
         """Stop the current session.
         
