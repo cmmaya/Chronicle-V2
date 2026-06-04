@@ -62,6 +62,7 @@ class MainWindow(QMainWindow):
         self._current_candidates = []  # Store current candidates for selection
         self._candidate_list_widget = None  # List widget for candidate selection
         self._current_conversation_id = None  # Store conversation ID for follow-up questions
+        self._thinking_message_widget = None  # Track "Thinking..." message for replacement
         
         # Create UI components
         self._create_menu_bar()
@@ -136,7 +137,7 @@ class MainWindow(QMainWindow):
             self._selected_session_id = None
             
             self._update_ui_state()
-            self._load_past_sessions()
+            self._load_past_conversations()
             self.status_label.setText('Ready')
         except Exception as e:
             self._on_status_update(f'Failed to initialize: {str(e)}', is_error=True)
@@ -226,6 +227,90 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             logger.warning(f"Failed to load past sessions: {str(e)}")
+    
+    def _load_past_conversations(self):
+        """Load and display past conversations from the database."""
+        try:
+            conversations = self.session_manager.db.list_conversations()
+            
+            self.conversations_list.clear()
+            
+            for conv in conversations:
+                conv_id = conv['id']
+                session_id = conv.get('session_id')
+                title = conv.get('title')
+                created_at = conv.get('created_at', 0)
+                updated_at = conv.get('updated_at', 0)
+                
+                # Format display text
+                from datetime import datetime
+                date_str = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M")
+                
+                if title:
+                    display_text = f"{title}\n{date_str}"
+                else:
+                    display_text = f"Conversation #{conv_id}\n{date_str}"
+                
+                # Add scope indicator
+                if session_id:
+                    display_text += " (Session-specific)"
+                else:
+                    display_text += " (All sessions)"
+                
+                item = QListWidgetItem(display_text)
+                item.setData(Qt.UserRole, conv_id)
+                self.conversations_list.addItem(item)
+            
+        except Exception as e:
+            logger.warning(f"Failed to load past conversations: {str(e)}")
+    
+    def _on_conversation_selected(self, item):
+        """Handle the selection of a conversation from the list."""
+        conv_id = item.data(Qt.UserRole)
+        if conv_id is None:
+            return
+        
+        # Load this conversation in the assistant panel
+        # First, get the conversation messages
+        try:
+            messages = self.session_manager.db.get_messages(conv_id)
+            
+            # Clear the current answer display
+            self._answer_container = QWidget()
+            self._answer_layout = QVBoxLayout(self._answer_container)
+            self._answer_layout.setSpacing(10)
+            self._answer_layout.setContentsMargins(5, 5, 5, 5)
+            self._answer_layout.addStretch()
+            
+            # Display messages in the scroll area
+            for msg in messages:
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                
+                # Create a label for this message
+                msg_label = QLabel(f"{role}: {content}")
+                msg_label.setWordWrap(True)
+                msg_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                
+                # Style based on role
+                if role == 'user':
+                    msg_label.setStyleSheet("background-color: #e3f2fd; padding: 5px; border-radius: 3px;")
+                else:
+                    msg_label.setStyleSheet("background-color: #f1f8e9; padding: 5px; border-radius: 3px;")
+                
+                self._answer_layout.insertWidget(self._answer_layout.count() - 1, msg_label)
+            
+            # Update the scroll area
+            self._answer_scroll_area.setWidget(self._answer_container)
+            
+            # Store conversation ID for follow-up questions
+            self._current_conversation_id = conv_id
+            
+            self._on_status_update(f"Loaded conversation #{conv_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load conversation: {str(e)}")
+            self._on_status_update(f"Error loading conversation: {str(e)}", is_error=True)
     
     def _on_session_name_changed(self, row, column):
         """Handle the renaming of a session."""
@@ -1136,30 +1221,28 @@ Keywords: {keywords_str}"""
         main_splitter.setContentsMargins(10, 10, 10, 10)
         
         # Set initial stretch factors via QSplitter
-        # Left panel: Session History
+        # Left panel: Past Conversations
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(10)
         left_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Past Sessions list - using table for separate cells
-        sessions_group = QGroupBox('Session History')
-        sessions_layout = QVBoxLayout()
-        self.sessions_list = QTableWidget()
-        self.sessions_list.setColumnCount(4)
-        self.sessions_list.setHorizontalHeaderLabels(['Session Name', 'Transcription', 'Summary', 'Actions'])
-        self.sessions_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.sessions_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.sessions_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.sessions_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.sessions_list.setSelectionBehavior(QTableWidget.SelectRows)
-        self.sessions_list.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
-        self.sessions_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.sessions_list.customContextMenuRequested.connect(self._show_session_context_menu)
-        self.sessions_list.cellChanged.connect(self._on_session_name_changed)
-        sessions_layout.addWidget(self.sessions_list)
-        sessions_group.setLayout(sessions_layout)
-        left_layout.addWidget(sessions_group)
+        # Past Conversations list
+        conversations_group = QGroupBox('Past Conversations')
+        conversations_layout = QVBoxLayout()
+        
+        self.conversations_list = QListWidget()
+        self.conversations_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.conversations_list.itemClicked.connect(self._on_conversation_selected)
+        conversations_layout.addWidget(self.conversations_list)
+        
+        # Refresh button
+        refresh_conv_button = QPushButton("Refresh")
+        refresh_conv_button.clicked.connect(self._load_past_conversations)
+        conversations_layout.addWidget(refresh_conv_button)
+        
+        conversations_group.setLayout(conversations_layout)
+        left_layout.addWidget(conversations_group)
         
         # Center panel: Current Chat/Current Session Area
         center_panel = QWidget()
@@ -1309,7 +1392,7 @@ Keywords: {keywords_str}"""
         self._answer_layout.addStretch()  # Push content to top
         
         self._answer_scroll_area.setWidget(self._answer_container)
-        self._answer_scroll_area.setMaximumHeight(200)
+        self._answer_scroll_area.setMaximumHeight(500)
         assistant_layout.addWidget(self._answer_scroll_area)
         
         # For backward compatibility, keep a reference (but we use the scroll area now)
@@ -1361,14 +1444,6 @@ Keywords: {keywords_str}"""
         self.candidate_group.setLayout(candidate_layout)
         self.candidate_group.setVisible(False)  # Hidden by default
         assistant_layout.addWidget(self.candidate_group)
-        
-        # Past conversations button
-        self.past_conversations_button = QPushButton("Past Conversations")
-        self.past_conversations_button.clicked.connect(self._on_past_conversations_clicked)
-        assistant_layout.addWidget(self.past_conversations_button)
-        
-        # Past conversations dialog (created on demand)
-        self._past_conversations_dialog = None
         
         assistant_group.setLayout(assistant_layout)
         center_layout.addWidget(assistant_group)
@@ -1578,14 +1653,31 @@ Keywords: {keywords_str}"""
         Args:
             role: 'user' or 'assistant'
             text: The message text
+        
+        Returns:
+            The bubble_frame widget that was added (can be used to replace later)
         """
         if not hasattr(self, '_answer_layout') or not self._answer_layout:
-            return
+            return None
+        
+        # If this is a "Thinking..." message and we already have one, remove the old one
+        if text == "Thinking..." and self._thinking_message_widget:
+            self._thinking_message_widget.deleteLater()
+            self._thinking_message_widget = None
         
         # Create a bubble frame
         bubble_frame = QFrame()
         bubble_frame.setFrameShape(QFrame.StyledPanel)
         bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        # Store reference if this is "Thinking..." message
+        if text == "Thinking...":
+            self._thinking_message_widget = bubble_frame
+        
+        # Store role as property for later retrieval
+        bubble_frame.setProperty('role', role)
+        # Store text as property for later retrieval
+        bubble_frame.setProperty('message_text', text)
         
         # Set layout for the bubble
         bubble_layout = QVBoxLayout(bubble_frame)
@@ -1646,6 +1738,8 @@ Keywords: {keywords_str}"""
         # Also update detached window if it exists
         if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
             self._add_message_to_detached_conversation(role, text)
+        
+        return bubble_frame
     
     def _clear_conversation_view(self):
         """Clear all messages from the conversation view."""
@@ -1655,6 +1749,83 @@ Keywords: {keywords_str}"""
                 item = self._answer_layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
+        # Reset thinking message tracker
+        self._thinking_message_widget = None
+    
+    def _replace_thinking_message(self, new_text: str):
+        """Replace the 'Thinking...' message with the actual response.
+        
+        Args:
+            new_text: The new text to replace Thinking... with
+        """
+        if not hasattr(self, '_answer_layout') or not self._answer_layout:
+            return
+        
+        # If there's a Thinking... message, replace it
+        if self._thinking_message_widget:
+            # Find the index of the Thinking... widget
+            index = self._answer_layout.indexOf(self._thinking_message_widget)
+            if index >= 0:
+                # Remove the old widget
+                self._answer_layout.takeAt(index)
+                self._thinking_message_widget.deleteLater()
+        
+        # Create a new bubble with the response text
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.StyledPanel)
+        bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        bubble_layout = QVBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(10, 8, 10, 8)
+        bubble_layout.setSpacing(4)
+        
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        role_label = QLabel("Assistant")
+        role_font = role_label.font()
+        role_font.setPointSize(10)
+        role_font.setBold(True)
+        role_label.setFont(role_font)
+        
+        header_layout.addWidget(role_label)
+        header_layout.addStretch()
+        bubble_layout.addLayout(header_layout)
+        
+        text_label = QLabel(new_text)
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble_layout.addWidget(text_label)
+        
+        bubble_frame.setStyleSheet("""
+            QFrame {
+                background-color: #E8F5E9;
+                border-radius: 10px;
+                border: 1px solid #A5D6A7;
+            }
+        """)
+        
+        # Insert at the same position where Thinking was
+        self._answer_layout.insertWidget(
+            self._answer_layout.count() - 1,
+            bubble_frame
+        )
+        
+        # Store role and text as properties for later retrieval (for copying to detached)
+        bubble_frame.setProperty('role', 'assistant')
+        bubble_frame.setProperty('message_text', new_text)
+        
+        # Reset thinking tracker
+        self._thinking_message_widget = None
+        
+        # Auto-scroll to bottom
+        self._answer_scroll_area.verticalScrollBar().setValue(
+            self._answer_scroll_area.verticalScrollBar().maximum()
+        )
+        
+        # Also update detached window if it exists
+        if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
+            self._add_message_to_detached_conversation('assistant', new_text)
     
     def _add_message_to_detached_conversation(self, role: str, text: str):
         """Add a message to the detached window's conversation view.
@@ -1719,6 +1890,10 @@ Keywords: {keywords_str}"""
             self._detached_answer_layout.count() - 1,
             bubble_frame
         )
+        
+        # Store role and text as properties for later retrieval
+        bubble_frame.setProperty('role', role)
+        bubble_frame.setProperty('message_text', text)
         
         # Auto-scroll to bottom
         self._detached_answer_scroll.verticalScrollBar().setValue(
@@ -2647,8 +2822,15 @@ Keywords: {keywords_str}"""
         active_session = self.session_manager.get_active_session()
         active_session_id = active_session.id if active_session else None
         
-        # Get selected session ID from the sessions table
+        # Get selected session ID from the sessions table (if any session is selected)
+        # Falls back to getting session from conversation if conversation is selected
         selected_session_id = self._get_selected_session_id()
+        
+        # If no session selected but we have a conversation, get session from conversation
+        if selected_session_id is None and self._current_conversation_id is not None:
+            conv = self.session_manager.db.get_conversation(self._current_conversation_id)
+            if conv:
+                selected_session_id = conv.get('session_id')
         
         # Disable the Ask button while processing
         self.ask_button.setEnabled(False)
@@ -2687,8 +2869,8 @@ Keywords: {keywords_str}"""
             if response.success:
                 # Clear candidates on successful answer
                 self._clear_candidates()
-                # Add assistant's response to conversation view
-                self._add_message_to_conversation('assistant', response.answer or "")
+                # Replace "Thinking..." with the actual response
+                self._replace_thinking_message(response.answer or "")
                 # Save conversation_id for follow-up questions
                 if response.conversation_id:
                     self._current_conversation_id = response.conversation_id
@@ -2696,7 +2878,8 @@ Keywords: {keywords_str}"""
             elif response.needs_clarification:
                 # Show clarification question and candidates
                 clarification_text = response.clarification_question or ""
-                self._add_message_to_conversation('assistant', clarification_text)
+                # Replace "Thinking..." with clarification
+                self._replace_thinking_message(clarification_text)
                 
                 # Display candidates if available
                 if response.candidates:
@@ -2728,14 +2911,11 @@ Keywords: {keywords_str}"""
             self.ask_button.setEnabled(True)
     
     def _get_selected_session_id(self) -> Optional[int]:
-        """Get the currently selected session ID from the sessions table."""
-        selected_indexes = self.sessions_list.selectedIndexes()
-        if selected_indexes:
-            # Get the row of the first selected item
-            row = selected_indexes[0].row()
-            item = self.sessions_list.item(row, 0)
-            if item:
-                return item.data(Qt.UserRole)
+        """Get the currently selected session ID from the sessions table.
+        
+        Returns None since sessions are no longer shown in a table.
+        Session can still be inferred from the selected conversation.
+        """
         return None
     
     def _display_candidates(self, candidates: list):
@@ -3050,7 +3230,8 @@ Keywords: {keywords_str}"""
         self._detached_answer_layout.addStretch()  # Push content to top
         
         self._detached_answer_scroll.setWidget(self._detached_answer_container)
-        self._detached_answer_scroll.setMinimumHeight(150)
+        self._detached_answer_scroll.setMinimumHeight(300)
+        self._detached_answer_scroll.setMaximumHeight(500)
         main_layout.addWidget(self._detached_answer_scroll)
         
         # Question input (on bottom)
@@ -3095,10 +3276,41 @@ Keywords: {keywords_str}"""
         self._detached_candidate_group.setVisible(False)
         main_layout.addWidget(self._detached_candidate_group)
         
+        # Copy existing conversation from main window to detached window
+        self._copy_conversation_to_detached()
+        
         # Connect main window's answer display to also update detached window
         # This keeps both windows in sync when main window gets an answer
         
         self._detached_assistant_window.show()
+    
+    def _copy_conversation_to_detached(self):
+        """Copy all existing conversation messages from main window to detached window."""
+        if not hasattr(self, '_answer_layout') or not self._answer_layout:
+            return
+        
+        if not hasattr(self, '_detached_answer_layout') or not self._detached_answer_layout:
+            return
+        
+        # Iterate through all message widgets in the main conversation (excluding stretch)
+        for i in range(self._answer_layout.count() - 1):
+            item = self._answer_layout.itemAt(i)
+            if item and item.widget():
+                original_frame = item.widget()
+                
+                # Get the role from the property we stored earlier
+                role = original_frame.property('role')
+                if not role:
+                    continue
+                
+                # Get the text from the property we stored
+                text = original_frame.property('message_text')
+                if not text:
+                    continue
+                
+                if text:
+                    # Add to detached window
+                    self._add_message_to_detached_conversation(role, text)
     
     def _on_detached_ask_clicked(self):
         """Handle the Ask button click in the detached assistant window."""
@@ -3129,8 +3341,15 @@ Keywords: {keywords_str}"""
         active_session = self.session_manager.get_active_session()
         active_session_id = active_session.id if active_session else None
         
-        # Get selected session ID from the sessions table
+        # Get selected session ID from the sessions table (if any session is selected)
+        # Falls back to getting session from conversation if conversation is selected
         selected_session_id = self._get_selected_session_id()
+        
+        # If no session selected but we have a conversation, get session from conversation
+        if selected_session_id is None and self._current_conversation_id is not None:
+            conv = self.session_manager.db.get_conversation(self._current_conversation_id)
+            if conv:
+                selected_session_id = conv.get('session_id')
         
         # Disable the Ask button while processing
         self._detached_ask_button.setEnabled(False)
