@@ -186,6 +186,135 @@ class AssistantAnswerService:
             conversation_id=conv_id,
         )
 
+    async def ask_async(
+        self,
+        question: str,
+        agent_id: Optional[str] = None,
+        explicit_scope: Optional[str] = None,
+        active_session_id: Optional[int] = None,
+        selected_session_id: Optional[int] = None,
+        conversation_id: Optional[int] = None,
+    ) -> AnswerResponse:
+        """
+        Process a user question and return an answer.
+
+        Args:
+            question: The user's question.
+            agent_id: Agent config ID to use (defaults to configured default).
+            explicit_scope: Explicit scope hint - "current_session", "any_session", or None.
+            active_session_id: Currently active session ID, if any.
+            selected_session_id: Currently selected session ID in UI, if any.
+            conversation_id: Existing conversation ID to continue, or None for new.
+
+        Returns:
+            AnswerResponse with either:
+            - success=True and answer text
+            - needs_clarification=True with clarification_question for ambiguous cases
+            - error message on failure
+        """
+        # Step 1: Resolve session scope
+        resolution = self._resolver.resolve(
+            question=question,
+            active_session_id=active_session_id,
+            selected_session_id=selected_session_id,
+            explicit_scope=explicit_scope,
+        )
+
+        # Step 2: Handle ambiguous cases - return clarification without calling OpenRouter
+        if resolution.scope == ScopeResolution.NEEDS_CLARIFICATION:
+            return AnswerResponse(
+                success=False,
+                needs_clarification=True,
+                clarification_question="Which session would you like me to search?",
+                error="No session could be inferred from the question or context.",
+            )
+
+        if resolution.scope == ScopeResolution.AMBIGUOUS:
+            candidates = [
+                {
+                    "session_id": c.session_id,
+                    "session_name": c.session_name,
+                    "start_time": c.start_timestamp,
+                }
+                for c in resolution.candidates
+            ]
+            candidate_list = "\n".join(
+                f"- {c['session_name']} (Session {c['session_id']})"
+                for c in candidates
+            )
+            return AnswerResponse(
+                success=False,
+                needs_clarification=True,
+                clarification_question=(
+                    f"I found multiple matching sessions. Which one would you like me to use?\n"
+                    f"{candidate_list}"
+                ),
+                candidates=candidates,
+                error="Ambiguous session scope - user clarification required.",
+            )
+
+        # Step 3: Get agent config
+        agent = self._get_agent_config(agent_id)
+        if agent is None:
+            return AnswerResponse(
+                success=False,
+                error=f"Agent '{agent_id}' not found.",
+            )
+
+        # Step 4: Determine if question requires session context
+        # Research Helper can answer general knowledge questions without session context
+        needs_session_context = self._needs_session_context(agent_id, question, resolution.scope)
+
+        # Step 5: Retrieve context based on scope
+        context_text = ""
+        session_ids = resolution.session_ids
+
+        if needs_session_context:
+            if resolution.scope == ScopeResolution.ALL_SESSIONS:
+                # Cross-session: use search tools
+                context_text = self._get_all_sessions_context(question)
+            else:
+                # Single session: use bounded context
+                if session_ids:
+                    context_text = self._get_single_session_context(
+                        session_ids[0], question, conversation_id
+                    )
+        else:
+            # For research_helper with general knowledge questions, use minimal context
+            # Just include conversation history, no session data needed
+            context_text = ""
+
+        # Step 6: Build messages for OpenRouter
+        messages = self._build_messages(agent, context_text, question, conversation_id)
+
+        # Step 6: Call OpenRouter API
+        try:
+            # Use selected model from settings (don't pass explicit model)
+            answer = await self._call_openrouter_async(messages)
+        except Exception as e:
+            return AnswerResponse(
+                success=False,
+                error=f"OpenRouter API call failed: {str(e)}",
+            )
+
+        # Step 7: Persist conversation
+        try:
+            conv_id = self._persist_conversation(
+                conversation_id,
+                session_ids[0] if session_ids else None,
+                question,
+                answer,
+            )
+        except Exception as e:
+            # Don't fail the answer if persistence fails - just log
+            conv_id = conversation_id
+
+        return AnswerResponse(
+            success=True,
+            answer=answer,
+            conversation_id=conv_id,
+        )
+
     def _get_agent_config(self, agent_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Get agent configuration by ID."""
         if agent_id is None:
@@ -376,6 +505,18 @@ class AssistantAnswerService:
         openrouter_client = OpenRouterClient(model=effective_model)
 
         return openrouter_client.chat(messages)
+
+    async def _call_openrouter_async(self, messages: List[Dict[str, str]], model: str = None) -> str:
+        """Call OpenRouter API and return the answer."""
+        # Always use fresh selected model - don't cache the client with a fixed model
+        # This ensures model changes in settings are immediately applied
+        selected_model = get_selected_model()
+        effective_model = model or selected_model
+        
+        # Create new client each time to ensure fresh model selection
+        openrouter_client = OpenRouterClient(model=effective_model)
+
+        return await openrouter_client.chat_async(messages)
 
     def _persist_conversation(
         self,

@@ -1,3 +1,26 @@
+# Non-Blocking Assistant Implementation
+
+## Summary
+Implemented asynchronous support for the assistant to allow the UI to remain responsive while processing queries. This enables the user to switch to other tasks while waiting for the assistant's response.
+
+## Files Changed
+
+- `src/assistant/service.py`: Added `ask_async` and `_call_openrouter_async` methods.
+- `src/assistant/openrouter_client.py`: Added `chat_async` method using `httpx`, restored synchronous `chat` method for backward compatibility.
+- `src/app/window.py`: Created `AssistantQueryThread` class and modified `_run_assistant_query` to use threads.
+
+## Important Decisions
+
+- Used `QThread` to run the async function in a separate thread to keep the UI responsive.
+- Installed `httpx` library to support both synchronous and asynchronous HTTP requests.
+- Maintained backward compatibility by keeping the synchronous `chat` method.
+
+## Recovery Notes
+
+- The UI now uses `AssistantQueryThread` to run the assistant query in a background thread.
+- The `ask` method still works synchronously for backward compatibility.
+- The new `ask_async` method can be used for fully async workflows.
+
 # BU003 Implementation Summary (Completed)
 
 - Created audio directory structure

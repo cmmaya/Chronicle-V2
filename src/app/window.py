@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter)
-from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG
+from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal
 from PySide6.QtGui import QAction, QPixmap, QColor
 from typing import Optional
 import logging
@@ -18,6 +18,45 @@ from ..assistant.service import AssistantAnswerService
 from ..screenshots.context_generator import ScreenshotContextGenerator
 
 logger = logging.getLogger(__name__)
+
+
+class AssistantQueryThread(QThread):
+    """Thread for running assistant queries asynchronously."""
+    
+    # Signals to communicate with the main thread
+    finished_signal = Signal(object)  # Emits the AnswerResponse
+    error_signal = Signal(str)  # Emits error message
+    
+    def __init__(self, assistant_service, question, agent_id, explicit_scope, active_session_id, selected_session_id, conversation_id):
+        super().__init__()
+        self.assistant_service = assistant_service
+        self.question = question
+        self.agent_id = agent_id
+        self.explicit_scope = explicit_scope
+        self.active_session_id = active_session_id
+        self.selected_session_id = selected_session_id
+        self.conversation_id = conversation_id
+    
+    def run(self):
+        """Run the async assistant query in a separate thread."""
+        import asyncio
+        
+        async def run_query():
+            return await self.assistant_service.ask_async(
+                question=self.question,
+                agent_id=self.agent_id,
+                explicit_scope=self.explicit_scope,
+                active_session_id=self.active_session_id,
+                selected_session_id=self.selected_session_id,
+                conversation_id=self.conversation_id
+            )
+        
+        try:
+            # Run the async function in a new event loop
+            response = asyncio.run(run_query())
+            self.finished_signal.emit(response)
+        except Exception as e:
+            self.error_signal.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -63,6 +102,7 @@ class MainWindow(QMainWindow):
         self._candidate_list_widget = None  # List widget for candidate selection
         self._current_conversation_id = None  # Store conversation ID for follow-up questions
         self._thinking_message_widget = None  # Track "Thinking..." message for replacement
+        self._assistant_thread = None  # Track active assistant query thread
         
         # Create UI components
         self._create_menu_bar()
@@ -2843,62 +2883,84 @@ Keywords: {keywords_str}"""
         active_session_id: Optional[int],
         selected_session_id: Optional[int]
     ):
-        """Execute the assistant query in the background."""
-        try:
-            # Call the assistant service
-            response = self.assistant_service.ask(
-                question=question,
-                agent_id=agent_id,
-                explicit_scope=explicit_scope,
-                active_session_id=active_session_id,
-                selected_session_id=selected_session_id,
-                conversation_id=self._current_conversation_id
-            )
-            
-            # Handle the response
-            if response.success:
-                # Clear candidates on successful answer
-                self._clear_candidates()
-                # Replace "Thinking..." with the actual response
-                self._replace_thinking_message(response.answer or "")
-                # Save conversation_id for follow-up questions
-                if response.conversation_id:
-                    self._current_conversation_id = response.conversation_id
-                self._on_status_update("Answer received")
-            elif response.needs_clarification:
-                # Show clarification question and candidates
-                clarification_text = response.clarification_question or ""
-                # Replace "Thinking..." with clarification
-                self._replace_thinking_message(clarification_text)
-                
-                # Display candidates if available
-                if response.candidates:
-                    self._display_candidates(response.candidates)
-                else:
-                    # Hide candidate UI if no candidates
-                    self._clear_candidates()
-                    
-                self._on_status_update("Clarification needed")
-            else:
-                # Show error
-                error_text = response.error or "Unknown error occurred"
-                self._add_message_to_conversation('assistant', f"Error: {error_text}")
-                self._on_status_update(f"Assistant error: {error_text}", is_error=True)
-                # Clear candidates on error
-                self._clear_candidates()
-                
-        except Exception as e:
-            logger.error(f"Assistant query failed: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self._add_message_to_conversation('assistant', f"Error: {str(e)}")
-            self._on_status_update(f"Assistant error: {str(e)}", is_error=True)
-            # Clear candidates on exception
-            self._clear_candidates()
+        """Execute the assistant query in a background thread."""
+        # Wait for any previous thread to finish before starting a new one
+        if self._assistant_thread is not None and self._assistant_thread.isRunning():
+            self._assistant_thread.wait()
         
-        finally:
-            # Re-enable the Ask button
-            self.ask_button.setEnabled(True)
+        # Create and configure the thread
+        self._assistant_thread = AssistantQueryThread(
+            assistant_service=self.assistant_service,
+            question=question,
+            agent_id=agent_id,
+            explicit_scope=explicit_scope,
+            active_session_id=active_session_id,
+            selected_session_id=selected_session_id,
+            conversation_id=self._current_conversation_id
+        )
+        
+        # Connect signals to handlers
+        self._assistant_thread.finished_signal.connect(self._on_assistant_query_finished)
+        self._assistant_thread.error_signal.connect(self._on_assistant_query_error)
+        
+        # Start the thread
+        self._assistant_thread.start()
+    
+    def _on_assistant_query_finished(self, response):
+        """Handle the assistant query response."""
+        # Clear thread reference
+        self._assistant_thread = None
+        
+        # Re-enable the Ask button
+        self.ask_button.setEnabled(True)
+        
+        # Handle the response
+        if response.success:
+            # Clear candidates on successful answer
+            self._clear_candidates()
+            # Replace "Thinking..." with the actual response
+            self._replace_thinking_message(response.answer or "")
+            # Save conversation_id for follow-up questions
+            if response.conversation_id:
+                self._current_conversation_id = response.conversation_id
+            self._on_status_update("Answer received")
+        elif response.needs_clarification:
+            # Show clarification question and candidates
+            clarification_text = response.clarification_question or ""
+            # Replace "Thinking..." with clarification
+            self._replace_thinking_message(clarification_text)
+            
+            # Display candidates if available
+            if response.candidates:
+                self._display_candidates(response.candidates)
+            else:
+                # Hide candidate UI if no candidates
+                self._clear_candidates()
+                
+            self._on_status_update("Clarification needed")
+        else:
+            # Show error
+            error_text = response.error or "Unknown error occurred"
+            self._add_message_to_conversation('assistant', f"Error: {error_text}")
+            self._on_status_update(f"Assistant error: {error_text}", is_error=True)
+            # Clear candidates on error
+            self._clear_candidates()
+    
+    def _on_assistant_query_error(self, error_message: str):
+        """Handle assistant query errors."""
+        # Clear thread reference
+        self._assistant_thread = None
+        
+        # Re-enable the Ask button
+        self.ask_button.setEnabled(True)
+        
+        logger.error(f"Assistant query failed: {error_message}")
+        import traceback
+        logger.error(traceback.format_exc())
+        self._add_message_to_conversation('assistant', f"Error: {error_message}")
+        self._on_status_update(f"Assistant error: {error_message}", is_error=True)
+        # Clear candidates on exception
+        self._clear_candidates()
     
     def _get_selected_session_id(self) -> Optional[int]:
         """Get the currently selected session ID from the sessions table.
@@ -3473,6 +3535,10 @@ Keywords: {keywords_str}"""
     
     def closeEvent(self, event):
         """Handle window close event."""
+        # Wait for any active assistant thread to finish
+        if self._assistant_thread is not None and self._assistant_thread.isRunning():
+            self._assistant_thread.wait()
+        
         # Check if there's an active session
         if self.session_manager and self.session_manager.get_active_session():
             reply = QMessageBox.question(

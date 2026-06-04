@@ -18,7 +18,7 @@ class Database:
         try:
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             
-            self.connection = sqlite3.connect(self.db_path)
+            self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row
             self._initialize_schema()
             return self.connection
