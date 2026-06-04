@@ -1130,15 +1130,17 @@ Keywords: {keywords_str}"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Main layout - three column split: left (history), center (chat/session), right (live transcription)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        # Main layout - use QSplitter for resizable panels
+        # Three column split: left (history), center (chat/session), right (live transcription)
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setContentsMargins(10, 10, 10, 10)
         
-        # ========== LEFT PANEL: Session History ==========
+        # Set initial stretch factors via QSplitter
+        # Left panel: Session History
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(10)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         
         # Past Sessions list - using table for separate cells
         sessions_group = QGroupBox('Session History')
@@ -1159,10 +1161,11 @@ Keywords: {keywords_str}"""
         sessions_group.setLayout(sessions_layout)
         left_layout.addWidget(sessions_group)
         
-        # ========== CENTER PANEL: Current Chat/Current Session Area ==========
+        # Center panel: Current Chat/Current Session Area
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
         center_layout.setSpacing(15)
+        center_layout.setContentsMargins(0, 0, 0, 0)
         
         # Title
         title_label = QLabel('Chronicle')
@@ -1289,7 +1292,17 @@ Keywords: {keywords_str}"""
         scope_layout.addStretch()
         assistant_layout.addLayout(scope_layout)
         
-        # Question input
+        # Answer display (read-only) - shown at the top
+        answer_label = QLabel("Answer:")
+        assistant_layout.addWidget(answer_label)
+        
+        self.answer_display = QTextEdit()
+        self.answer_display.setReadOnly(True)
+        self.answer_display.setPlaceholderText("Assistant responses will appear here...")
+        self.answer_display.setMaximumHeight(150)
+        assistant_layout.addWidget(self.answer_display)
+        
+        # Question input - shown at the bottom
         question_label = QLabel("Question:")
         assistant_layout.addWidget(question_label)
         
@@ -1315,16 +1328,6 @@ Keywords: {keywords_str}"""
         
         button_layout.addStretch()
         assistant_layout.addLayout(button_layout)
-        
-        # Answer display (read-only)
-        answer_label = QLabel("Answer:")
-        assistant_layout.addWidget(answer_label)
-        
-        self.answer_display = QTextEdit()
-        self.answer_display.setReadOnly(True)
-        self.answer_display.setPlaceholderText("Assistant responses will appear here...")
-        self.answer_display.setMaximumHeight(150)
-        assistant_layout.addWidget(self.answer_display)
         
         # Candidate session selection (initially hidden)
         self.candidate_group = QGroupBox("Select a Session:")
@@ -1377,10 +1380,20 @@ Keywords: {keywords_str}"""
         live_transcription_group.setLayout(live_transcription_layout)
         right_layout.addWidget(live_transcription_group)
         
-        # Add all three panels to main layout
-        main_layout.addWidget(left_panel, 1)   # Stretch factor 1
-        main_layout.addWidget(center_panel, 2)  # Stretch factor 2 (wider center)
-        main_layout.addWidget(right_panel, 1)   # Stretch factor 1
+        # Add all three panels to the splitter
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(center_panel)
+        main_splitter.addWidget(right_panel)
+        
+        # Set stretch factors: left=1, center=2, right=1
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 2)
+        main_splitter.setStretchFactor(2, 1)
+        
+        # Set the splitter as the central widget's layout
+        central_layout = QVBoxLayout(central_widget)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.addWidget(main_splitter)
     
     def _create_status_bar(self):
         """Create the status bar."""
@@ -2850,7 +2863,17 @@ Keywords: {keywords_str}"""
         agent_layout.addStretch()
         main_layout.addLayout(agent_layout)
         
-        # Question input
+        # Answer display (on top)
+        answer_label = QLabel("Answer:")
+        main_layout.addWidget(answer_label)
+        
+        self._detached_answer_display = QTextEdit()
+        self._detached_answer_display.setReadOnly(True)
+        self._detached_answer_display.setPlaceholderText("Assistant responses will appear here...")
+        self._detached_answer_display.setMinimumHeight(150)
+        main_layout.addWidget(self._detached_answer_display)
+        
+        # Question input (on bottom)
         question_label = QLabel("Question:")
         main_layout.addWidget(question_label)
         
@@ -2872,16 +2895,6 @@ Keywords: {keywords_str}"""
         
         button_layout.addStretch()
         main_layout.addLayout(button_layout)
-        
-        # Answer display
-        answer_label = QLabel("Answer:")
-        main_layout.addWidget(answer_label)
-        
-        self._detached_answer_display = QTextEdit()
-        self._detached_answer_display.setReadOnly(True)
-        self._detached_answer_display.setPlaceholderText("Assistant responses will appear here...")
-        self._detached_answer_display.setMinimumHeight(150)
-        main_layout.addWidget(self._detached_answer_display)
         
         # Candidate session selection (initially hidden) - same as main window
         self._detached_candidate_group = QGroupBox("Select a Session:")
