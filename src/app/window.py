@@ -1292,15 +1292,28 @@ Keywords: {keywords_str}"""
         scope_layout.addStretch()
         assistant_layout.addLayout(scope_layout)
         
-        # Answer display (read-only) - shown at the top
+        # Answer display (read-only) - shown at the top, scrollable for conversation history
         answer_label = QLabel("Answer:")
         assistant_layout.addWidget(answer_label)
         
-        self.answer_display = QTextEdit()
-        self.answer_display.setReadOnly(True)
-        self.answer_display.setPlaceholderText("Assistant responses will appear here...")
-        self.answer_display.setMaximumHeight(150)
-        assistant_layout.addWidget(self.answer_display)
+        # Create scrollable conversation view
+        self._answer_scroll_area = QScrollArea()
+        self._answer_scroll_area.setWidgetResizable(True)
+        self._answer_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        # Container for conversation messages
+        self._answer_container = QWidget()
+        self._answer_layout = QVBoxLayout(self._answer_container)
+        self._answer_layout.setSpacing(10)
+        self._answer_layout.setContentsMargins(5, 5, 5, 5)
+        self._answer_layout.addStretch()  # Push content to top
+        
+        self._answer_scroll_area.setWidget(self._answer_container)
+        self._answer_scroll_area.setMaximumHeight(200)
+        assistant_layout.addWidget(self._answer_scroll_area)
+        
+        # For backward compatibility, keep a reference (but we use the scroll area now)
+        self.answer_display = None  # Will be replaced by conversation view
         
         # Question input - shown at the bottom
         question_label = QLabel("Question:")
@@ -1558,6 +1571,159 @@ Keywords: {keywords_str}"""
                 item = self._transcription_layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
+    
+    def _add_message_to_conversation(self, role: str, text: str):
+        """Add a message to the conversation view.
+        
+        Args:
+            role: 'user' or 'assistant'
+            text: The message text
+        """
+        if not hasattr(self, '_answer_layout') or not self._answer_layout:
+            return
+        
+        # Create a bubble frame
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.StyledPanel)
+        bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        # Set layout for the bubble
+        bubble_layout = QVBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(10, 8, 10, 8)
+        bubble_layout.setSpacing(4)
+        
+        # Header with role label
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        role_label = QLabel(f"{'You' if role == 'user' else 'Assistant'}")
+        role_font = role_label.font()
+        role_font.setPointSize(10)
+        role_font.setBold(True)
+        role_label.setFont(role_font)
+        
+        header_layout.addWidget(role_label)
+        header_layout.addStretch()
+        bubble_layout.addLayout(header_layout)
+        
+        # Message text
+        text_label = QLabel(text)
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble_layout.addWidget(text_label)
+        
+        # Style based on role
+        if role == 'user':
+            # User - right aligned with blue-ish background
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E3F2FD;
+                    border-radius: 10px;
+                    border: 1px solid #90CAF9;
+                }
+            """)
+        else:
+            # Assistant - left aligned with green-ish background
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E8F5E9;
+                    border-radius: 10px;
+                    border: 1px solid #A5D6A7;
+                }
+            """)
+        
+        # Add to layout (before the stretch)
+        self._answer_layout.insertWidget(
+            self._answer_layout.count() - 1,  # Insert before stretch
+            bubble_frame
+        )
+        
+        # Auto-scroll to bottom to show new message
+        self._answer_scroll_area.verticalScrollBar().setValue(
+            self._answer_scroll_area.verticalScrollBar().maximum()
+        )
+        
+        # Also update detached window if it exists
+        if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
+            self._add_message_to_detached_conversation(role, text)
+    
+    def _clear_conversation_view(self):
+        """Clear all messages from the conversation view."""
+        if hasattr(self, '_answer_layout') and self._answer_layout:
+            # Remove all widgets except the stretch (last item)
+            while self._answer_layout.count() > 1:
+                item = self._answer_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+    
+    def _add_message_to_detached_conversation(self, role: str, text: str):
+        """Add a message to the detached window's conversation view.
+        
+        Args:
+            role: 'user' or 'assistant'
+            text: The message text
+        """
+        if not hasattr(self, '_detached_answer_layout') or not self._detached_answer_layout:
+            return
+        
+        # Create a bubble frame
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.StyledPanel)
+        bubble_frame.setFrameShadow(QFrame.Raised)
+        
+        # Set layout for the bubble
+        bubble_layout = QVBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(10, 8, 10, 8)
+        bubble_layout.setSpacing(4)
+        
+        # Header with role label
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        role_label = QLabel(f"{'You' if role == 'user' else 'Assistant'}")
+        role_font = role_label.font()
+        role_font.setPointSize(10)
+        role_font.setBold(True)
+        role_label.setFont(role_font)
+        
+        header_layout.addWidget(role_label)
+        header_layout.addStretch()
+        bubble_layout.addLayout(header_layout)
+        
+        # Message text
+        text_label = QLabel(text)
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble_layout.addWidget(text_label)
+        
+        # Style based on role
+        if role == 'user':
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E3F2FD;
+                    border-radius: 10px;
+                    border: 1px solid #90CAF9;
+                }
+            """)
+        else:
+            bubble_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #E8F5E9;
+                    border-radius: 10px;
+                    border: 1px solid #A5D6A7;
+                }
+            """)
+        
+        # Add to layout (before the stretch)
+        self._detached_answer_layout.insertWidget(
+            self._detached_answer_layout.count() - 1,
+            bubble_frame
+        )
+        
+        # Auto-scroll to bottom
+        self._detached_answer_scroll.verticalScrollBar().setValue(
+            self._detached_answer_scroll.verticalScrollBar().maximum()
+        )
 
     def _on_transcription_filter_changed(self, index: int):
         """Handle the transcription filter selection change.
@@ -2448,7 +2614,7 @@ Keywords: {keywords_str}"""
         """Handle the New Chat button click - resets conversation context."""
         self._current_conversation_id = None
         self.question_input.clear()
-        self.answer_display.setPlainText("")
+        self._clear_conversation_view()
         self._clear_candidates()
         self._on_status_update("New conversation started")
     
@@ -2458,8 +2624,11 @@ Keywords: {keywords_str}"""
         question = self.question_input.toPlainText().strip()
         
         if not question:
-            self.answer_display.setPlainText("Please enter a question.")
+            self._add_message_to_conversation('assistant', "Please enter a question.")
             return
+        
+        # Add user's question to conversation view
+        self._add_message_to_conversation('user', question)
         
         # Clear previous candidates when asking a new question
         self._clear_candidates()
@@ -2483,7 +2652,7 @@ Keywords: {keywords_str}"""
         
         # Disable the Ask button while processing
         self.ask_button.setEnabled(False)
-        self.answer_display.setPlainText("Thinking...")
+        self._add_message_to_conversation('assistant', "Thinking...")
         
         # Run the assistant service call in the background using QTimer to keep UI responsive
         QTimer.singleShot(50, lambda: self._run_assistant_query(
@@ -2518,7 +2687,8 @@ Keywords: {keywords_str}"""
             if response.success:
                 # Clear candidates on successful answer
                 self._clear_candidates()
-                self.answer_display.setPlainText(response.answer or "")
+                # Add assistant's response to conversation view
+                self._add_message_to_conversation('assistant', response.answer or "")
                 # Save conversation_id for follow-up questions
                 if response.conversation_id:
                     self._current_conversation_id = response.conversation_id
@@ -2526,7 +2696,7 @@ Keywords: {keywords_str}"""
             elif response.needs_clarification:
                 # Show clarification question and candidates
                 clarification_text = response.clarification_question or ""
-                self.answer_display.setPlainText(clarification_text)
+                self._add_message_to_conversation('assistant', clarification_text)
                 
                 # Display candidates if available
                 if response.candidates:
@@ -2539,7 +2709,7 @@ Keywords: {keywords_str}"""
             else:
                 # Show error
                 error_text = response.error or "Unknown error occurred"
-                self.answer_display.setPlainText(f"Error: {error_text}")
+                self._add_message_to_conversation('assistant', f"Error: {error_text}")
                 self._on_status_update(f"Assistant error: {error_text}", is_error=True)
                 # Clear candidates on error
                 self._clear_candidates()
@@ -2548,7 +2718,7 @@ Keywords: {keywords_str}"""
             logger.error(f"Assistant query failed: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            self.answer_display.setPlainText(f"Error: {str(e)}")
+            self._add_message_to_conversation('assistant', f"Error: {str(e)}")
             self._on_status_update(f"Assistant error: {str(e)}", is_error=True)
             # Clear candidates on exception
             self._clear_candidates()
@@ -2863,15 +3033,25 @@ Keywords: {keywords_str}"""
         agent_layout.addStretch()
         main_layout.addLayout(agent_layout)
         
-        # Answer display (on top)
+        # Answer display (scrollable conversation on top)
         answer_label = QLabel("Answer:")
         main_layout.addWidget(answer_label)
         
-        self._detached_answer_display = QTextEdit()
-        self._detached_answer_display.setReadOnly(True)
-        self._detached_answer_display.setPlaceholderText("Assistant responses will appear here...")
-        self._detached_answer_display.setMinimumHeight(150)
-        main_layout.addWidget(self._detached_answer_display)
+        # Create scrollable conversation view for detached window
+        self._detached_answer_scroll = QScrollArea()
+        self._detached_answer_scroll.setWidgetResizable(True)
+        self._detached_answer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        # Container for conversation messages
+        self._detached_answer_container = QWidget()
+        self._detached_answer_layout = QVBoxLayout(self._detached_answer_container)
+        self._detached_answer_layout.setSpacing(10)
+        self._detached_answer_layout.setContentsMargins(5, 5, 5, 5)
+        self._detached_answer_layout.addStretch()  # Push content to top
+        
+        self._detached_answer_scroll.setWidget(self._detached_answer_container)
+        self._detached_answer_scroll.setMinimumHeight(150)
+        main_layout.addWidget(self._detached_answer_scroll)
         
         # Question input (on bottom)
         question_label = QLabel("Question:")
@@ -2926,8 +3106,11 @@ Keywords: {keywords_str}"""
         question = self._detached_question_input.toPlainText().strip()
         
         if not question:
-            self._detached_answer_display.setPlainText("Please enter a question.")
+            self._add_message_to_conversation('assistant', "Please enter a question.")
             return
+        
+        # Add user's question to conversation view
+        self._add_message_to_conversation('user', question)
         
         # Clear previous candidates when asking a new question
         self._detached_candidate_group.setVisible(False)
@@ -2951,7 +3134,7 @@ Keywords: {keywords_str}"""
         
         # Disable the Ask button while processing
         self._detached_ask_button.setEnabled(False)
-        self._detached_answer_display.setPlainText("Thinking...")
+        self._add_message_to_conversation('assistant', "Thinking...")
         
         # Run the assistant service call in the background
         QTimer.singleShot(50, lambda: self._run_detached_assistant_query(
@@ -2988,9 +3171,8 @@ Keywords: {keywords_str}"""
             if response.success:
                 # Clear candidates on successful answer
                 self._detached_candidate_group.setVisible(False)
-                self._detached_answer_display.setPlainText(response.answer or "")
-                # Also update main window's answer display to keep them in sync
-                self.answer_display.setPlainText(response.answer or "")
+                # Add assistant's response to conversation view
+                self._add_message_to_conversation('assistant', response.answer or "")
                 # Save conversation_id for follow-up questions
                 if response.conversation_id:
                     self._current_conversation_id = response.conversation_id
@@ -2998,9 +3180,7 @@ Keywords: {keywords_str}"""
             elif response.needs_clarification:
                 # Show clarification question and candidates
                 clarification_text = response.clarification_question or ""
-                self._detached_answer_display.setPlainText(clarification_text)
-                # Also show in main window
-                self.answer_display.setPlainText(clarification_text)
+                self._add_message_to_conversation('assistant', clarification_text)
                 
                 # Display candidates in detached window
                 if response.candidates:
@@ -3012,8 +3192,7 @@ Keywords: {keywords_str}"""
             else:
                 # Show error
                 error_text = response.error or "Unknown error occurred"
-                self._detached_answer_display.setPlainText(f"Error: {error_text}")
-                self.answer_display.setPlainText(f"Error: {error_text}")
+                self._add_message_to_conversation('assistant', f"Error: {error_text}")
                 self._on_status_update(f"Assistant error: {error_text}", is_error=True)
                 # Clear candidates on error
                 self._detached_candidate_group.setVisible(False)
@@ -3022,9 +3201,7 @@ Keywords: {keywords_str}"""
             logger.error(f"Assistant query failed (detached): {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            error_text = f"Error: {str(e)}"
-            self._detached_answer_display.setPlainText(error_text)
-            self.answer_display.setPlainText(error_text)
+            self._add_message_to_conversation('assistant', f"Error: {str(e)}")
             self._on_status_update(f"Assistant error: {str(e)}", is_error=True)
             # Clear candidates on exception
             self._detached_candidate_group.setVisible(False)
@@ -3065,7 +3242,7 @@ Keywords: {keywords_str}"""
             if selected_session_id and self._current_question:
                 # Disable button during processing
                 self._detached_use_candidate_button.setEnabled(False)
-                self._detached_answer_display.setPlainText("Thinking...")
+                self._add_message_to_conversation('assistant', "Thinking...")
                 
                 agent_id = self._detached_agent_combo.currentData()
                 scope_value = self._detached_scope_combo.currentData()
