@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU063
-- Next BU: BU064
+- Current BU: BU065
+- Next BU: BU066
 
 ## Target Architecture
 
@@ -79,6 +79,7 @@ BU060 - Pause Resume Session Lifecycle
 BU061 - Pause Button UI
 BU062 - Home Layout Shell
 BU063 - Session Search Combobox
+BU065 - Selected Session Scope Label
 
 ## In Progress BUs
 None
@@ -187,3 +188,5 @@ None
 - Service passes conversation_id through to context retrieval for follow-up questions
 - Added ALLOWED_MODELS list and DEFAULT_MODEL constant to config.py
 - Added get_selected_model() and set_selected_model() functions for model selection
+- Added session search with autocomplete completer in main window
+- Added scope label that shows "Scope: <session_name>" when a session is selected

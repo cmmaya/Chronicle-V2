@@ -1924,6 +1924,11 @@ Keywords: {keywords_str}"""
         
         center_layout.addLayout(session_search_layout)
         
+        # Scope label - shows selected session name
+        self._scope_label = QLabel("Scope: (none)")
+        self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+        center_layout.addWidget(self._scope_label)
+        
         # Assistant panel
         assistant_group = QGroupBox('Assistant')
         assistant_layout = QVBoxLayout()
@@ -3596,6 +3601,36 @@ Keywords: {keywords_str}"""
         except Exception as e:
             logger.error(f"Failed to refresh session completer: {e}")
     
+    def _update_scope_label(self):
+        """Update the scope label to show the currently selected session name."""
+        if not hasattr(self, '_scope_label'):
+            return
+            
+        if self._selected_session_id is None:
+            self._scope_label.setText("Scope: (none)")
+            self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+            return
+        
+        try:
+            # Get session name from database
+            sessions = self.session_manager.db.list_sessions()
+            session_name = None
+            for session in sessions:
+                if session.get('id') == self._selected_session_id:
+                    session_name = session.get('name', 'Unnamed')
+                    break
+            
+            if session_name:
+                self._scope_label.setText(f"Scope: {session_name}")
+                self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+            else:
+                self._scope_label.setText("Scope: (not found)")
+                self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+        except Exception as e:
+            logger.error(f"Failed to update scope label: {e}")
+            self._scope_label.setText("Scope: (error)")
+            self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+    
     def _on_session_completer_selected(self, text: str):
         """Handle session selection from completer.
         
@@ -3605,6 +3640,7 @@ Keywords: {keywords_str}"""
         session_id = self._session_completer_map.get(text)
         if session_id is not None:
             self._selected_session_id = session_id
+            self._update_scope_label()
             logger.info(f"Selected session for assistant: {session_id}")
     
     def _show_all_sessions_window(self):
@@ -3717,6 +3753,24 @@ Keywords: {keywords_str}"""
         
         # Connect cellChanged for name editing
         table.cellChanged.connect(lambda row, col: self._on_all_sessions_cell_changed(row, col, table, sessions_data))
+        
+        # Connect double-click to select session (except for name column which is for renaming)
+        def on_cell_double_clicked(row, col):
+            # Skip if double-clicking on name column (reserved for renaming)
+            if col == 0:
+                return
+            
+            # Get session_id from the row
+            if row < len(sessions_data):
+                session = sessions_data[row]
+                session_id = session.get('id')
+                if session_id is not None:
+                    self._selected_session_id = session_id
+                    self._update_scope_label()
+                    logger.info(f"Selected session from All Sessions window: {session_id}")
+                    dialog.close()
+        
+        table.cellDoubleClicked.connect(on_cell_double_clicked)
         
         layout.addWidget(table)
         
@@ -3860,9 +3914,11 @@ Keywords: {keywords_str}"""
         session_id = self.session_search_combo.currentData()
         if session_id is not None:
             self._selected_session_id = session_id
+            self._update_scope_label()
             logger.info(f"Selected session for assistant: {session_id}")
         else:
             self._selected_session_id = None
+            self._update_scope_label()
     
     def _on_session_search_dropdown_opened(self, index: int):
         """Handle when the dropdown is opened - load recent sessions.
@@ -3925,6 +3981,7 @@ Keywords: {keywords_str}"""
             session_id = item.data(Qt.UserRole)
             if session_id is not None:
                 self._selected_session_id = session_id
+                self._update_scope_label()
                 # Also update the input text
                 self.session_search_input.setText(item.text())
                 logger.info(f"Selected session for assistant: {session_id}")

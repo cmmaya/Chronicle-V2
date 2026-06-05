@@ -1721,3 +1721,34 @@ Added a session search combobox to the home UI that shows recent sessions on foc
 **Next:**
 - Ready for BU064
 
+# BU065 - Selected Session Scope Label
+
+**Summary:**
+Added a scope label below the session search area that displays "Scope: <session_name>" when a session is selected, providing clear feedback about which session drives assistant queries.
+
+**Files Changed:**
+- `src/app/window.py`: Added `_scope_label` widget and `_update_scope_label()` method, wired to all session selection handlers.
+
+**Implementation Details:**
+- Added `_scope_label` QLabel after session search layout in center panel
+- Created `_update_scope_label()` method that:
+  - Shows "Scope: <session_name>" with blue bold styling when a session is selected
+  - Shows "Scope: (none)" with gray italic styling when no session is selected
+  - Shows "Scope: (not found)" if session ID not found in database
+- Wired scope label updates to:
+  - `_on_session_completer_selected()` - when user selects from autocomplete
+  - `_on_session_search_selected()` - when user selects from dropdown combobox
+  - Popup item click handler in `_show_session_search_dropdown()`
+
+**Definition of Done Satisfied:**
+- [x] Scope label exists
+- [x] Label updates from all existing selection paths
+- [x] No selected session shows safe default
+- [x] No backend scope behavior changes
+
+**Validation:**
+- Python syntax check passed (py_compile)
+
+**Next:**
+- Ready for BU066
+
