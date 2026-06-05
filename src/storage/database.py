@@ -329,6 +329,46 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Screenshot retrieval failed: {str(e)}')
 
+    def delete_screenshot(self, screenshot_id: int) -> bool:
+        """Delete a screenshot from the database.
+
+        Args:
+            screenshot_id: ID of the screenshot to delete
+
+        Returns:
+            True if deleted, False if not found
+
+        Raises:
+            DatabaseError: If deletion fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM screenshots WHERE id = ?', (screenshot_id,))
+            self.connection.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot deletion failed: {str(e)}')
+
+    def delete_screenshot_by_filepath(self, filepath: str) -> bool:
+        """Delete a screenshot from the database by its filepath.
+
+        Args:
+            filepath: Path to the screenshot file
+
+        Returns:
+            True if deleted, False if not found
+
+        Raises:
+            DatabaseError: If deletion fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM screenshots WHERE filepath = ?', (filepath,))
+            self.connection.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot deletion failed: {str(e)}')
+
 
     def add_transcript(self, session_id: int, timestamp: datetime, text: str, source: str) -> int:
         """Add a transcript entry to the database.

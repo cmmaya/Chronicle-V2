@@ -1752,3 +1752,35 @@ Added a scope label below the session search area that displays "Scope: <session
 **Next:**
 - Ready for BU066
 
+---
+
+## BU066 - Session Action Icon Row
+
+**Date:** 2026-06-05
+
+**Summary:**
+Added a compact icon row above the assistant panel with four action buttons: play/stop toggle, pause/resume, screenshot, and view screenshots/view summary icons. The icons respond to session state - play/stop toggles between ▶ and ⏹, pause icon appears only during active session, screenshot enabled only during active session, and summary icon enabled only when selected session has a summary.
+
+**Files Changed:**
+- `src/app/window.py`: Added QToolButton import, created icon row with 4 buttons, added _on_play_stop_clicked, _on_view_screenshots_icon_clicked (delegates to existing handler), _on_view_summary_icon_clicked, _update_summary_icon_state, and updated _update_ui_state for icon state management.
+
+**Implementation Details:**
+- Play/Stop button toggles between ▶ (start) and ⏹ (stop) based on session state
+- Pause icon button (⏸/▶) appears only when session is active/paused
+- Screenshot icon (📷) enabled only during active session
+- View Screenshots icon (🖼) uses existing complete _on_view_screenshots handler
+- View Summary icon (📝) enabled only when selected/active session has summary
+- Summary icon state updates when scope label changes
+
+**Definition of Done Satisfied:**
+- [x] Four icons are visible
+- [x] Screenshot icon is enabled only during active session
+- [x] Summary icon is enabled only when selected session has summary
+- [x] Existing handlers are reused where available (view screenshots delegates to complete handler)
+
+**Validation:**
+- Python syntax check passed (py_compile)
+
+**Next:**
+- Ready for BU067
+

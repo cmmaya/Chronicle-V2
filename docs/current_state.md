@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU065
-- Next BU: BU066
+- Current BU: BU066
+- Next BU: BU067
 
 ## Target Architecture
 
@@ -80,6 +80,7 @@ BU061 - Pause Button UI
 BU062 - Home Layout Shell
 BU063 - Session Search Combobox
 BU065 - Selected Session Scope Label
+BU066 - Session Action Icon Row
 
 ## In Progress BUs
 None

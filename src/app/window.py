@@ -4,7 +4,8 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
-                                QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter)
+                                QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
+                                QToolButton)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel
 from PySide6.QtGui import QAction, QPixmap, QColor
 from typing import Optional
@@ -18,6 +19,103 @@ from ..assistant.service import AssistantAnswerService
 from ..screenshots.context_generator import ScreenshotContextGenerator
 
 logger = logging.getLogger(__name__)
+
+
+class ScreenshotContextThread(QThread):
+    """Thread for running screenshot context generation asynchronously."""
+    
+    # Signals to communicate with the main thread
+    finished_signal = Signal(object)  # Emits the context dict
+    error_signal = Signal(str)  # Emits error message
+    
+    def __init__(self, screenshot_path, summary, transcript_excerpt, db):
+        super().__init__()
+        self.screenshot_path = screenshot_path
+        self.summary = summary
+        self.transcript_excerpt = transcript_excerpt
+        self.db = db
+    
+    def run(self):
+        """Run the screenshot context generation in a separate thread."""
+        try:
+            context_gen = ScreenshotContextGenerator(database=self.db)
+            context = context_gen.generate_context(
+                screenshot_path=self.screenshot_path,
+                summary=self.summary,
+                transcript_excerpt=self.transcript_excerpt,
+                store=True
+            )
+            self.finished_signal.emit(context)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class ScreenshotContextBatchThread(QThread):
+    """Thread for running screenshot context generation for multiple screenshots sequentially."""
+    
+    # Signals to communicate with the main thread
+    progress_signal = Signal(int, int, object, str)  # current, total, context/None, filepath
+    finished_signal = Signal(list)  # Emits list of (context, filepath) tuples
+    
+    def __init__(self, screenshots_data, summary, db):
+        """
+        Args:
+            screenshots_data: List of dicts with 'filepath' and 'timestamp' keys
+            summary: Session summary string
+            db: Database instance
+        """
+        super().__init__()
+        self.screenshots_data = screenshots_data
+        self.summary = summary
+        self.db = db
+    
+    def run(self):
+        """Run the screenshot context generation for all screenshots sequentially."""
+        results = []
+        
+        try:
+            context_gen = ScreenshotContextGenerator(database=self.db)
+            total = len(self.screenshots_data)
+            
+            for idx, screenshot in enumerate(self.screenshots_data):
+                filepath = screenshot.get('filepath', '')
+                screenshot_timestamp = screenshot.get('timestamp', 0)
+                
+                if not filepath:
+                    self.progress_signal.emit(idx + 1, total, None, filepath)
+                    continue
+                
+                # Get transcript excerpt for this screenshot
+                transcript_excerpt = ""
+                all_transcripts = self.db.get_transcripts(screenshot.get('session_id', 0))
+                if all_transcripts:
+                    sorted_transcripts = sorted(
+                        all_transcripts,
+                        key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
+                    )
+                    nearest_2 = sorted_transcripts[:2]
+                    transcript_excerpt = " | ".join(
+                        t.get('text', '')[:200] for t in nearest_2 if t.get('text')
+                    )
+                
+                try:
+                    context = context_gen.generate_context(
+                        screenshot_path=filepath,
+                        summary=self.summary if self.summary else None,
+                        transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
+                        store=True
+                    )
+                    results.append((context, filepath))
+                    self.progress_signal.emit(idx + 1, total, context, filepath)
+                except Exception as e:
+                    logger.warning(f"Failed to generate context for {filepath}: {e}")
+                    self.progress_signal.emit(idx + 1, total, None, filepath)
+            
+            self.finished_signal.emit(results)
+            
+        except Exception as e:
+            logger.error(f"Batch screenshot context generation failed: {e}")
+            self.finished_signal.emit(results)
 
 
 class AssistantQueryThread(QThread):
@@ -405,7 +503,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Failed to start transcription: {str(e)}")
             self._on_status_update(f"Error: {str(e)}", is_error=True)
             # Reload to reset state
-            self._load_past_sessions()
+            self._refresh_session_completer()
     
     def _run_transcription(self, session_id: int, combo: QComboBox):
         """Run the transcription process for a session."""
@@ -431,7 +529,7 @@ class MainWindow(QMainWindow):
                 self._on_status_update('No audio files found to transcribe')
             
             # Reload the sessions list to update UI
-            self._load_past_sessions()
+            self._refresh_session_completer()
             
         except Exception as e:
             logger.error(f"Transcription failed: {str(e)}")
@@ -440,7 +538,7 @@ class MainWindow(QMainWindow):
             self._on_status_update(f"Transcription failed: {str(e)}", is_error=True)
             QMessageBox.warning(self, 'Transcription Failed', str(e))
             # Reload to reset button state
-            self._load_past_sessions()
+            self._refresh_session_completer()
     
     def _on_summarize_clicked(self, session_id: int, combo: QComboBox):
         """Handle the summarize action for a session."""
@@ -455,7 +553,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Failed to start summarization: {str(e)}")
             self._on_status_update(f"Error: {str(e)}", is_error=True)
             # Reload to reset state
-            self._load_past_sessions()
+            self._refresh_session_completer()
     
     def _run_summarization(self, session_id: int, combo: QComboBox):
         """Run the summarization process for a session."""
@@ -474,7 +572,7 @@ class MainWindow(QMainWindow):
             if not transcripts:
                 self._on_status_update('No transcripts found for summarization')
                 QMessageBox.warning(self, 'No Transcripts', 'No transcripts available. Please transcribe first.')
-                self._load_past_sessions()
+                self._refresh_session_completer()
                 return
             
             # Combine all transcript text
@@ -485,7 +583,7 @@ class MainWindow(QMainWindow):
             if not full_transcript.strip():
                 self._on_status_update('No transcript text found')
                 QMessageBox.warning(self, 'No Transcript Text', 'Transcripts are empty.')
-                self._load_past_sessions()
+                self._refresh_session_completer()
                 return
             
             # Create summary generator (reads API key from .env)
@@ -503,8 +601,11 @@ class MainWindow(QMainWindow):
             
             self._on_status_update('Summary generated successfully')
             
+            # Update summary icon state to reflect the new summary
+            self._update_summary_icon_state()
+            
             # Reload the sessions list to update UI
-            self._load_past_sessions()
+            self._refresh_session_completer()
             
         except Exception as e:
             logger.error(f"Summarization failed: {str(e)}")
@@ -513,7 +614,7 @@ class MainWindow(QMainWindow):
             self._on_status_update(f"Summarization failed: {str(e)}", is_error=True)
             QMessageBox.warning(self, 'Summarization Failed', str(e))
             # Reload to reset button state
-            self._load_past_sessions()
+            self._refresh_session_completer()
     
     def _show_session_context_menu(self, position):
         """Show a context menu for the right-clicked session item."""
@@ -862,6 +963,8 @@ Keywords: {keywords_str}"""
                 update_selection(idx)
                 if has_summary and idx is not None:
                     give_context_selected_button.setEnabled(True)
+                # Enable delete button when a screenshot is selected
+                delete_button.setEnabled(idx is not None)
 
             from datetime import datetime
             for idx, screenshot in enumerate(screenshots):
@@ -927,8 +1030,8 @@ Keywords: {keywords_str}"""
             context_text.setMaximumHeight(100)
 
             summaries = self.session_manager.db.get_summaries(session_id)
-            has_summary = summaries and len(summaries) > 0
-
+            has_summary = bool(summaries and len(summaries) > 0)
+            
             if has_summary:
                 context_text.setPlaceholderText("Select a screenshot and click 'Give Context to Selected' to generate context, or 'Give Context to All' for all screenshots...")
             else:
@@ -953,18 +1056,31 @@ Keywords: {keywords_str}"""
             close_button = QPushButton("Close")
             close_button.clicked.connect(dialog.close)
 
+            delete_button = QPushButton("Delete Selected")
+            delete_button.setEnabled(False)
+            delete_button.setStyleSheet("color: red;")
+
             button_layout.addWidget(give_context_selected_button)
             button_layout.addWidget(give_context_all_button)
             button_layout.addStretch()
+            button_layout.addWidget(delete_button)
             button_layout.addWidget(close_button)
 
             layout.addLayout(button_layout)
 
             # Handlers (copied from session-row implementation)
+            # Store thread references for cleanup
+            context_thread = [None]  # Use list to allow mutation in closure
+            all_context_threads = [None]  # For "Give Context to All"
+
             def on_give_context_selected():
                 selected_idx = selected_screenshot_index[0]
                 if selected_idx is None:
                     QMessageBox.information(self, 'No Selection', 'Please select a screenshot first.')
+                    return
+
+                # Check if a thread is already running
+                if context_thread[0] is not None and context_thread[0].isRunning():
                     return
 
                 give_context_selected_button.setEnabled(False)
@@ -972,148 +1088,228 @@ Keywords: {keywords_str}"""
                 context_text.setPlainText("Generating context for selected screenshot...")
                 QApplication.processEvents()
 
-                try:
-                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
-                    summary_content = ""
-                    if has_summary:
-                        summary = summaries[0]
-                        summary_content = summary.get('content', '')
+                # Get the screenshot data
+                screenshot = screenshots[selected_idx]
+                filepath = screenshot.get('filepath', '')
+                screenshot_timestamp = screenshot.get('timestamp', 0)
 
-                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
+                if not filepath:
+                    context_text.setPlainText("Invalid screenshot filepath.")
+                    give_context_selected_button.setEnabled(True)
+                    give_context_selected_button.setText("Give Context to Selected")
+                    return
 
-                    screenshot = screenshots[selected_idx]
-                    filepath = screenshot.get('filepath', '')
-                    screenshot_timestamp = screenshot.get('timestamp', 0)
+                # Prepare parameters for the thread
+                summary_content = ""
+                if has_summary:
+                    summary = summaries[0]
+                    summary_content = summary.get('content', '')
 
-                    if not filepath:
-                        context_text.setPlainText("Invalid screenshot filepath.")
-                        return
+                all_transcripts = self.session_manager.db.get_transcripts(session_id)
 
-                    transcript_excerpt = ""
-                    if all_transcripts:
-                        sorted_transcripts = sorted(all_transcripts, key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp))
-                        nearest_2 = sorted_transcripts[:2]
-                        transcript_excerpt = " | ".join(t.get('text', '')[:200] for t in nearest_2 if t.get('text'))
+                transcript_excerpt = ""
+                if all_transcripts:
+                    sorted_transcripts = sorted(all_transcripts, key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp))
+                    nearest_2 = sorted_transcripts[:2]
+                    transcript_excerpt = " | ".join(t.get('text', '')[:200] for t in nearest_2 if t.get('text'))
 
-                    context = context_gen.generate_context(
-                        screenshot_path=filepath,
-                        summary=summary_content if summary_content else None,
-                        transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                        store=True
-                    )
+                # Create and configure the thread
+                thread = ScreenshotContextThread(
+                    screenshot_path=filepath,
+                    summary=summary_content if summary_content else None,
+                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
+                    db=self.session_manager.db
+                )
 
-                    ai_summary = context.get('summary', 'N/A')
-                    visible_text = context.get('visible_text', [])
-                    keywords = context.get('keywords', [])
+                def on_context_finished(context):
+                    try:
+                        ai_summary = context.get('summary', 'N/A')
+                        visible_text = context.get('visible_text', [])
+                        keywords = context.get('keywords', [])
 
-                    if isinstance(visible_text, list):
-                        visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                    else:
-                        visible_text_str = str(visible_text) if visible_text else "None"
+                        if isinstance(visible_text, list):
+                            visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                        else:
+                            visible_text_str = str(visible_text) if visible_text else "None"
 
-                    if isinstance(keywords, list):
-                        keywords_str = ", ".join(keywords) if keywords else "None"
-                    else:
-                        keywords_str = str(keywords) if keywords else "None"
+                        if isinstance(keywords, list):
+                            keywords_str = ", ".join(keywords) if keywords else "None"
+                        else:
+                            keywords_str = str(keywords) if keywords else "None"
 
-                    import os
-                    filename = os.path.basename(filepath)
+                        import os
+                        filename = os.path.basename(filepath)
 
-                    context_text.setPlainText(f"""Screenshot: {filename}
+                        context_text.setPlainText(f"""Screenshot: {filename}
 Summary: {ai_summary}
 Visible Text: {visible_text_str}
 Keywords: {keywords_str}""")
 
-                    self._on_status_update(f"Generated context for selected screenshot")
+                        self._on_status_update(f"Generated context for selected screenshot")
+                    except Exception as e:
+                        logger.error(f"Error processing context result: {e}")
+                        context_text.setPlainText(f"Error processing result: {str(e)}")
+                    finally:
+                        give_context_selected_button.setEnabled(True)
+                        give_context_selected_button.setText("Give Context to Selected")
+                        context_thread[0] = None
 
-                except Exception as e:
-                    logger.error(f"Failed to generate screenshot context: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    context_text.setPlainText(f"Error generating context: {str(e)}")
-                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
-                finally:
+                def on_context_error(error_msg):
+                    logger.error(f"Failed to generate screenshot context: {error_msg}")
+                    context_text.setPlainText(f"Error generating context: {error_msg}")
+                    QMessageBox.warning(self, 'Context Generation Failed', error_msg)
                     give_context_selected_button.setEnabled(True)
                     give_context_selected_button.setText("Give Context to Selected")
+                    context_thread[0] = None
+
+                # Connect signals and start thread
+                thread.finished_signal.connect(on_context_finished)
+                thread.error_signal.connect(on_context_error)
+                context_thread[0] = thread
+                thread.start()
 
             def on_give_context_all():
+                # Check if a thread is already running
+                if all_context_threads[0] is not None and all_context_threads[0].isRunning():
+                    return
+
                 give_context_all_button.setEnabled(False)
                 give_context_all_button.setText("Generating...")
                 context_text.setPlainText("Generating context for all screenshots...")
                 QApplication.processEvents()
 
-                try:
-                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
-                    summary_content = ""
-                    if has_summary:
-                        summary = summaries[0]
-                        summary_content = summary.get('content', '')
+                # Prepare common data
+                summary_content = ""
+                if has_summary:
+                    summary = summaries[0]
+                    summary_content = summary.get('content', '')
 
-                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
+                # Prepare screenshots data for batch thread
+                screenshots_data = [
+                    {
+                        'filepath': s.get('filepath', ''),
+                        'timestamp': s.get('timestamp', 0),
+                        'session_id': session_id
+                    }
+                    for s in screenshots
+                ]
 
-                    context_display_parts = []
-                    for screenshot in screenshots:
-                        filepath = screenshot.get('filepath', '')
-                        screenshot_timestamp = screenshot.get('timestamp', 0)
+                # Create batch thread (processes sequentially)
+                batch_thread = ScreenshotContextBatchThread(
+                    screenshots_data=screenshots_data,
+                    summary=summary_content,
+                    db=self.session_manager.db
+                )
 
-                        if filepath:
-                            transcript_excerpt = ""
-                            if all_transcripts:
-                                sorted_transcripts = sorted(all_transcripts, key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp))
-                                nearest_2 = sorted_transcripts[:2]
-                                transcript_excerpt = " | ".join(t.get('text', '')[:200] for t in nearest_2 if t.get('text'))
+                context_display_parts = []
 
-                            try:
-                                context = context_gen.generate_context(
-                                    screenshot_path=filepath,
-                                    summary=summary_content if summary_content else None,
-                                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                                    store=True
-                                )
+                def on_progress(current, total, context, filepath):
+                    if context is not None:
+                        try:
+                            ai_summary = context.get('summary', 'N/A')
+                            visible_text = context.get('visible_text', [])
+                            keywords = context.get('keywords', [])
 
-                                ai_summary = context.get('summary', 'N/A')
-                                visible_text = context.get('visible_text', [])
-                                keywords = context.get('keywords', [])
+                            if isinstance(visible_text, list):
+                                visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                            else:
+                                visible_text_str = str(visible_text) if visible_text else "None"
 
-                                if isinstance(visible_text, list):
-                                    visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                                else:
-                                    visible_text_str = str(visible_text) if visible_text else "None"
+                            if isinstance(keywords, list):
+                                keywords_str = ", ".join(keywords) if keywords else "None"
+                            else:
+                                keywords_str = str(keywords) if keywords else "None"
 
-                                if isinstance(keywords, list):
-                                    keywords_str = ", ".join(keywords) if keywords else "None"
-                                else:
-                                    keywords_str = str(keywords) if keywords else "None"
+                            import os
+                            filename = os.path.basename(filepath)
 
-                                import os
-                                filename = os.path.basename(filepath)
-
-                                screenshot_entry = f"""Screenshot: {filename}
+                            screenshot_entry = f"""Screenshot: {filename}
 Summary: {ai_summary}
 Visible Text: {visible_text_str}
 Keywords: {keywords_str}"""
 
-                                context_display_parts.append(screenshot_entry)
-                            except Exception as e:
-                                logger.warning(f"Failed to generate context for {filepath}: {e}")
-                                context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
+                            context_display_parts.append(screenshot_entry)
+                        except Exception as e:
+                            logger.error(f"Error processing context result: {e}")
+                            import os
+                            context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
+                    else:
+                        import os
+                        context_display_parts.append(f"[Error for {os.path.basename(filepath)}: Failed to generate]")
 
+                    # Update UI with current progress
+                    context_text.setPlainText(f"Processed {current}/{total} screenshots...\n\n" + "\n\n".join(context_display_parts))
+                    QApplication.processEvents()
+
+                def on_batch_finished(results):
                     if context_display_parts:
                         context_text.setPlainText("\n\n".join(context_display_parts))
                         self._on_status_update(f"Generated context for {len(context_display_parts)} screenshot(s)")
                     else:
                         context_text.setPlainText("No context could be generated.")
-
-                except Exception as e:
-                    logger.error(f"Failed to generate screenshot context: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    context_text.setPlainText(f"Error generating context: {str(e)}")
-                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
-                finally:
                     give_context_all_button.setEnabled(True)
                     give_context_all_button.setText("Give Context to All")
+                    all_context_threads[0] = None
 
+                batch_thread.progress_signal.connect(on_progress)
+                batch_thread.finished_signal.connect(on_batch_finished)
+                all_context_threads[0] = batch_thread
+                batch_thread.start()
+
+            def on_delete_screenshot():
+                """Delete the selected screenshot from database and file system."""
+                selected_idx = selected_screenshot_index[0]
+                if selected_idx is None:
+                    return
+
+                screenshot = screenshots[selected_idx]
+                filepath = screenshot.get('filepath', '')
+                screenshot_id = screenshot.get('id')
+
+                if not filepath:
+                    return
+
+                reply = QMessageBox.question(
+                    self,
+                    'Delete Screenshot',
+                    f"Are you sure you want to delete this screenshot?\n\n{filepath}\n\nThis will remove it from the database and delete the file.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+
+                if reply != QMessageBox.Yes:
+                    return
+
+                try:
+                    # Delete from database
+                    if screenshot_id:
+                        self.session_manager.db.delete_screenshot(screenshot_id)
+                    else:
+                        self.session_manager.db.delete_screenshot_by_filepath(filepath)
+
+                    # Delete file from filesystem
+                    import os
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                        logger.info(f"Deleted screenshot file: {filepath}")
+                    else:
+                        logger.warning(f"Screenshot file not found: {filepath}")
+
+                    self._on_status_update(f"Screenshot deleted")
+
+                    # Close the dialog and refresh
+                    dialog.close()
+
+                    # Reopen the screenshots dialog to refresh the list
+                    self._show_screenshots_by_session_id(session_id, session_name)
+
+                except Exception as e:
+                    logger.error(f"Failed to delete screenshot: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    QMessageBox.warning(self, 'Delete Failed', f"Failed to delete screenshot: {str(e)}")
+
+            delete_button.clicked.connect(on_delete_screenshot)
             give_context_selected_button.clicked.connect(on_give_context_selected)
             give_context_all_button.clicked.connect(on_give_context_all)
 
@@ -1404,6 +1600,8 @@ Keywords: {keywords_str}"""
                 # Enable the "Give Context to Selected" button when a screenshot is selected
                 if has_summary and idx is not None:
                     give_context_selected_button.setEnabled(True)
+                # Enable delete button when a screenshot is selected
+                delete_button.setEnabled(idx is not None)
             
             # Add screenshots to the grid
             from datetime import datetime
@@ -1481,7 +1679,7 @@ Keywords: {keywords_str}"""
             
             # Check if summary exists - required for context generation
             summaries = self.session_manager.db.get_summaries(session_id)
-            has_summary = summaries and len(summaries) > 0
+            has_summary = bool(summaries and len(summaries) > 0)
             
             # Initial message based on summary availability
             if has_summary:
@@ -1509,206 +1707,277 @@ Keywords: {keywords_str}"""
             
             if not has_summary:
                 give_context_all_button.setToolTip("Generate a summary first before generating screenshot context")
-            
+
+            # Delete button
+            delete_button = QPushButton("Delete Selected")
+            delete_button.setEnabled(False)
+            delete_button.setStyleSheet("color: red;")
+
             # Close button
             close_button = QPushButton("Close")
             close_button.clicked.connect(dialog.close)
-            
+
             button_layout.addWidget(give_context_selected_button)
             button_layout.addWidget(give_context_all_button)
             button_layout.addStretch()
+            button_layout.addWidget(delete_button)
             button_layout.addWidget(close_button)
             
             layout.addLayout(button_layout)
             
             # Store references for the callbacks
+            # Store thread references for cleanup
+            context_thread = [None]  # Use list to allow mutation in closure
+            all_context_threads = [None]  # For "Give Context to All"
+
             def on_give_context_selected():
                 """Generate context for the selected screenshot."""
                 selected_idx = selected_screenshot_index[0]
                 if selected_idx is None:
                     QMessageBox.information(self, 'No Selection', 'Please select a screenshot first.')
                     return
-                
+
+                # Check if a thread is already running
+                if context_thread[0] is not None and context_thread[0].isRunning():
+                    return
+
                 give_context_selected_button.setEnabled(False)
                 give_context_selected_button.setText("Generating...")
                 context_text.setPlainText("Generating context for selected screenshot...")
                 QApplication.processEvents()
-                
-                try:
-                    # Create context generator
-                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
-                    
-                    # Get summary for context generation
-                    summary_content = ""
-                    if has_summary:
-                        summary = summaries[0]
-                        summary_content = summary.get('content', '')
-                    
-                    # Get all transcripts for finding nearest ones
-                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
-                    
-                    # Generate context for selected screenshot only
-                    screenshot = screenshots[selected_idx]
-                    filepath = screenshot.get('filepath', '')
-                    screenshot_timestamp = screenshot.get('timestamp', 0)
-                    
-                    if not filepath:
-                        context_text.setPlainText("Invalid screenshot filepath.")
-                        return
-                    
-                    # Find 2 nearest transcripts to this screenshot timestamp
-                    transcript_excerpt = ""
-                    if all_transcripts:
-                        sorted_transcripts = sorted(
-                            all_transcripts,
-                            key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
-                        )
-                        nearest_2 = sorted_transcripts[:2]
-                        transcript_excerpt = " | ".join(
-                            t.get('text', '')[:200] for t in nearest_2 if t.get('text')
-                        )
-                    
-                    context = context_gen.generate_context(
-                        screenshot_path=filepath,
-                        summary=summary_content if summary_content else None,
-                        transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                        store=True
+
+                # Get the screenshot data
+                screenshot = screenshots[selected_idx]
+                filepath = screenshot.get('filepath', '')
+                screenshot_timestamp = screenshot.get('timestamp', 0)
+
+                if not filepath:
+                    context_text.setPlainText("Invalid screenshot filepath.")
+                    give_context_selected_button.setEnabled(True)
+                    give_context_selected_button.setText("Give Context to Selected")
+                    return
+
+                # Prepare parameters for the thread
+                summary_content = ""
+                if has_summary:
+                    summary = summaries[0]
+                    summary_content = summary.get('content', '')
+
+                all_transcripts = self.session_manager.db.get_transcripts(session_id)
+
+                transcript_excerpt = ""
+                if all_transcripts:
+                    sorted_transcripts = sorted(
+                        all_transcripts,
+                        key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
                     )
-                    
-                    # Format the context for display
-                    ai_summary = context.get('summary', 'N/A')
-                    visible_text = context.get('visible_text', [])
-                    keywords = context.get('keywords', [])
-                    
-                    # Format visible text as string
-                    if isinstance(visible_text, list):
-                        visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                    else:
-                        visible_text_str = str(visible_text) if visible_text else "None"
-                    
-                    # Format keywords as string
-                    if isinstance(keywords, list):
-                        keywords_str = ", ".join(keywords) if keywords else "None"
-                    else:
-                        keywords_str = str(keywords) if keywords else "None"
-                    
-                    # Get just the filename for display
-                    import os
-                    filename = os.path.basename(filepath)
-                    
-                    context_text.setPlainText(f"""Screenshot: {filename}
+                    nearest_2 = sorted_transcripts[:2]
+                    transcript_excerpt = " | ".join(
+                        t.get('text', '')[:200] for t in nearest_2 if t.get('text')
+                    )
+
+                # Create and configure the thread
+                thread = ScreenshotContextThread(
+                    screenshot_path=filepath,
+                    summary=summary_content if summary_content else None,
+                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
+                    db=self.session_manager.db
+                )
+
+                def on_context_finished(context):
+                    try:
+                        ai_summary = context.get('summary', 'N/A')
+                        visible_text = context.get('visible_text', [])
+                        keywords = context.get('keywords', [])
+
+                        # Format visible text as string
+                        if isinstance(visible_text, list):
+                            visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                        else:
+                            visible_text_str = str(visible_text) if visible_text else "None"
+
+                        # Format keywords as string
+                        if isinstance(keywords, list):
+                            keywords_str = ", ".join(keywords) if keywords else "None"
+                        else:
+                            keywords_str = str(keywords) if keywords else "None"
+
+                        # Get just the filename for display
+                        import os
+                        filename = os.path.basename(filepath)
+
+                        context_text.setPlainText(f"""Screenshot: {filename}
 Summary: {ai_summary}
 Visible Text: {visible_text_str}
 Keywords: {keywords_str}""")
-                    
-                    self._on_status_update(f"Generated context for selected screenshot")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to generate screenshot context: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    context_text.setPlainText(f"Error generating context: {str(e)}")
-                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
-                finally:
+
+                        self._on_status_update(f"Generated context for selected screenshot")
+                    except Exception as e:
+                        logger.error(f"Error processing context result: {e}")
+                        context_text.setPlainText(f"Error processing result: {str(e)}")
+                    finally:
+                        give_context_selected_button.setEnabled(True)
+                        give_context_selected_button.setText("Give Context to Selected")
+                        context_thread[0] = None
+
+                def on_context_error(error_msg):
+                    logger.error(f"Failed to generate screenshot context: {error_msg}")
+                    context_text.setPlainText(f"Error generating context: {error_msg}")
+                    QMessageBox.warning(self, 'Context Generation Failed', error_msg)
                     give_context_selected_button.setEnabled(True)
                     give_context_selected_button.setText("Give Context to Selected")
-            
+                    context_thread[0] = None
+
+                # Connect signals and start thread
+                thread.finished_signal.connect(on_context_finished)
+                thread.error_signal.connect(on_context_error)
+                context_thread[0] = thread
+                thread.start()
+
             def on_give_context_all():
                 """Generate context for all screenshots."""
+                # Check if a thread is already running
+                if all_context_threads[0] is not None and all_context_threads[0].isRunning():
+                    return
+
                 give_context_all_button.setEnabled(False)
                 give_context_all_button.setText("Generating...")
                 context_text.setPlainText("Generating context for all screenshots...")
                 QApplication.processEvents()
-                
-                try:
-                    # Create context generator
-                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
-                    
-                    # Get summary for context generation
-                    summary_content = ""
-                    if has_summary:
-                        summary = summaries[0]
-                        summary_content = summary.get('content', '')
-                    
-                    # Get all transcripts for finding nearest ones
-                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
-                    
-                    # Generate context for each screenshot
-                    context_display_parts = []
-                    for screenshot in screenshots:
-                        filepath = screenshot.get('filepath', '')
-                        screenshot_timestamp = screenshot.get('timestamp', 0)
-                        
-                        if filepath:
-                            # Find 2 nearest transcripts to this screenshot timestamp
-                            transcript_excerpt = ""
-                            if all_transcripts:
-                                sorted_transcripts = sorted(
-                                    all_transcripts,
-                                    key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
-                                )
-                                nearest_2 = sorted_transcripts[:2]
-                                transcript_excerpt = " | ".join(
-                                    t.get('text', '')[:200] for t in nearest_2 if t.get('text')
-                                )
-                            
-                            try:
-                                context = context_gen.generate_context(
-                                    screenshot_path=filepath,
-                                    summary=summary_content if summary_content else None,
-                                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                                    store=True
-                                )
-                                
-                                # Format the context for display
-                                ai_summary = context.get('summary', 'N/A')
-                                visible_text = context.get('visible_text', [])
-                                keywords = context.get('keywords', [])
-                                
-                                # Format visible text as string
-                                if isinstance(visible_text, list):
-                                    visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                                else:
-                                    visible_text_str = str(visible_text) if visible_text else "None"
-                                
-                                # Format keywords as string
-                                if isinstance(keywords, list):
-                                    keywords_str = ", ".join(keywords) if keywords else "None"
-                                else:
-                                    keywords_str = str(keywords) if keywords else "None"
-                                
-                                # Get just the filename for display
-                                import os
-                                filename = os.path.basename(filepath)
-                                
-                                screenshot_entry = f"""Screenshot: {filename}
+
+                # Prepare common data
+                summary_content = ""
+                if has_summary:
+                    summary = summaries[0]
+                    summary_content = summary.get('content', '')
+
+                # Prepare screenshots data for batch thread
+                screenshots_data = [
+                    {
+                        'filepath': s.get('filepath', ''),
+                        'timestamp': s.get('timestamp', 0),
+                        'session_id': session_id
+                    }
+                    for s in screenshots
+                ]
+
+                # Create batch thread (processes sequentially)
+                batch_thread = ScreenshotContextBatchThread(
+                    screenshots_data=screenshots_data,
+                    summary=summary_content,
+                    db=self.session_manager.db
+                )
+
+                context_display_parts = []
+
+                def on_progress(current, total, context, filepath):
+                    if context is not None:
+                        try:
+                            ai_summary = context.get('summary', 'N/A')
+                            visible_text = context.get('visible_text', [])
+                            keywords = context.get('keywords', [])
+
+                            if isinstance(visible_text, list):
+                                visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                            else:
+                                visible_text_str = str(visible_text) if visible_text else "None"
+
+                            if isinstance(keywords, list):
+                                keywords_str = ", ".join(keywords) if keywords else "None"
+                            else:
+                                keywords_str = str(keywords) if keywords else "None"
+
+                            import os
+                            filename = os.path.basename(filepath)
+
+                            screenshot_entry = f"""Screenshot: {filename}
 Summary: {ai_summary}
 Visible Text: {visible_text_str}
 Keywords: {keywords_str}"""
-                                
-                                context_display_parts.append(screenshot_entry)
-                            except Exception as e:
-                                logger.warning(f"Failed to generate context for {filepath}: {e}")
-                                context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
-                    
-                    # Display all contexts
+
+                            context_display_parts.append(screenshot_entry)
+                        except Exception as e:
+                            logger.error(f"Error processing context result: {e}")
+                            import os
+                            context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
+                    else:
+                        import os
+                        context_display_parts.append(f"[Error for {os.path.basename(filepath)}: Failed to generate]")
+
+                    # Update UI with current progress
+                    context_text.setPlainText(f"Processed {current}/{total} screenshots...\n\n" + "\n\n".join(context_display_parts))
+                    QApplication.processEvents()
+
+                def on_batch_finished(results):
                     if context_display_parts:
                         context_text.setPlainText("\n\n".join(context_display_parts))
                         self._on_status_update(f"Generated context for {len(context_display_parts)} screenshot(s)")
                     else:
                         context_text.setPlainText("No context could be generated.")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to generate screenshot context: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    context_text.setPlainText(f"Error generating context: {str(e)}")
-                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
-                finally:
                     give_context_all_button.setEnabled(True)
                     give_context_all_button.setText("Give Context to All")
-            
+                    all_context_threads[0] = None
+
+                batch_thread.progress_signal.connect(on_progress)
+                batch_thread.finished_signal.connect(on_batch_finished)
+                all_context_threads[0] = batch_thread
+                batch_thread.start()
+
+            def on_delete_screenshot():
+                """Delete the selected screenshot from database and file system."""
+                selected_idx = selected_screenshot_index[0]
+                if selected_idx is None:
+                    return
+
+                screenshot = screenshots[selected_idx]
+                filepath = screenshot.get('filepath', '')
+                screenshot_id = screenshot.get('id')
+
+                if not filepath:
+                    return
+
+                reply = QMessageBox.question(
+                    self,
+                    'Delete Screenshot',
+                    f"Are you sure you want to delete this screenshot?\n\n{filepath}\n\nThis will remove it from the database and delete the file.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+
+                if reply != QMessageBox.Yes:
+                    return
+
+                try:
+                    # Delete from database
+                    if screenshot_id:
+                        self.session_manager.db.delete_screenshot(screenshot_id)
+                    else:
+                        self.session_manager.db.delete_screenshot_by_filepath(filepath)
+
+                    # Delete file from filesystem
+                    import os
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                        logger.info(f"Deleted screenshot file: {filepath}")
+                    else:
+                        logger.warning(f"Screenshot file not found: {filepath}")
+
+                    self._on_status_update(f"Screenshot deleted")
+
+                    # Close the dialog and refresh
+                    dialog.close()
+
+                    # Reopen the screenshots dialog to refresh the list
+                    self._show_session_screenshots(row)
+
+                except Exception as e:
+                    logger.error(f"Failed to delete screenshot: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    QMessageBox.warning(self, 'Delete Failed', f"Failed to delete screenshot: {str(e)}")
+
             # Connect buttons to handlers
+            delete_button.clicked.connect(on_delete_screenshot)
             give_context_selected_button.clicked.connect(on_give_context_selected)
             give_context_all_button.clicked.connect(on_give_context_all)
             
@@ -1784,6 +2053,55 @@ Keywords: {keywords_str}"""
         left_layout.setSpacing(10)
         left_layout.setContentsMargins(0, 0, 0, 0)
         
+        # Session action icon row - above Past Conversations
+        icon_row_layout = QHBoxLayout()
+        icon_row_layout.setSpacing(5)
+        icon_row_layout.setContentsMargins(0, 0, 0, 5)
+        
+        # Play/Stop toggle button
+        self.play_stop_button = QToolButton()
+        self.play_stop_button.setText("▶")
+        self.play_stop_button.setToolTip("Start/Stop Session")
+        self.play_stop_button.setMinimumSize(40, 40)
+        self.play_stop_button.clicked.connect(self._on_play_stop_clicked)
+        icon_row_layout.addWidget(self.play_stop_button)
+        
+        # Pause/Resume button (only visible when session is active)
+        self.pause_icon_button = QToolButton()
+        self.pause_icon_button.setText("⏸")
+        self.pause_icon_button.setToolTip("Pause/Resume Session")
+        self.pause_icon_button.setMinimumSize(40, 40)
+        self.pause_icon_button.clicked.connect(self._on_pause_resume_session)
+        self.pause_icon_button.setVisible(False)
+        icon_row_layout.addWidget(self.pause_icon_button)
+        
+        # Screenshot button
+        self.screenshot_icon_button = QToolButton()
+        self.screenshot_icon_button.setText("📷")
+        self.screenshot_icon_button.setToolTip("Take Screenshot")
+        self.screenshot_icon_button.setMinimumSize(40, 40)
+        self.screenshot_icon_button.clicked.connect(self._on_take_screenshot)
+        icon_row_layout.addWidget(self.screenshot_icon_button)
+        
+        # View Screenshots button
+        self.view_screenshots_icon_button = QToolButton()
+        self.view_screenshots_icon_button.setText("🖼")
+        self.view_screenshots_icon_button.setToolTip("View Screenshots")
+        self.view_screenshots_icon_button.setMinimumSize(40, 40)
+        self.view_screenshots_icon_button.clicked.connect(self._on_view_screenshots_icon_clicked)
+        icon_row_layout.addWidget(self.view_screenshots_icon_button)
+        
+        # View Summary button
+        self.view_summary_icon_button = QToolButton()
+        self.view_summary_icon_button.setText("📝")
+        self.view_summary_icon_button.setToolTip("View Summary")
+        self.view_summary_icon_button.setMinimumSize(40, 40)
+        self.view_summary_icon_button.clicked.connect(self._on_view_summary_icon_clicked)
+        icon_row_layout.addWidget(self.view_summary_icon_button)
+        
+        icon_row_layout.addStretch()
+        left_layout.addLayout(icon_row_layout)
+        
         # Past Conversations list
         conversations_group = QGroupBox('Past Conversations')
         conversations_layout = QVBoxLayout()
@@ -1830,49 +2148,6 @@ Keywords: {keywords_str}"""
         
         # Spacer
         center_layout.addStretch()
-        
-        # Control buttons
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(20)
-        
-        self.start_button = QPushButton('Start Session')
-        self.start_button.setMinimumSize(150, 50)
-        self.start_button.setFont(title_font)
-        self.start_button.clicked.connect(self._on_start_session)
-        
-        self.stop_button = QPushButton('Stop Session')
-        self.stop_button.setMinimumSize(150, 50)
-        self.stop_button.setFont(title_font)
-        self.stop_button.clicked.connect(self._on_stop_session)
-        self.stop_button.setEnabled(False)
-        
-        self.pause_button = QPushButton('Pause Session')
-        self.pause_button.setMinimumSize(150, 50)
-        self.pause_button.setFont(title_font)
-        self.pause_button.clicked.connect(self._on_pause_resume_session)
-        self.pause_button.setEnabled(False)
-        
-        self.screenshot_button = QPushButton('Take Screenshot')
-        self.screenshot_button.setMinimumSize(150, 50)
-        self.screenshot_button.setFont(title_font)
-        self.screenshot_button.clicked.connect(self._on_take_screenshot)
-        self.screenshot_button.setEnabled(False)
-        
-        self.view_screenshots_button = QPushButton('View Screenshots')
-        self.view_screenshots_button.setMinimumSize(150, 50)
-        self.view_screenshots_button.setFont(title_font)
-        self.view_screenshots_button.clicked.connect(self._on_view_screenshots)
-        self.view_screenshots_button.setEnabled(False)
-        
-        button_layout.addStretch()
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)
-        button_layout.addWidget(self.pause_button)
-        button_layout.addWidget(self.screenshot_button)
-        button_layout.addWidget(self.view_screenshots_button)
-        button_layout.addStretch()
-        
-        center_layout.addLayout(button_layout)
         
         # Live transcription checkbox
         self.live_transcription_checkbox = QCheckBox('Enable live transcription')
@@ -2853,38 +3128,50 @@ Keywords: {keywords_str}"""
         active_session = self.session_manager.get_active_session()
         
         if active_session and active_session.status == Session.STATUS_ACTIVE:
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.pause_button.setEnabled(True)
-            self.pause_button.setText('Pause Session')
-            self.screenshot_button.setEnabled(True)
-            self.view_screenshots_button.setEnabled(True)
             self._is_recording = True
             self.session_name_input.setText(active_session.name)
+            
+            # Update icon row
+            self.play_stop_button.setText("⏹")
+            self.play_stop_button.setToolTip("Stop Session")
+            self.pause_icon_button.setVisible(True)
+            self.pause_icon_button.setText("⏸")
+            self.pause_icon_button.setToolTip("Pause Session")
+            self.screenshot_icon_button.setEnabled(True)
+            
         elif active_session and active_session.status == Session.STATUS_PAUSED:
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.pause_button.setEnabled(True)
-            self.pause_button.setText('Resume Session')
-            self.screenshot_button.setEnabled(True)
-            self.view_screenshots_button.setEnabled(True)
             self._is_recording = False
             self.session_name_input.setText(active_session.name)
+            
+            # Update icon row
+            self.play_stop_button.setText("⏹")
+            self.play_stop_button.setToolTip("Stop Session")
+            self.pause_icon_button.setVisible(True)
+            self.pause_icon_button.setText("▶")
+            self.pause_icon_button.setToolTip("Resume Session")
+            self.screenshot_icon_button.setEnabled(True)
+            
         elif active_session and active_session.status == Session.STATUS_PROCESSING:
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(False)
-            self.pause_button.setEnabled(False)
-            self.screenshot_button.setEnabled(False)
-            self.view_screenshots_button.setEnabled(False)
+            # Update icon row
+            self.play_stop_button.setText("▶")
+            self.play_stop_button.setToolTip("Start Session")
+            self.pause_icon_button.setVisible(False)
+            self.screenshot_icon_button.setEnabled(False)
+            
         else:
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.pause_button.setEnabled(False)
-            self.screenshot_button.setEnabled(False)
             # Enable View Screenshots button if there are past sessions
             sessions = self.session_manager.db.list_sessions()
-            self.view_screenshots_button.setEnabled(len(sessions) > 0)
             self._is_recording = False
+            
+            # Update icon row
+            self.play_stop_button.setText("▶")
+            self.play_stop_button.setToolTip("Start Session")
+            self.pause_icon_button.setVisible(False)
+            self.screenshot_icon_button.setEnabled(False)
+            self.screenshot_icon_button.setEnabled(False)
+        
+        # Update summary icon button based on selected session
+        self._update_summary_icon_state()
     
     def _on_start_session(self):
         """Handle start session button click."""
@@ -2914,17 +3201,15 @@ Keywords: {keywords_str}"""
             # Stop session without auto-transcribing (manual transcription only)
             session = self.session_manager.stop_session(auto_transcribe=False)
             
-            # Update UI
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.screenshot_button.setEnabled(False)
+            # Update UI via icon buttons
+            self._update_ui_state()
             
             # Just show status - no automatic transcription/summarization
             if session:
                 self._on_status_update(f"Session '{session.name}' saved. Use Transcribe button to process.")
             
             # Reload sessions to show the new session
-            self._load_past_sessions()
+            self._refresh_session_completer()
             self._refresh_session_completer()
             
         except Exception as e:
@@ -2941,12 +3226,13 @@ Keywords: {keywords_str}"""
             
             if active_session.status == Session.STATUS_ACTIVE:
                 self.session_manager.pause_session()
-                self.pause_button.setText('Resume Session')
                 self._on_status_update(f"Session '{active_session.name}' paused")
             elif active_session.status == Session.STATUS_PAUSED:
                 self.session_manager.resume_session()
-                self.pause_button.setText('Pause Session')
                 self._on_status_update(f"Session '{active_session.name}' resumed")
+            
+            # Update UI state
+            self._update_ui_state()
             
             self._update_ui_state()
         except Exception as e:
@@ -3002,20 +3288,147 @@ Keywords: {keywords_str}"""
             self._on_status_update(f'Failed to take screenshot: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to take screenshot: {str(e)}')
     
+    def _on_play_stop_clicked(self):
+        """Handle play/stop icon button click."""
+        active_session = self.session_manager.get_active_session() if self.session_manager else None
+        if active_session and active_session.status in (Session.STATUS_ACTIVE, Session.STATUS_PAUSED):
+            # Session is running - stop it
+            self._on_stop_session()
+        else:
+            # No session running - start one
+            self._on_start_session()
+    
+    def _on_view_screenshots_icon_clicked(self):
+        """Handle view screenshots icon button click - uses selected session."""
+        # Delegate to the complete handler
+        self._on_view_screenshots()
+    
+    def _on_view_summary_icon_clicked(self):
+        """Handle view summary icon button click - uses selected session."""
+        try:
+            session_id = None
+            session_name = None
+            
+            # First check for selected session
+            if self._selected_session_id:
+                session_id = self._selected_session_id
+                # Get session name from database
+                sessions = self.session_manager.db.list_sessions()
+                for s in sessions:
+                    if s['id'] == session_id:
+                        session_name = s['name']
+                        break
+                
+                # Check summary status
+                if session_id:
+                    summaries = self.session_manager.db.get_summaries(session_id)
+                    if not summaries:
+                        QMessageBox.information(
+                            self,
+                            'No Summary',
+                            f"Session '{session_name}' does not have a summary yet.\n\n"
+                            "Please transcribe and summarize the session first."
+                        )
+                        return
+            else:
+                # Fall back to active session or most recent
+                active_session = self.session_manager.get_active_session()
+                if active_session:
+                    session_id = active_session.id
+                    session_name = active_session.name
+                else:
+                    sessions = self.session_manager.db.list_sessions()
+                    if sessions:
+                        session_id = sessions[0]['id']
+                        session_name = sessions[0]['name']
+            
+            if not session_id:
+                QMessageBox.information(
+                    self,
+                    'No Sessions',
+                    'There are no sessions with summaries.'
+                )
+                return
+            
+            # Fetch summary from database
+            summaries = self.session_manager.db.get_summaries(session_id)
+            
+            if not summaries:
+                QMessageBox.information(
+                    self,
+                    'No Summary',
+                    f"Session '{session_name}' does not have a summary yet.\n\n"
+                    "Please transcribe and summarize the session first."
+                )
+                return
+            
+            # Get the first summary
+            summary = summaries[0]
+            summary_content = summary.get('content', '')
+            summary_type = summary.get('summary_type', 'full')
+            model_used = summary.get('model_used', 'unknown')
+            
+            # Create a dialog to display the summary
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Summary - {session_name}")
+            dialog.setMinimumSize(600, 400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header with session info
+            header_label = QLabel(f"Session: {session_name}")
+            header_font = header_label.font()
+            header_font.setPointSize(14)
+            header_font.setBold(True)
+            header_label.setFont(header_font)
+            layout.addWidget(header_label)
+            
+            # Summary type and model info
+            info_label = QLabel(f"Type: {summary_type} | Model: {model_used}")
+            layout.addWidget(info_label)
+            
+            # Summary content
+            summary_browser = QTextBrowser()
+            summary_browser.setPlainText(summary_content)
+            layout.addWidget(summary_browser)
+            
+            # Close button
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            layout.addWidget(close_button)
+            
+            dialog.exec()
+            
+        except Exception as e:
+            logger.error(f"Failed to view summary: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(self, 'Error', f'Failed to view summary: {str(e)}')
+    
     def _on_view_screenshots(self):
         """Handle view screenshots button click."""
         try:
             session_id = None
             session_name = None
 
-            # Check if there's an active session first
-            active_session = self.session_manager.get_active_session()
-
-            if active_session:
-                session_id = active_session.id
-                session_name = active_session.name
-            else:
-                # Get the most recent session from the list
+            # First check for selected session (scope)
+            if self._selected_session_id:
+                session_id = self._selected_session_id
+                # Get session name from database
+                sessions = self.session_manager.db.list_sessions()
+                for s in sessions:
+                    if s['id'] == session_id:
+                        session_name = s['name']
+                        break
+            # Then check if there's an active session
+            elif not session_id:
+                active_session = self.session_manager.get_active_session()
+                if active_session:
+                    session_id = active_session.id
+                    session_name = active_session.name
+            
+            # Fall back to most recent session
+            if not session_id:
                 sessions = self.session_manager.db.list_sessions()
                 if sessions:
                     session_id = sessions[0]['id']
@@ -3029,105 +3442,9 @@ Keywords: {keywords_str}"""
                 )
                 return
 
-            # Fetch screenshots from database
-            screenshots = self.session_manager.db.get_screenshots(session_id)
-
-            if not screenshots:
-                QMessageBox.information(
-                    self,
-                    'No Screenshots',
-                    "No screenshots have been taken in this session yet."
-                )
-                return
-
-            # Create a dialog to display the screenshots
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Screenshots - {session_name}")
-            dialog.setMinimumSize(800, 600)
-
-            layout = QVBoxLayout(dialog)
-
-            # Header
-            header_label = QLabel(f"Screenshots for: {session_name}")
-            header_font = header_label.font()
-            header_font.setPointSize(14)
-            header_font.setBold(True)
-            header_label.setFont(header_font)
-            layout.addWidget(header_label)
-
-            # Scroll area for screenshots
-            scroll_area = QScrollArea()
-            scroll_area.setWidgetResizable(True)
-
-            # Grid layout for screenshots
-            grid_widget = QWidget()
-            grid_layout = QGridLayout(grid_widget)
-            grid_layout.setSpacing(10)
-
-            # Add screenshots to the grid
-            from datetime import datetime
-            for idx, screenshot in enumerate(screenshots):
-                filepath = screenshot.get('filepath', '')
-                timestamp = screenshot.get('timestamp', 0)
-                description = screenshot.get('description', '') or ''
-
-                # Convert timestamp to readable format
-                dt = datetime.fromtimestamp(timestamp)
-                time_str = dt.strftime('%H:%M:%S')
-
-                # Create label with image
-                image_label = QLabel()
-                pixmap = QPixmap(filepath)
-
-                if not pixmap.isNull():
-                    # Scale to fit while maintaining aspect ratio
-                    scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    image_label.setPixmap(scaled_pixmap)
-                else:
-                    image_label.setText(f"Failed to load image\n{filepath}")
-
-                image_label.setAlignment(Qt.AlignCenter)
-                image_label.setCursor(Qt.PointingHandCursor)
-                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp: self._show_full_image(fp, ts)
-
-                # Timestamp label
-                time_label = QLabel(f"Captured at: {time_str}")
-                time_label.setAlignment(Qt.AlignCenter)
-
-                # Description label (editable with double click)
-                desc_label = QLabel()
-                if description:
-                    desc_label.setText(f"Description: {description}")
-                else:
-                    desc_label.setText("<i>Double-click to add description</i>")
-                    desc_label.setStyleSheet("color: gray;")
-                desc_label.setAlignment(Qt.AlignCenter)
-                desc_label.setTextInteractionFlags(Qt.NoTextInteraction)
-                desc_label.setCursor(Qt.PointingHandCursor)
-
-                # Store filepath for editing
-                desc_label.setProperty('filepath', filepath)
-                desc_label.setProperty('session_id', session_id)
-
-                # Install event filter for double-click
-                desc_label.installEventFilter(self)
-                desc_label.setObjectName(f"desc_label_{idx}")
-
-                # Add to grid (2 columns)
-                grid_layout.addWidget(image_label, idx // 2 * 3, idx % 2)
-                grid_layout.addWidget(time_label, idx // 2 * 3 + 1, idx % 2)
-                grid_layout.addWidget(desc_label, idx // 2 * 3 + 2, idx % 2)
-
-            scroll_area.setWidget(grid_widget)
-            layout.addWidget(scroll_area)
-
-            # Close button
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.close)
-            layout.addWidget(close_button)
-
-            dialog.exec()
-
+            # Use the complete screenshots window with context generator
+            self._show_screenshots_by_session_id(session_id, session_name)
+            
         except Exception as e:
             logger.error(f"Failed to view screenshots: {str(e)}")
             import traceback
@@ -3135,7 +3452,7 @@ Keywords: {keywords_str}"""
             QMessageBox.critical(
                 self,
                 'Error',
-                f"Failed to view screenshots: {str(e)}"
+                f'Failed to view screenshots: {str(e)}'
             )
     
     def _process_transcription(self, session):
@@ -3208,7 +3525,7 @@ Keywords: {keywords_str}"""
             self._on_status_update('Session complete')
             
             # Reload sessions to show updated status
-            self._load_past_sessions()
+            self._refresh_session_completer()
             
             # Show completion message
             mic_count = len(results.get('microphone', []))
@@ -3630,6 +3947,36 @@ Keywords: {keywords_str}"""
             logger.error(f"Failed to update scope label: {e}")
             self._scope_label.setText("Scope: (error)")
             self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+        
+        # Also update summary icon state
+        self._update_summary_icon_state()
+    
+    def _update_summary_icon_state(self):
+        """Update the summary icon button based on selected session."""
+        if not hasattr(self, 'view_summary_icon_button'):
+            return
+        
+        # Check if selected session has a summary
+        if self._selected_session_id:
+            try:
+                summaries = self.session_manager.db.get_summaries(self._selected_session_id)
+                self.view_summary_icon_button.setEnabled(len(summaries) > 0)
+                self.view_summary_icon_button.setToolTip("View Summary" if summaries else "No summary available")
+            except Exception:
+                self.view_summary_icon_button.setEnabled(False)
+        else:
+            # Check active session
+            active_session = self.session_manager.get_active_session() if self.session_manager else None
+            if active_session:
+                try:
+                    summaries = self.session_manager.db.get_summaries(active_session.id)
+                    self.view_summary_icon_button.setEnabled(len(summaries) > 0)
+                    self.view_summary_icon_button.setToolTip("View Summary" if summaries else "No summary available")
+                except Exception:
+                    self.view_summary_icon_button.setEnabled(False)
+            else:
+                self.view_summary_icon_button.setEnabled(False)
+                self.view_summary_icon_button.setToolTip("No session selected")
     
     def _on_session_completer_selected(self, text: str):
         """Handle session selection from completer.
