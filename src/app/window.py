@@ -4,8 +4,8 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QListWidgetItem, QMenu, QTableWidget, QTableWidgetItem,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
-                                QFrame, QAbstractItemView, QSplitter)
-from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal
+                                QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter)
+from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel
 from PySide6.QtGui import QAction, QPixmap, QColor
 from typing import Optional
 import logging
@@ -104,6 +104,9 @@ class MainWindow(QMainWindow):
         self._thinking_message_widget = None  # Track "Thinking..." message for replacement
         self._assistant_thread = None  # Track active assistant query thread
         
+        # Session search components
+        self._recent_sessions = []  # Store sessions for dropdown
+        
         # Create UI components
         self._create_menu_bar()
         self._create_central_widget()
@@ -178,6 +181,7 @@ class MainWindow(QMainWindow):
             
             self._update_ui_state()
             self._load_past_conversations()
+            self._refresh_session_completer()
             self.status_label.setText('Ready')
         except Exception as e:
             self._on_status_update(f'Failed to initialize: {str(e)}', is_error=True)
@@ -564,6 +568,50 @@ class MainWindow(QMainWindow):
                 
         except Exception as e:
             logger.error(f"Failed to delete session: {str(e)}")
+            self._on_status_update(f"Error deleting session: {str(e)}", is_error=True)
+    
+    def _delete_session_by_id(self, session_id: int):
+        """Delete a session by its ID.
+        
+        Args:
+            session_id: The session ID to delete
+        """
+        try:
+            # Get session name first
+            sessions = self.session_manager.db.list_sessions()
+            session_name = None
+            for s in sessions:
+                if s['id'] == session_id:
+                    session_name = s['name']
+                    break
+            
+            if session_name is None:
+                return
+            
+            reply = QMessageBox.question(
+                self,
+                'Delete Session',
+                f"Are you sure you want to permanently delete '{session_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Delete related data first (summaries, transcripts)
+                self.session_manager.db.delete_summaries(session_id)
+                self.session_manager.db.delete_transcripts(session_id)
+                # Delete the session itself
+                self.session_manager.db.delete_session(session_id)
+                
+                logger.info(f"Deleted session {session_id} ('{session_name}')")
+                self._on_status_update(f"Session '{session_name}' deleted.")
+                
+                # Refresh completer
+                self._refresh_session_completer()
+                
+        except Exception as e:
+            logger.error(f"Failed to delete session: {str(e)}")
+            self._on_status_update(f"Error deleting session: {str(e)}", is_error=True)
             self._on_status_update(f"Error deleting session.", is_error=True)
             QMessageBox.critical(self, 'Error', 'Could not delete the session from the database.')
     
@@ -651,86 +699,435 @@ class MainWindow(QMainWindow):
                 f"Failed to load summary: {str(e)}"
             )
     
-    def _show_full_image(self, filepath: str, timestamp: int):
-        """Show a full-size image in a dialog."""
+    def _show_summary_by_session_id(self, session_id: int, session_name: str):
+        """Show the summary for a session by session_id.
+        
+        Args:
+            session_id: The session ID
+            session_name: The session name
+        """
         try:
-            from datetime import datetime
-            from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy
+            # Check if session has a summary
+            summaries = self.session_manager.db.get_summaries(session_id)
             
-            # Create dialog with window controls
+            if not summaries:
+                QMessageBox.information(
+                    self,
+                    'No Summary',
+                    f"Session '{session_name}' does not have a summary yet.\n\n"
+                    "Please transcribe and summarize the session first."
+                )
+                return
+            
+            # Get the first summary (or most recent)
+            summary = summaries[0]
+            summary_content = summary.get('content', '')
+            summary_type = summary.get('summary_type', 'full')
+            model_used = summary.get('model_used', 'unknown')
+            
+            # Create a dialog to display the summary
             dialog = QDialog(self)
-            dialog.setWindowTitle("Screenshot")
-            dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowMinMaxButtonsHint)
-            
-            # Get screen size
-            screen = QApplication.primaryScreen()
-            screen_geometry = screen.availableGeometry()
-            
-            # Default to 50% of screen
-            width = int(screen_geometry.width() * 0.5)
-            height = int(screen_geometry.height() * 0.5)
-            dialog.resize(width, height)
-            
-            # Center the window
-            dialog.move(int((screen_geometry.width() - width) / 2), 
-                       int((screen_geometry.height() - height) / 2))
+            dialog.setWindowTitle(f"Summary - {session_name}")
+            dialog.setMinimumSize(600, 400)
             
             layout = QVBoxLayout(dialog)
-            layout.setContentsMargins(5, 5, 5, 5)
             
-            # Timestamp
-            dt = datetime.fromtimestamp(timestamp)
-            time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-            time_label = QLabel(f"Captured at: {time_str}")
-            time_label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(time_label)
+            # Header with session info
+            header_label = QLabel(f"Session: {session_name}")
+            header_font = header_label.font()
+            header_font.setPointSize(14)
+            header_font.setBold(True)
+            header_label.setFont(header_font)
+            layout.addWidget(header_label)
             
-            # Image with scroll area for zooming/panning
-            scroll_area = QScrollArea()
-            scroll_area.setWidgetResizable(True)
-            scroll_area.setAlignment(Qt.AlignCenter)
+            # Summary type and model info
+            info_label = QLabel(f"Type: {summary_type} | Model: {model_used}")
+            info_label.setStyleSheet("color: gray;")
+            layout.addWidget(info_label)
             
-            image_label = QLabel()
-            image_label.setAlignment(Qt.AlignCenter)
-            pixmap = QPixmap(filepath)
-            
-            if not pixmap.isNull():
-                # Scale image to fit in the scroll area
-                image_label.setPixmap(pixmap.scaled(
-                    screen_geometry.width(), 
-                    screen_geometry.height(), 
-                    Qt.KeepAspectRatio, 
-                    Qt.SmoothTransformation
-                ))
-            else:
-                image_label.setText(f"Failed to load image\n{filepath}")
-            
-            scroll_area.setWidget(image_label)
-            layout.addWidget(scroll_area)
-            
-            # Button layout for Close and Fullscreen
-            button_layout = QHBoxLayout()
-            button_layout.addStretch()
-            
-            # Fullscreen toggle button
-            fullscreen_btn = QPushButton("Fullscreen")
-            fullscreen_btn.clicked.connect(lambda: self._toggle_fullscreen(dialog, fullscreen_btn, image_label, pixmap, screen_geometry))
-            button_layout.addWidget(fullscreen_btn)
+            # Summary content
+            text_browser = QTextBrowser()
+            text_browser.setPlainText(summary_content)
+            text_browser.setOpenExternalLinks(True)
+            layout.addWidget(text_browser)
             
             # Close button
             close_button = QPushButton("Close")
             close_button.clicked.connect(dialog.close)
-            button_layout.addWidget(close_button)
-            
-            layout.addLayout(button_layout)
+            layout.addWidget(close_button)
             
             dialog.exec()
             
         except Exception as e:
-            logger.error(f"Failed to show full image: {str(e)}")
+            logger.error(f"Failed to show summary: {str(e)}")
+            QMessageBox.critical(
+                self,
+                'Error',
+                f"Failed to load summary: {str(e)}"
+            )
+    
+    def _show_screenshots_by_session_id(self, session_id: int, session_name: str):
+        """Show screenshots for a session by session_id.
+        
+        Args:
+            session_id: The session ID
+            session_name: The session name
+        """
+        try:
+            # Reuse the same rich screenshot dialog (with context generator)
+            screenshots = self.session_manager.db.get_screenshots(session_id)
+
+            if not screenshots:
+                QMessageBox.information(
+                    self,
+                    'No Screenshots',
+                    f"Session '{session_name}' does not have any screenshots."
+                )
+                return
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Screenshots - {session_name}")
+            dialog.setMinimumSize(800, 600)
+
+            layout = QVBoxLayout(dialog)
+
+            header_label = QLabel(f"Screenshots for: {session_name}")
+            header_font = header_label.font()
+            header_font.setPointSize(14)
+            header_font.setBold(True)
+            header_label.setFont(header_font)
+            layout.addWidget(header_label)
+
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+
+            grid_widget = QWidget()
+            grid_layout = QGridLayout(grid_widget)
+            grid_layout.setSpacing(10)
+
+            screenshot_labels = []
+            time_labels = []
+            selected_screenshot_index = [None]
+
+            def get_context_for_screenshot(idx):
+                if idx is None or idx >= len(screenshots):
+                    return ""
+                screenshot = screenshots[idx]
+                ai_summary = screenshot.get('ai_summary', '')
+                visible_text = screenshot.get('visible_text', '')
+                keywords = screenshot.get('keywords', '')
+
+                if not ai_summary:
+                    return ""
+
+                import json, os
+                try:
+                    visible_text_list = json.loads(visible_text) if visible_text else []
+                except:
+                    visible_text_list = []
+                try:
+                    keywords_list = json.loads(keywords) if keywords else []
+                except:
+                    keywords_list = []
+
+                visible_text_str = ", ".join(visible_text_list) if visible_text_list else "None"
+                keywords_str = ", ".join(keywords_list) if keywords_list else "None"
+                filename = os.path.basename(screenshot.get('filepath', ''))
+
+                return f"""Screenshot: {filename}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}"""
+
+            def update_selection(new_index):
+                old_index = selected_screenshot_index[0]
+                if old_index is not None and old_index < len(screenshot_labels):
+                    screenshot_labels[old_index].setStyleSheet("")
+                    time_labels[old_index].setStyleSheet("")
+
+                selected_screenshot_index[0] = new_index
+
+                if new_index is not None:
+                    screenshot_labels[new_index].setStyleSheet("border: 3px solid #0078d4;")
+                    time_labels[new_index].setStyleSheet("border: 3px solid #0078d4; border-top: none;")
+                    context = get_context_for_screenshot(new_index)
+                    if context:
+                        context_text.setPlainText(context)
+                    else:
+                        context_text.setPlainText("No context available for this screenshot. Click 'Give Context to Selected' to generate it.")
+                else:
+                    context_text.setPlainText("")
+
+            def on_screenshot_clicked(idx):
+                update_selection(idx)
+                if has_summary and idx is not None:
+                    give_context_selected_button.setEnabled(True)
+
+            from datetime import datetime
+            for idx, screenshot in enumerate(screenshots):
+                filepath = screenshot.get('filepath', '')
+                timestamp = screenshot.get('timestamp', 0)
+
+                try:
+                    dt = datetime.fromtimestamp(timestamp) if timestamp else None
+                    time_str = dt.strftime('%H:%M:%S') if dt else ''
+                except Exception:
+                    time_str = ''
+
+                container = QWidget()
+                container_layout = QVBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(2)
+
+                image_label = QLabel()
+                pixmap = QPixmap(filepath)
+                if not pixmap.isNull():
+                    scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    image_label.setPixmap(scaled_pixmap)
+                else:
+                    image_label.setText(f"Failed to load image\n{filepath}")
+
+                image_label.setAlignment(Qt.AlignCenter)
+                image_label.setCursor(Qt.PointingHandCursor)
+
+                screenshot_labels.append(image_label)
+
+                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp, i=idx: (
+                    event.accept(),
+                    on_screenshot_clicked(i)
+                )
+
+                image_label.mouseDoubleClickEvent = lambda event, fp=filepath, ts=timestamp: (
+                    event.accept(),
+                    self._show_full_image(fp, ts)
+                )
+
+                time_label = QLabel(f"Captured at: {time_str}")
+                time_label.setAlignment(Qt.AlignCenter)
+                time_labels.append(time_label)
+
+                container_layout.addWidget(image_label)
+                container_layout.addWidget(time_label)
+
+                grid_layout.addWidget(container, idx // 2, idx % 2)
+
+            scroll_area.setWidget(grid_widget)
+            layout.addWidget(scroll_area)
+
+            selection_hint = QLabel("Click on a screenshot to select it and view its context")
+            selection_hint.setStyleSheet("color: gray; font-style: italic;")
+            layout.addWidget(selection_hint)
+
+            context_label = QLabel("Screenshot Context:")
+            context_label.setFont(header_font)
+            layout.addWidget(context_label)
+
+            context_text = QTextEdit()
+            context_text.setReadOnly(True)
+            context_text.setMaximumHeight(100)
+
+            summaries = self.session_manager.db.get_summaries(session_id)
+            has_summary = summaries and len(summaries) > 0
+
+            if has_summary:
+                context_text.setPlaceholderText("Select a screenshot and click 'Give Context to Selected' to generate context, or 'Give Context to All' for all screenshots...")
+            else:
+                context_text.setPlaceholderText("Generate a summary first before generating screenshot context.")
+
+            layout.addWidget(context_text)
+
+            button_layout = QHBoxLayout()
+
+            give_context_selected_button = QPushButton("Give Context to Selected")
+            give_context_selected_button.setEnabled(False)
+            if not has_summary:
+                give_context_selected_button.setToolTip("Generate a summary first before generating screenshot context")
+            else:
+                give_context_selected_button.setToolTip("Generate context for the currently selected screenshot")
+
+            give_context_all_button = QPushButton("Give Context to All")
+            give_context_all_button.setEnabled(has_summary and len(screenshots) > 0)
+            if not has_summary:
+                give_context_all_button.setToolTip("Generate a summary first before generating screenshot context")
+
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+
+            button_layout.addWidget(give_context_selected_button)
+            button_layout.addWidget(give_context_all_button)
+            button_layout.addStretch()
+            button_layout.addWidget(close_button)
+
+            layout.addLayout(button_layout)
+
+            # Handlers (copied from session-row implementation)
+            def on_give_context_selected():
+                selected_idx = selected_screenshot_index[0]
+                if selected_idx is None:
+                    QMessageBox.information(self, 'No Selection', 'Please select a screenshot first.')
+                    return
+
+                give_context_selected_button.setEnabled(False)
+                give_context_selected_button.setText("Generating...")
+                context_text.setPlainText("Generating context for selected screenshot...")
+                QApplication.processEvents()
+
+                try:
+                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
+                    summary_content = ""
+                    if has_summary:
+                        summary = summaries[0]
+                        summary_content = summary.get('content', '')
+
+                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
+
+                    screenshot = screenshots[selected_idx]
+                    filepath = screenshot.get('filepath', '')
+                    screenshot_timestamp = screenshot.get('timestamp', 0)
+
+                    if not filepath:
+                        context_text.setPlainText("Invalid screenshot filepath.")
+                        return
+
+                    transcript_excerpt = ""
+                    if all_transcripts:
+                        sorted_transcripts = sorted(all_transcripts, key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp))
+                        nearest_2 = sorted_transcripts[:2]
+                        transcript_excerpt = " | ".join(t.get('text', '')[:200] for t in nearest_2 if t.get('text'))
+
+                    context = context_gen.generate_context(
+                        screenshot_path=filepath,
+                        summary=summary_content if summary_content else None,
+                        transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
+                        store=True
+                    )
+
+                    ai_summary = context.get('summary', 'N/A')
+                    visible_text = context.get('visible_text', [])
+                    keywords = context.get('keywords', [])
+
+                    if isinstance(visible_text, list):
+                        visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                    else:
+                        visible_text_str = str(visible_text) if visible_text else "None"
+
+                    if isinstance(keywords, list):
+                        keywords_str = ", ".join(keywords) if keywords else "None"
+                    else:
+                        keywords_str = str(keywords) if keywords else "None"
+
+                    import os
+                    filename = os.path.basename(filepath)
+
+                    context_text.setPlainText(f"""Screenshot: {filename}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}""")
+
+                    self._on_status_update(f"Generated context for selected screenshot")
+
+                except Exception as e:
+                    logger.error(f"Failed to generate screenshot context: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    context_text.setPlainText(f"Error generating context: {str(e)}")
+                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
+                finally:
+                    give_context_selected_button.setEnabled(True)
+                    give_context_selected_button.setText("Give Context to Selected")
+
+            def on_give_context_all():
+                give_context_all_button.setEnabled(False)
+                give_context_all_button.setText("Generating...")
+                context_text.setPlainText("Generating context for all screenshots...")
+                QApplication.processEvents()
+
+                try:
+                    context_gen = ScreenshotContextGenerator(database=self.session_manager.db)
+                    summary_content = ""
+                    if has_summary:
+                        summary = summaries[0]
+                        summary_content = summary.get('content', '')
+
+                    all_transcripts = self.session_manager.db.get_transcripts(session_id)
+
+                    context_display_parts = []
+                    for screenshot in screenshots:
+                        filepath = screenshot.get('filepath', '')
+                        screenshot_timestamp = screenshot.get('timestamp', 0)
+
+                        if filepath:
+                            transcript_excerpt = ""
+                            if all_transcripts:
+                                sorted_transcripts = sorted(all_transcripts, key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp))
+                                nearest_2 = sorted_transcripts[:2]
+                                transcript_excerpt = " | ".join(t.get('text', '')[:200] for t in nearest_2 if t.get('text'))
+
+                            try:
+                                context = context_gen.generate_context(
+                                    screenshot_path=filepath,
+                                    summary=summary_content if summary_content else None,
+                                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
+                                    store=True
+                                )
+
+                                ai_summary = context.get('summary', 'N/A')
+                                visible_text = context.get('visible_text', [])
+                                keywords = context.get('keywords', [])
+
+                                if isinstance(visible_text, list):
+                                    visible_text_str = ", ".join(visible_text) if visible_text else "None"
+                                else:
+                                    visible_text_str = str(visible_text) if visible_text else "None"
+
+                                if isinstance(keywords, list):
+                                    keywords_str = ", ".join(keywords) if keywords else "None"
+                                else:
+                                    keywords_str = str(keywords) if keywords else "None"
+
+                                import os
+                                filename = os.path.basename(filepath)
+
+                                screenshot_entry = f"""Screenshot: {filename}
+Summary: {ai_summary}
+Visible Text: {visible_text_str}
+Keywords: {keywords_str}"""
+
+                                context_display_parts.append(screenshot_entry)
+                            except Exception as e:
+                                logger.warning(f"Failed to generate context for {filepath}: {e}")
+                                context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
+
+                    if context_display_parts:
+                        context_text.setPlainText("\n\n".join(context_display_parts))
+                        self._on_status_update(f"Generated context for {len(context_display_parts)} screenshot(s)")
+                    else:
+                        context_text.setPlainText("No context could be generated.")
+
+                except Exception as e:
+                    logger.error(f"Failed to generate screenshot context: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    context_text.setPlainText(f"Error generating context: {str(e)}")
+                    QMessageBox.warning(self, 'Context Generation Failed', str(e))
+                finally:
+                    give_context_all_button.setEnabled(True)
+                    give_context_all_button.setText("Give Context to All")
+
+            give_context_selected_button.clicked.connect(on_give_context_selected)
+            give_context_all_button.clicked.connect(on_give_context_all)
+
+            dialog.exec()
+
+        except Exception as e:
+            logger.error(f"Failed to show screenshots: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            QMessageBox.critical(self, 'Error', f"Failed to show full image: {str(e)}")
+            QMessageBox.critical(
+                self,
+                'Error',
+                f"Failed to load screenshots: {str(e)}"
+            )
     
     def _toggle_fullscreen(self, dialog: QDialog, btn: QPushButton, image_label: QLabel, pixmap: QPixmap, screen_geometry):
         """Toggle between fullscreen and normal mode."""
@@ -761,6 +1158,136 @@ class MainWindow(QMainWindow):
                 Qt.KeepAspectRatio, 
                 Qt.SmoothTransformation
             ))
+
+    def _show_full_image(self, filepath: str, timestamp):
+        """Show a full-size image in a dialog for the given filepath and timestamp.
+
+        Args:
+            filepath: Path to the image file
+            timestamp: Capture timestamp (int/float epoch or ISO string)
+        """
+        try:
+            from datetime import datetime
+            from PySide6.QtWidgets import QApplication, QScrollArea
+
+            # Create dialog with window controls
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Screenshot")
+            dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowMinMaxButtonsHint)
+
+            # Get screen size (fall back to sensible defaults)
+            screen = QApplication.primaryScreen()
+            if screen:
+                screen_geometry = screen.availableGeometry()
+            else:
+                # Use a default size object if primaryScreen not available
+                class _G:
+                    def width(self):
+                        return 1280
+                    def height(self):
+                        return 800
+                screen_geometry = _G()
+
+            # Default to 50% of screen
+            try:
+                width = int(screen_geometry.width() * 0.5)
+                height = int(screen_geometry.height() * 0.5)
+            except Exception:
+                width, height = 800, 600
+
+            dialog.resize(width, height)
+
+            # Center the window
+            try:
+                dialog.move(int((screen_geometry.width() - width) / 2),
+                            int((screen_geometry.height() - height) / 2))
+            except Exception:
+                pass
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(5, 5, 5, 5)
+
+            # Timestamp label (if available)
+            time_str = ''
+            if timestamp:
+                try:
+                    if isinstance(timestamp, (int, float)):
+                        dt = datetime.fromtimestamp(timestamp)
+                    elif isinstance(timestamp, str):
+                        try:
+                            dt = datetime.fromisoformat(timestamp)
+                        except Exception:
+                            # Try numeric string
+                            dt = datetime.fromtimestamp(float(timestamp))
+                    else:
+                        dt = None
+
+                    if dt:
+                        time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    try:
+                        time_str = str(timestamp)
+                    except Exception:
+                        time_str = ''
+
+            if time_str:
+                time_label = QLabel(f"Captured at: {time_str}")
+                time_label.setAlignment(Qt.AlignCenter)
+                layout.addWidget(time_label)
+
+            # Image with scroll area for zooming/panning
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            try:
+                scroll_area.setAlignment(Qt.AlignCenter)
+            except Exception:
+                # Older Qt versions may not support setAlignment on QScrollArea
+                pass
+
+            image_label = QLabel()
+            image_label.setAlignment(Qt.AlignCenter)
+            pixmap = QPixmap(filepath)
+
+            if not pixmap.isNull():
+                # Scale image to fit in the scroll area
+                try:
+                    image_label.setPixmap(pixmap.scaled(
+                        screen_geometry.width(),
+                        screen_geometry.height(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    ))
+                except Exception:
+                    image_label.setPixmap(pixmap)
+            else:
+                image_label.setText(f"Failed to load image\n{filepath}")
+
+            scroll_area.setWidget(image_label)
+            layout.addWidget(scroll_area)
+
+            # Button layout for Close and Fullscreen
+            button_layout = QHBoxLayout()
+            button_layout.addStretch()
+
+            # Fullscreen toggle button
+            fullscreen_btn = QPushButton("Fullscreen")
+            fullscreen_btn.clicked.connect(lambda: self._toggle_fullscreen(dialog, fullscreen_btn, image_label, pixmap, screen_geometry))
+            button_layout.addWidget(fullscreen_btn)
+
+            # Close button
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.close)
+            button_layout.addWidget(close_button)
+
+            layout.addLayout(button_layout)
+
+            dialog.exec()
+
+        except Exception as e:
+            logger.error(f"Failed to show full image: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(self, 'Error', f"Failed to show full image: {str(e)}")
     
     def _show_session_screenshots(self, row):
         """Show the screenshots for a session in a separate window."""
@@ -1368,6 +1895,34 @@ Keywords: {keywords_str}"""
         status_font.setPointSize(16)
         self.status_label.setFont(status_font)
         center_layout.addWidget(self.status_label)
+        
+        session_search_layout = QHBoxLayout()
+        session_search_label = QLabel("Search Session:")
+        session_search_layout.addWidget(session_search_label)
+        
+        # Session search with completer (autocomplete)
+        self.session_search_input = QLineEdit()
+        self.session_search_input.setPlaceholderText("Type to search...")
+        self.session_search_input.setMinimumWidth(150)
+        session_search_layout.addWidget(self.session_search_input)
+        
+        # Setup completer for session search
+        self._session_completer = QCompleter()
+        self._session_completer.setFilterMode(Qt.MatchContains)
+        self._session_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._session_completer.setMaxVisibleItems(5)
+        self._session_completer.activated.connect(self._on_session_completer_selected)
+        self.session_search_input.setCompleter(self._session_completer)
+        
+        # Button to show all sessions in detached window
+        self.show_all_sessions_button = QPushButton("All Sessions")
+        self.show_all_sessions_button.clicked.connect(self._show_all_sessions_window)
+        session_search_layout.addWidget(self.show_all_sessions_button)
+        
+        # Load sessions for completer
+        self._refresh_session_completer()
+        
+        center_layout.addLayout(session_search_layout)
         
         # Assistant panel
         assistant_group = QGroupBox('Assistant')
@@ -2365,6 +2920,7 @@ Keywords: {keywords_str}"""
             
             # Reload sessions to show the new session
             self._load_past_sessions()
+            self._refresh_session_completer()
             
         except Exception as e:
             self._on_status_update(f'Failed to stop session: {str(e)}', is_error=True)
@@ -2969,6 +3525,443 @@ Keywords: {keywords_str}"""
         Session can still be inferred from the selected conversation.
         """
         return None
+    
+    def _load_recent_sessions(self, limit: int = 5):
+        """Load the most recent sessions for the search dropdown.
+        
+        Args:
+            limit: Maximum number of sessions to load (default 5)
+        """
+        # Store recent sessions in memory for dropdown
+        self._recent_sessions = self._get_filtered_sessions("", limit)
+    
+    def _filter_sessions_by_name(self, filter_text: str):
+        """Filter sessions by name matching the filter text.
+        
+        Args:
+            filter_text: Text to filter session names by
+        """
+        # Store filtered sessions in memory for dropdown
+        self._recent_sessions = self._get_filtered_sessions(filter_text, 5)
+    
+    def _on_session_search_text_changed(self, text: str):
+        """Handle text changes in the session search input.
+        
+        Args:
+            text: The current text in the search field
+        """
+        # Filter and show dropdown automatically
+        self._show_session_search_dropdown()
+    
+    def _refresh_session_completer(self):
+        """Refresh the completer with current session list."""
+        # Skip if session_manager not initialized yet
+        if not self.session_manager:
+            return
+        
+        try:
+            sessions = self.session_manager.db.list_sessions()
+            
+            # Create list of display strings
+            from datetime import datetime
+            session_list = []
+            session_map = {}  # Maps display text to session_id
+            
+            for session in sessions:
+                session_id = session.get('id')
+                session_name = session.get('name', 'Unnamed')
+                start_time = session.get('start_time', 0)
+                
+                # Format display text
+                if start_time:
+                    try:
+                        dt = datetime.fromtimestamp(start_time)
+                        display_text = f"{session_name} - {dt.strftime('%Y-%m-%d %H:%M')}"
+                    except:
+                        display_text = f"{session_name} (ID: {session_id})"
+                else:
+                    display_text = f"{session_name} (ID: {session_id})"
+                
+                session_list.append(display_text)
+                session_map[display_text] = session_id
+            
+            # Sort by most recent
+            session_list.sort()
+            
+            # Update completer
+            self._session_completer_model = QStringListModel(session_list)
+            self._session_completer.setModel(self._session_completer_model)
+            self._session_completer_map = session_map
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh session completer: {e}")
+    
+    def _on_session_completer_selected(self, text: str):
+        """Handle session selection from completer.
+        
+        Args:
+            text: The selected text
+        """
+        session_id = self._session_completer_map.get(text)
+        if session_id is not None:
+            self._selected_session_id = session_id
+            logger.info(f"Selected session for assistant: {session_id}")
+    
+    def _show_all_sessions_window(self):
+        """Show all sessions in a detached window."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("All Sessions")
+        dialog.resize(700, 500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Create table
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Session Name", "Transcription", "Summary", "Date", "Actions"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        
+        # Load sessions
+        sessions = self.session_manager.db.list_sessions()
+        
+        # Verify and fix status
+        from datetime import datetime
+        for session in sessions:
+            session_id = session['id']
+            trans_status = session.get('transcription_status', 'none')
+            sum_status = session.get('summary_status', 'none')
+            
+            # Verify transcription status
+            if trans_status == 'none':
+                actual_transcripts = self.session_manager.db.get_transcripts(session_id)
+                if actual_transcripts:
+                    trans_status = 'transcribed'
+            
+            # Verify summary status
+            if sum_status == 'none':
+                actual_summaries = self.session_manager.db.get_summaries(session_id)
+                if actual_summaries:
+                    sum_status = 'summarized'
+            
+            session['transcription_status'] = trans_status
+            session['summary_status'] = sum_status
+        
+        table.setRowCount(len(sessions))
+        
+        # Store sessions data for access in handlers
+        sessions_data = sessions
+        
+        for row, session in enumerate(sessions):
+            session_id = session['id']
+            trans_status = session.get('transcription_status', 'none')
+            sum_status = session.get('summary_status', 'none')
+            
+            # Session name (editable)
+            name_item = QTableWidgetItem(session['name'])
+            name_item.setData(Qt.UserRole, session_id)
+            name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+            table.setItem(row, 0, name_item)
+            
+            # Transcription status (read-only)
+            trans_item = QTableWidgetItem(trans_status)
+            trans_item.setFlags(trans_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 1, trans_item)
+            
+            # Summary status (read-only)
+            sum_item = QTableWidgetItem(sum_status)
+            sum_item.setFlags(sum_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 2, sum_item)
+            
+            # Date
+            start_time = session.get('start_time', 0)
+            if start_time:
+                try:
+                    dt = datetime.fromtimestamp(start_time)
+                    date_str = dt.strftime('%Y-%m-%d %H:%M')
+                except:
+                    date_str = ''
+            else:
+                date_str = ''
+            date_item = QTableWidgetItem(date_str)
+            date_item.setFlags(date_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 3, date_item)
+            
+            # Actions dropdown
+            action_combo = QComboBox()
+            # Placeholder to ensure selecting the same action twice emits a change
+            action_combo.addItem("Select Action", "none")
+            
+            # Determine available actions
+            if trans_status != 'transcribed':
+                action_combo.addItem("Transcribe", "transcribe")
+            
+            if trans_status == 'transcribed':
+                if sum_status != 'summarized':
+                    action_combo.addItem("Summarize", "summarize")
+                else:
+                    action_combo.addItem("View Summary", "view_summary")
+            
+            # Always add View Screenshots
+            action_combo.addItem("View Screenshots", "view_screenshots")
+            
+            # Add Delete option
+            action_combo.addItem("Delete", "delete")
+            
+            action_combo.currentIndexChanged.connect(
+                lambda idx, sid=session_id, sname=session['name'], tstat=trans_status, sstat=sum_status, c=action_combo, d=dialog: 
+                self._on_all_sessions_action_selected(sid, sname, tstat, sstat, idx, c, d)
+            )
+            
+            table.setCellWidget(row, 4, action_combo)
+        
+        # Connect cellChanged for name editing
+        table.cellChanged.connect(lambda row, col: self._on_all_sessions_cell_changed(row, col, table, sessions_data))
+        
+        layout.addWidget(table)
+        
+        # Refresh button
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(lambda: self._refresh_all_sessions_window(dialog))
+        layout.addWidget(refresh_btn)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+        
+        dialog.exec()
+    
+    def _on_all_sessions_cell_changed(self, row, col, table, sessions_data):
+        """Handle cell changes in the all sessions table.
+        
+        Args:
+            row: The changed row
+            col: The changed column
+            table: The table widget
+            sessions_data: List of session dictionaries
+        """
+        if col != 0:  # Only handle name column
+            return
+        
+        try:
+            item = table.item(row, 0)
+            if not item:
+                return
+            
+            session_id = item.data(Qt.UserRole)
+            new_name = item.text()
+            
+            if not new_name:
+                return
+            
+            # Find the old name from sessions_data
+            old_name = None
+            for session in sessions_data:
+                if session['id'] == session_id:
+                    old_name = session['name']
+                    break
+            
+            if old_name is None or new_name == old_name:
+                return
+            
+            # Update in database
+            self.session_manager.db.update_session(session_id, name=new_name)
+            logger.info(f"Renamed session {session_id} to '{new_name}'")
+            self._on_status_update(f"Session renamed to '{new_name}'")
+            
+            # Update the local data
+            for session in sessions_data:
+                if session['id'] == session_id:
+                    session['name'] = new_name
+                    break
+            
+            # Refresh completer
+            self._refresh_session_completer()
+            
+        except Exception as e:
+            logger.error(f"Failed to rename session: {e}")
+            self._on_status_update(f"Error renaming session: {e}", is_error=True)
+    
+    def _refresh_all_sessions_window(self, dialog):
+        """Refresh the all sessions window."""
+        # Simply recreate the window
+        dialog.close()
+        self._show_all_sessions_window()
+    
+    def _on_all_sessions_action_selected(self, session_id, session_name, trans_status, sum_status, index, combo, dialog):
+        """Handle action selection from all sessions window."""
+        # Debug/logging to trace UI actions
+        try:
+            logger.debug(f"_on_all_sessions_action_selected called: session_id={session_id}, index={index}, text={combo.currentText()}, data={combo.currentData()}, trans_status={trans_status}, sum_status={sum_status}")
+        except Exception:
+            logger.debug(f"_on_all_sessions_action_selected called: session_id={session_id}, index={index}")
+
+        # Determine selected action; ignore placeholder/none
+        action = combo.currentData()
+        if not action or action == 'none':
+            return
+        # Show immediate status so user sees action was registered
+        try:
+            self._on_status_update(f"Action selected: {action} for session {session_id}")
+        except Exception:
+            pass
+        
+        if action == "transcribe":
+            combo.setEnabled(False)
+            self._on_transcribe_clicked(session_id, combo)
+            # Reset the combo so the same action can be chosen again
+            try:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+            except Exception:
+                pass
+        elif action == "summarize":
+            combo.setEnabled(False)
+            self._on_summarize_clicked(session_id, combo)
+            # Reset the combo so the same action can be chosen again
+            try:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+            except Exception:
+                pass
+        elif action == "view_summary":
+            # Show summary directly from database
+            self._show_summary_by_session_id(session_id, session_name)
+            # Reset the combo so the same action can be chosen again
+            try:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+            except Exception:
+                pass
+        elif action == "view_screenshots":
+            self._show_screenshots_by_session_id(session_id, session_name)
+            # Reset the combo so the same action can be chosen again
+            try:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+            except Exception:
+                pass
+        elif action == "delete":
+            self._delete_session_by_id(session_id)
+            # Refresh the dialog
+            self._refresh_all_sessions_window(dialog)
+    
+    def _on_session_search_selected(self, index: int):
+        """Handle session selection from the combobox.
+        
+        Args:
+            index: The selected index
+        """
+        session_id = self.session_search_combo.currentData()
+        if session_id is not None:
+            self._selected_session_id = session_id
+            logger.info(f"Selected session for assistant: {session_id}")
+        else:
+            self._selected_session_id = None
+    
+    def _on_session_search_dropdown_opened(self, index: int):
+        """Handle when the dropdown is opened - load recent sessions.
+        
+        Args:
+            index: The selected index (can be -1 if no selection)
+        """
+        # Load recent sessions when dropdown is opened
+        current_text = self.session_search_input.text()
+        if not current_text:
+            self._load_recent_sessions(5)
+    
+    def _show_session_search_dropdown(self):
+        """Show the session search dropdown popup."""
+        # Load recent sessions first
+        current_text = self.session_search_input.text()
+        if not current_text:
+            self._load_recent_sessions(5)
+        
+        # Get current sessions from the internal list
+        sessions_to_show = self._get_filtered_sessions(current_text)
+        
+        # Create a popup list
+        popup = QDialog(self)
+        popup.setWindowFlags(Qt.Popup)
+        popup.setAttribute(Qt.WA_DeleteOnClose)
+        
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create list widget
+        list_widget = QListWidget()
+        list_widget.setMaximumHeight(200)
+        
+        # Populate with sessions
+        from datetime import datetime
+        for session in sessions_to_show:
+            session_id = session.get('id')
+            session_name = session.get('name', 'Unnamed')
+            start_time = session.get('start_time', 0)
+            
+            # Format display text
+            if start_time:
+                try:
+                    dt = datetime.fromtimestamp(start_time)
+                    display_text = f"{session_name} - {dt.strftime('%Y-%m-%d %H:%M')}"
+                except:
+                    display_text = f"{session_name} (ID: {session_id})"
+            else:
+                display_text = f"{session_name} (ID: {session_id})"
+            
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, session_id)
+            list_widget.addItem(item)
+        
+        layout.addWidget(list_widget)
+        
+        # Handle selection
+        def on_item_clicked(item):
+            session_id = item.data(Qt.UserRole)
+            if session_id is not None:
+                self._selected_session_id = session_id
+                # Also update the input text
+                self.session_search_input.setText(item.text())
+                logger.info(f"Selected session for assistant: {session_id}")
+            popup.close()
+        
+        list_widget.itemClicked.connect(on_item_clicked)
+        
+        # Position popup below the button
+        pos = self.session_search_button.mapToGlobal(self.session_search_button.rect().bottomLeft())
+        popup.move(pos)
+        popup.exec()
+    
+    def _get_filtered_sessions(self, filter_text: str = "", limit: int = 5):
+        """Get sessions filtered by text.
+        
+        Args:
+            filter_text: Text to filter session names by
+            limit: Maximum number of sessions to return
+        Returns:
+            List of session dictionaries
+        """
+        try:
+            all_sessions = self.session_manager.db.list_sessions()
+            
+            # Filter by name (case-insensitive)
+            if filter_text:
+                filtered = [s for s in all_sessions if filter_text.lower() in s.get('name', '').lower()]
+            else:
+                filtered = all_sessions
+            
+            # Sort by start_time descending (newest first) and take limit
+            sorted_sessions = sorted(filtered, key=lambda s: s.get('start_time', 0), reverse=True)[:limit]
+            return sorted_sessions
+            
+        except Exception as e:
+            logger.error(f"Failed to get filtered sessions: {e}")
+            return []
     
     def _display_candidates(self, candidates: list):
         """Display candidate sessions for user selection.

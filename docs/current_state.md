@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU062
-- Next BU: BU063
+- Current BU: BU063
+- Next BU: BU064
 
 ## Target Architecture
 
@@ -78,6 +78,7 @@ BU059 - Screenshot Context UI Button (Fixed - Selection Support)
 BU060 - Pause Resume Session Lifecycle
 BU061 - Pause Button UI
 BU062 - Home Layout Shell
+BU063 - Session Search Combobox
 
 ## In Progress BUs
 None

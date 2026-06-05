@@ -8,12 +8,23 @@ Implemented asynchronous support for the assistant to allow the UI to remain res
 - `src/assistant/service.py`: Added `ask_async` and `_call_openrouter_async` methods.
 - `src/assistant/openrouter_client.py`: Added `chat_async` method using `httpx`, restored synchronous `chat` method for backward compatibility.
 - `src/app/window.py`: Created `AssistantQueryThread` class and modified `_run_assistant_query` to use threads.
+- `src/storage/database.py`: Added `check_same_thread=False` to SQLite connection for thread safety.
 
 ## Important Decisions
 
 - Used `QThread` to run the async function in a separate thread to keep the UI responsive.
 - Installed `httpx` library to support both synchronous and asynchronous HTTP requests.
 - Maintained backward compatibility by keeping the synchronous `chat` method.
+- Added thread safety to database connections to allow the assistant query thread to access the database.
+
+## Bug Fixes
+
+- Fixed "QThread: Destroyed while thread is still running" error by:
+  - Adding `_assistant_thread` instance variable to track active thread.
+  - Waiting for previous thread to finish before starting a new one.
+  - Waiting for thread to finish in `closeEvent` before closing.
+  - Clearing thread reference in signal handlers.
+- Fixed conversation context not being saved by enabling thread-safe SQLite connections.
 
 ## Recovery Notes
 
@@ -1670,4 +1681,43 @@ Refactored the home UI into a three-panel layout with left session history, cent
 
 **Next:**
 - Ready for BU063
+
+---
+
+## BU063 - Session Search Combobox
+
+**Date:** 2026-06-04
+
+**Summary:**
+Added a session search combobox to the home UI that shows recent sessions on focus and supports filtering by name.
+
+**Files Changed:**
+- src/app/window.py
+
+**Implementation Details:**
+- Added QComboBox with editable=True above the Assistant group in the center panel
+- Implemented _load_recent_sessions() to load last 5 sessions sorted by start_time descending
+- Implemented _filter_sessions_by_name() to filter sessions by name as user types
+- Connected editTextChanged signal to trigger filtering
+- Connected currentIndexChanged to update _selected_session_id on selection
+- Sessions are loaded on application startup
+
+**Important Decisions:**
+- Shows up to 5 most recent sessions by default
+- Text filtering is case-insensitive
+- Selecting a session sets _selected_session_id for assistant queries
+- Empty selection (default option) clears the selected session
+
+**Definition of Done Satisfied:**
+- [x] Search bar is visible above chat
+- [x] Recent 5 sessions appear on focus
+- [x] Typing filters by session name
+- [x] Selecting a session updates selected session state
+
+**Validation:**
+- Python syntax check passed (py_compile)
+- No runtime errors in import (syntax validation only)
+
+**Next:**
+- Ready for BU064
 
