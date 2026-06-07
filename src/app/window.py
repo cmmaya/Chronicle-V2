@@ -187,6 +187,9 @@ class MainWindow(QMainWindow):
         self._vad_threshold = 30  # Default 30%
         self._vad_aggressiveness = 2  # Default mode 2
         
+        # Flag to track if we're viewing historical transcripts (not live)
+        self._viewing_historical_transcripts = False
+        
         # Transcription view components (for chat-like display)
         self._transcription_scroll_area = None
         self._transcription_container = None
@@ -224,6 +227,46 @@ class MainWindow(QMainWindow):
                     self._edit_screenshot_description(obj, filepath, session_id)
                     return True
         return super().eventFilter(obj, event)
+    
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key_Escape:
+            # Clear scope when ESC is pressed
+            self._clear_scope()
+        else:
+            super().keyPressEvent(event)
+    
+    def _clear_scope(self):
+        """Clear the current scope and reset to default state."""
+        # Clear selected session
+        self._selected_session_id = None
+        
+        # Clear transcriptions view
+        self._clear_transcription_view()
+        
+        # Close detached window if exists
+        if hasattr(self, '_detached_window') and self._detached_window:
+            self._on_close_detached_window()
+        
+        # Check if there's an active session and set scope to it
+        if self.session_manager:
+            active_session = self.session_manager.get_active_session()
+            if active_session:
+                self._selected_session_id = active_session.id
+                # Load all transcripts from the active session (not just recent ones)
+                # Allow live transcriptions to be shown alongside
+                self._load_transcripts_for_session(active_session.id, allow_live=True)
+                self._on_status_update(f"Scope set to active session: {active_session.name}")
+            else:
+                self._on_status_update("Scope cleared - no active session")
+        
+        # Update the scope label
+        self._update_scope_label()
+        
+        # Reset scope combo to "Any Session" (index 1)
+        self.scope_combo.setCurrentIndex(1)
+        
+        logger.info("Scope cleared via ESC key")
 
     def _edit_screenshot_description(self, label, filepath, session_id):
         """Edit screenshot description with a dialog."""
@@ -1295,6 +1338,22 @@ Keywords: {keywords_str}"""
                     else:
                         logger.warning(f"Screenshot file not found: {filepath}")
 
+                    # Delete description file if it exists
+                    # Format: description_{filename_without_extension}.txt
+                    directory = os.path.dirname(filepath)
+                    filename = os.path.basename(filepath)
+                    if filename.lower().endswith('.png'):
+                        desc_filename = 'description_' + filename[:-4] + '.txt'
+                    elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+                        desc_filename = 'description_' + filename[:-4] + '.txt'
+                    else:
+                        desc_filename = 'description_' + os.path.splitext(filename)[0] + '.txt'
+                    
+                    desc_filepath = os.path.join(directory, desc_filename)
+                    if os.path.exists(desc_filepath):
+                        os.remove(desc_filepath)
+                        logger.info(f"Deleted description file: {desc_filepath}")
+
                     self._on_status_update(f"Screenshot deleted")
 
                     # Close the dialog and refresh
@@ -1962,6 +2021,22 @@ Keywords: {keywords_str}"""
                     else:
                         logger.warning(f"Screenshot file not found: {filepath}")
 
+                    # Delete description file if it exists
+                    # Format: description_{filename_without_extension}.txt
+                    directory = os.path.dirname(filepath)
+                    filename = os.path.basename(filepath)
+                    if filename.lower().endswith('.png'):
+                        desc_filename = 'description_' + filename[:-4] + '.txt'
+                    elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+                        desc_filename = 'description_' + filename[:-4] + '.txt'
+                    else:
+                        desc_filename = 'description_' + os.path.splitext(filename)[0] + '.txt'
+                    
+                    desc_filepath = os.path.join(directory, desc_filename)
+                    if os.path.exists(desc_filepath):
+                        os.remove(desc_filepath)
+                        logger.info(f"Deleted description file: {desc_filepath}")
+
                     self._on_status_update(f"Screenshot deleted")
 
                     # Close the dialog and refresh
@@ -2236,6 +2311,7 @@ Keywords: {keywords_str}"""
         self.scope_combo.addItem("Any Session", "any")
         # Set default to "Any Session"
         self.scope_combo.setCurrentIndex(1)
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
         scope_layout.addWidget(self.scope_combo)
         scope_layout.addStretch()
         assistant_layout.addLayout(scope_layout)
@@ -2504,6 +2580,9 @@ Keywords: {keywords_str}"""
         """Clear all transcriptions from the view."""
         # Clear history
         self._transcription_history = []
+        
+        # Reset viewing flag - go back to live mode
+        self._viewing_historical_transcripts = False
         
         if hasattr(self, '_transcription_layout') and self._transcription_layout:
             # Remove all widgets except the stretch (last item)
@@ -2806,6 +2885,136 @@ Keywords: {keywords_str}"""
                     else:
                         bubble_frame.hide()
 
+    def _on_scope_changed(self, index: int):
+        """Handle scope selection change to load session transcripts.
+        
+        Args:
+            index: The index of the selected scope option
+        """
+        scope_value = self.scope_combo.currentData()
+        logger.info(f"Scope changed to: {scope_value}, selected_session_id: {self._selected_session_id}")
+        
+        # Clear current transcriptions when scope changes
+        self._clear_transcription_view()
+        
+        # Also clear the detached window if it exists
+        if hasattr(self, '_detached_window') and self._detached_window:
+            self._on_close_detached_window()
+        
+        if scope_value == 'current':
+            # Load transcripts from the current/active session
+            # Allow live transcriptions to be shown (use allow_live=True)
+            self._load_session_transcripts_for_current_session(allow_live=True)
+        elif scope_value == 'any':
+            # When scope is "Any Session", check if a specific session is selected
+            if self._selected_session_id is not None:
+                self._load_transcripts_for_session(self._selected_session_id)
+            # Otherwise, keep it empty (waiting for session selection)
+        
+        # Update the scope label
+        self._update_scope_label()
+    
+    def _load_session_transcripts_for_current_session(self, allow_live: bool = False):
+        """Load transcripts from the current/active session.
+        
+        Args:
+            allow_live: If True, allow live transcriptions to be shown
+        """
+        try:
+            # Use selected session from UI first, then fall back to active session
+            session_id = None
+            
+            if self._selected_session_id is not None:
+                # Use the selected session from UI
+                session_id = self._selected_session_id
+            elif self.session_manager:
+                # Fall back to active session (if recording)
+                active_session = self.session_manager.get_active_session()
+                if active_session:
+                    session_id = active_session.id
+            
+            if session_id is not None:
+                self._load_transcripts_for_session(session_id, allow_live=allow_live)
+                logger.info(f"Loaded transcripts for current session: {session_id}")
+            else:
+                self._on_status_update("No session selected or active")
+        except Exception as e:
+            logger.error(f"Failed to load transcripts for current session: {e}")
+    
+    def _load_transcripts_for_session(self, session_id: int, allow_live: bool = False):
+        """Load and display transcripts for a specific session.
+        
+        Args:
+            session_id: The session ID to load transcripts for
+            allow_live: If True, allow live transcriptions to be shown alongside historical ones
+        """
+        try:
+            logger.info(f"Loading transcripts for session {session_id}")
+            
+            # Set flag to indicate we're viewing historical transcripts (unless allow_live is True)
+            self._viewing_historical_transcripts = not allow_live
+            
+            # Get transcripts from database
+            transcripts = self.session_manager.db.get_transcripts(session_id)
+            
+            if not transcripts:
+                logger.info(f"No transcripts found for session {session_id}")
+                self._on_status_update(f"No transcripts found for session {session_id}")
+                return
+            
+            logger.info(f"Found {len(transcripts)} transcripts for session {session_id}")
+            
+            # Sort transcripts by timestamp
+            sorted_transcripts = sorted(transcripts, key=lambda t: t.get('timestamp', 0))
+            
+            # Add each transcript to the view
+            for transcript in sorted_transcripts:
+                text = transcript.get('text', '')
+                source = transcript.get('source', 'microphone')
+                timestamp = transcript.get('timestamp', 0)
+                
+                if not text:
+                    continue
+                
+                # Normalize source: 'microphone' -> 'mic', otherwise keep as-is
+                if source == 'microphone':
+                    source = 'mic'
+                # Also handle case where source might be stored as 'mic' already
+                elif source == 'mic':
+                    pass  # Already normalized
+                # Otherwise keep as-is (e.g., 'system')
+                
+                # Format timestamp
+                time_str = ''
+                if timestamp:
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromtimestamp(timestamp)
+                        time_str = dt.strftime('%H:%M:%S')
+                    except:
+                        time_str = str(timestamp)
+                
+                # Format display text
+                source_label = 'Mic' if source == 'mic' else 'System'
+                display_text = f"[{time_str}] {source_label}: {text}" if time_str else f"{source_label}: {text}"
+                
+                # Store in history
+                self._transcription_history.append(display_text)
+                
+                # Add to view (using the add_transcription_to_view method)
+                self.add_transcription_to_view(text, source, time_str)
+                
+                # Also add to detached window if it exists
+                if hasattr(self, '_detached_window') and self._detached_window:
+                    self._add_transcription_to_detached(display_text)
+            
+            logger.info(f"Loaded {len(sorted_transcripts)} transcripts for session {session_id}")
+            self._on_status_update(f"Loaded {len(sorted_transcripts)} transcripts")
+            
+        except Exception as e:
+            logger.error(f"Failed to load transcripts for session {session_id}: {e}")
+            self._on_status_update(f"Error loading transcripts: {str(e)}", is_error=True)
+
     def _on_status_update(self, message: str, is_error: bool = False):
         """Handle status updates from the session manager."""
         print(f"[DEBUG] Status update: {message}")
@@ -2825,6 +3034,10 @@ Keywords: {keywords_str}"""
         
         Thread-safe: Uses QTimer.singleShot to update UI from any thread.
         """
+        # Skip if we're viewing historical transcripts (not live)
+        if self._viewing_historical_transcripts:
+            return
+        
         try:
             text = result.get('text', '')
             source = result.get('source', 'unknown')
@@ -3724,7 +3937,6 @@ Keywords: {keywords_str}"""
         
         # Get scope from combo
         scope_value = self.scope_combo.currentData()  # "current" or "any"
-        explicit_scope = "current_session" if scope_value == "current" else "any_session"
         
         # Get active session ID if there's an active session
         active_session = self.session_manager.get_active_session()
@@ -3739,6 +3951,22 @@ Keywords: {keywords_str}"""
             conv = self.session_manager.db.get_conversation(self._current_conversation_id)
             if conv:
                 selected_session_id = conv.get('session_id')
+        
+        # Determine explicit_scope based on scope combo
+        # When "current", use selected session if available, otherwise active session
+        # When "any", use any_session to search all sessions
+        if scope_value == "current":
+            # Use selected session (from UI) if available, otherwise active session
+            if selected_session_id is not None:
+                explicit_scope = "current_session"
+                active_session_id = selected_session_id  # Override: use selected session
+            elif active_session_id is not None:
+                explicit_scope = "current_session"
+                # active_session_id already has the active session
+            else:
+                explicit_scope = "current_session"  # Will cause clarification
+        else:
+            explicit_scope = "any_session"
         
         # Disable the Ask button while processing
         self.ask_button.setEnabled(False)
@@ -3988,6 +4216,11 @@ Keywords: {keywords_str}"""
         if session_id is not None:
             self._selected_session_id = session_id
             self._update_scope_label()
+            # Clear previous transcripts and load new ones
+            self._clear_transcription_view()
+            if hasattr(self, '_detached_window') and self._detached_window:
+                self._on_close_detached_window()
+            self._load_transcripts_for_session(session_id)
             logger.info(f"Selected session for assistant: {session_id}")
     
     def _show_all_sessions_window(self):
@@ -4114,6 +4347,13 @@ Keywords: {keywords_str}"""
                 if session_id is not None:
                     self._selected_session_id = session_id
                     self._update_scope_label()
+                    # Clear previous transcripts and load new ones
+                    self._clear_transcription_view()
+                    if hasattr(self, '_detached_window') and self._detached_window:
+                        self._on_close_detached_window()
+                    self._load_transcripts_for_session(session_id)
+                    # Process events to ensure UI updates before closing dialog
+                    QApplication.processEvents()
                     logger.info(f"Selected session from All Sessions window: {session_id}")
                     dialog.close()
         
@@ -4262,6 +4502,11 @@ Keywords: {keywords_str}"""
         if session_id is not None:
             self._selected_session_id = session_id
             self._update_scope_label()
+            # Clear previous transcripts and load new ones
+            self._clear_transcription_view()
+            if hasattr(self, '_detached_window') and self._detached_window:
+                self._on_close_detached_window()
+            self._load_transcripts_for_session(session_id)
             logger.info(f"Selected session for assistant: {session_id}")
         else:
             self._selected_session_id = None
@@ -4329,6 +4574,11 @@ Keywords: {keywords_str}"""
             if session_id is not None:
                 self._selected_session_id = session_id
                 self._update_scope_label()
+                # Clear previous transcripts and load new ones
+                self._clear_transcription_view()
+                if hasattr(self, '_detached_window') and self._detached_window:
+                    self._on_close_detached_window()
+                self._load_transcripts_for_session(session_id)
                 # Also update the input text
                 self.session_search_input.setText(item.text())
                 logger.info(f"Selected session for assistant: {session_id}")
