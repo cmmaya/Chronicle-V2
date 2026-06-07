@@ -39,3 +39,17 @@
 | BU068 | Screenshot Icon Wiring                  | Pending   | BU066, BU067        | BU069 |
 | BU069 | Viewer Icon Wiring                      | Pending   | BU066, BU067        | BU070 |
 | BU070 | Ongoing Session Split View              | Pending   | BU062               | none  |
+| BU071 | Create RAG Metadata Schema              | Pending   | none                |
+| BU072 | Add RAG Source Upsert Helpers           | Pending   | BU071               |
+| BU073 | Add RAG FTS Rebuild                     | Pending   | BU072               |
+| BU074 | Add Unified FTS Search                  | Pending   | BU073               |
+| BU075 | Expose Unified Search Tool              | Pending   | BU074               |
+| BU076 | Create RAG Result Models                | Pending   | BU075               |
+| BU077 | Add Current Session FTS Retrieval       | Pending   | BU076               |
+| BU078 | Replace Current Session Context Path    | Pending   | BU077               |
+| BU079 | Add Any Session Context Builder         | Pending   | BU075               |
+| BU080 | Wire Any Session Service Retrieval      | Pending   | BU079               |
+| BU081 | Improve Session Resolver Search Terms   | Pending   | BU074               |
+| BU082 | Tighten Chronicle Assistant Prompt      | Pending   | BU080               |
+| BU083 | Add Retrieval Tests                     | Pending   | BU080               |
+| BU084 | Add Local Embedding Schema Placeholder  | Pending   | BU083               |
