@@ -4080,10 +4080,9 @@ Keywords: {keywords_str}"""
     def _get_selected_session_id(self) -> Optional[int]:
         """Get the currently selected session ID from the sessions table.
         
-        Returns None since sessions are no longer shown in a table.
-        Session can still be inferred from the selected conversation.
+        Returns the _selected_session_id if set, None otherwise.
         """
-        return None
+        return self._selected_session_id
     
     def _load_recent_sessions(self, limit: int = 5):
         """Load the most recent sessions for the search dropdown.
@@ -5064,6 +5063,22 @@ Keywords: {keywords_str}"""
             conv = self.session_manager.db.get_conversation(self._current_conversation_id)
             if conv:
                 selected_session_id = conv.get('session_id')
+        
+        # Determine explicit_scope based on scope combo
+        # When "current", use selected session if available, otherwise active session
+        # When "any", use any_session to search all sessions
+        if scope_value == "current":
+            # Use selected session (from UI) if available, otherwise active session
+            if selected_session_id is not None:
+                explicit_scope = "current_session"
+                active_session_id = selected_session_id  # Override: use selected session
+            elif active_session_id is not None:
+                explicit_scope = "current_session"
+                # active_session_id already has the active session
+            else:
+                explicit_scope = "current_session"  # Will cause clarification
+        else:
+            explicit_scope = "any_session"
         
         # Disable the Ask button while processing
         self._detached_ask_button.setEnabled(False)

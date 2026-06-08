@@ -80,9 +80,9 @@ class AssistantAnswerService:
 
         Returns:
             AnswerResponse with either:
-            - success=True and answer text
-            - needs_clarification=True with clarification_question for ambiguous cases
-            - error message on failure
+                - success=True with answer on success
+                - needs_clarification=True with clarification_question for ambiguous cases
+                - success=False with error message on failure
         """
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
@@ -91,6 +91,15 @@ class AssistantAnswerService:
             selected_session_id=selected_session_id,
             explicit_scope=explicit_scope,
         )
+
+        # Step 2: Handle ambiguous cases - return clarification without calling OpenRouter
+        if resolution.scope == ScopeResolution.NEEDS_CLARIFICATION:
+            return AnswerResponse(
+                success=False,
+                needs_clarification=True,
+                clarification_question="Please set the scope to a specific session.",
+                error="No session could be inferred from the question or context.",
+            )
 
         # Step 2: Handle ambiguous cases - return clarification without calling OpenRouter
         if resolution.scope == ScopeResolution.NEEDS_CLARIFICATION:
@@ -209,9 +218,9 @@ class AssistantAnswerService:
 
         Returns:
             AnswerResponse with either:
-            - success=True and answer text
-            - needs_clarification=True with clarification_question for ambiguous cases
-            - error message on failure
+                - success=True with answer on success
+                - needs_clarification=True with clarification_question for ambiguous cases
+                - success=False with error message on failure
         """
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
@@ -220,6 +229,15 @@ class AssistantAnswerService:
             selected_session_id=selected_session_id,
             explicit_scope=explicit_scope,
         )
+
+        # Step 2: Handle ambiguous cases - return clarification without calling OpenRouter
+        if resolution.scope == ScopeResolution.NEEDS_CLARIFICATION:
+            return AnswerResponse(
+                success=False,
+                needs_clarification=True,
+                clarification_question="Please set the scope to a specific session.",
+                error="No session could be inferred from the question or context.",
+            )
 
         # Step 2: Handle ambiguous cases - return clarification without calling OpenRouter
         if resolution.scope == ScopeResolution.NEEDS_CLARIFICATION:

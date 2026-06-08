@@ -601,3 +601,60 @@ Recovery Notes:
 Next:
 
 - none
+
+## BU085 - Implement RAG Content Indexing
+
+Summary:
+Created RAG indexer module to populate RAG tables with session transcripts and summaries. Wired session_manager and window to call indexer after transcription/summarization complete.
+
+Files Changed:
+
+- src/rag/__init__.py (new file)
+- src/rag/indexer.py (new file)
+- src/app/session_manager.py (wired indexer calls)
+- src/app/window.py (wired indexer after manual summary)
+- src/storage/database.py (fixed upsert_rag_document to return correct ID)
+- tests/test_rag_indexer.py (new file)
+
+Implementation:
+
+- Created src/rag/indexer.py with index_session_content() function
+  - Fetches transcripts and summaries from database
+  - Upserts RAG documents for each content type
+  - Chunks content using _chunk_text() helper
+  - Stores chunks via replace_rag_chunks()
+  - Calls rebuild_rag_fts() to make content searchable
+- Wired SessionManager.stop_session() to call indexer after transcription
+- Wired SessionManager.process_transcriptions() to call indexer
+- Wired window._run_summarization() to call indexer after manual summary
+- Fixed database.upsert_rag_document() to return correct document ID for both insert and update
+- Added transcription status update even when auto_transcribe=False (for live transcription)
+
+Definition of Done Satisfied:
+
+- [x] src/rag/indexer.py created with session indexing logic
+- [x] SessionManager calls indexer after transcription and summarization
+- [x] rebuild_rag_fts() is called after content is indexed
+- [x] New tests for indexer pass (15 tests)
+- [x] current_state.md updated
+- [x] devlog.md appended
+
+Validation:
+
+- All 15 tests pass
+- Module imports without errors
+- Database bug fix verified (upsert returns correct ID on update)
+
+Important Decisions:
+
+- Indexing runs after transcription/summarization completes, not during live recording
+- Uses existing database connection (not thread-safe for concurrent access)
+- Content hashed for deduplication
+
+Recovery Notes:
+
+- Clear chronicle.db and sessions/ to start fresh with RAG indexing
+
+Next:
+
+- BU086 - (Optional) Add UI element to trigger re-indexing for a session
