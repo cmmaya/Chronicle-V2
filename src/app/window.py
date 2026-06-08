@@ -642,6 +642,15 @@ class MainWindow(QMainWindow):
             # Update summary status in database
             self.session_manager.db.update_session(session_id, summary_status='summarized')
             
+            # Index the session content for RAG search (will include the new summary)
+            try:
+                from src.rag.indexer import index_session_content
+                index_session_content(self.session_manager.db, session_id)
+                self._on_status_update('RAG indexing completed')
+            except Exception as e:
+                logger.error(f"RAG indexing failed: {str(e)}")
+                self._on_status_update(f"RAG indexing failed: {str(e)}", is_error=True)
+            
             self._on_status_update('Summary generated successfully')
             
             # Update summary icon state to reflect the new summary

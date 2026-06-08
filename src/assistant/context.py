@@ -10,6 +10,7 @@ from .context_models import (
     ScreenshotReference,
     ConversationTurn,
 )
+from .rag_models import RetrievedChunk, SourceType
 
 
 class DatabaseProtocol(Protocol):
@@ -20,6 +21,8 @@ class DatabaseProtocol(Protocol):
     def get_screenshots(self, session_id: int) -> List[dict[str, Any]]: ...
     def get_transcripts(self, session_id: int) -> List[dict[str, Any]]: ...
     def get_messages(self, conversation_id: int) -> List[dict[str, Any]]: ...
+    def search_rag_fts(self, query: str, limit: int = 20,
+                      session_id: Optional[int] = None) -> List[dict[str, Any]]: ...
 
 
 # Default limits for context building
@@ -81,8 +84,10 @@ class AssistantContextRetriever:
         # Get summaries
         summaries = self._get_summaries(session_id, session_name)
 
-        # Get transcripts
-        transcripts = self._get_transcripts(session_id, session_name, question)
+        # Get transcripts - try RAG first, then fallback to legacy
+        transcripts = self._get_transcripts_rag_first(
+            session_id, session_name, question
+        )
 
         # Get screenshots near relevant transcript timestamps
         screenshots = self._get_screenshots_near_transcripts(
@@ -216,6 +221,83 @@ class AssistantContextRetriever:
 
         return excerpts
 
+    def _convert_rag_transcripts(
+        self,
+        session_id: int,
+        session_name: str,
+        chunks: List[RetrievedChunk],
+    ) -> List[TranscriptExcerpt]:
+        """Convert RAG transcript chunks to TranscriptExcerpt objects.
+
+        Args:
+            session_id: ID of the session.
+            session_name: Name of the session for context.
+            chunks: List of RAG chunks with transcript source type.
+
+        Returns:
+            List of TranscriptExcerpt objects.
+        """
+        excerpts = []
+        for chunk in chunks:
+            # Only convert transcript source chunks
+            if chunk.source_type != SourceType.TRANSCRIPT:
+                continue
+
+            text = chunk.content
+            # Truncate long transcripts
+            if len(text) > MAX_TRANSCRIPT_LENGTH:
+                text = text[:MAX_TRANSCRIPT_LENGTH] + "..."
+
+            # Determine source from title or default to microphone
+            source = "microphone"
+            if chunk.title:
+                if "system" in chunk.title.lower():
+                    source = "system"
+
+            excerpts.append(TranscriptExcerpt(
+                session_id=session_id,
+                session_name=session_name,
+                timestamp=chunk.timestamp,
+                source=source,
+                text=text,
+            ))
+
+        return excerpts
+
+    def _get_transcripts_rag_first(
+        self,
+        session_id: int,
+        session_name: str,
+        question: str,
+    ) -> List[TranscriptExcerpt]:
+        """Get transcripts using RAG first, then fallback to legacy keyword matching.
+
+        Args:
+            session_id: ID of the session.
+            session_name: Name of the session for context.
+            question: User question for relevance filtering.
+
+        Returns:
+            List of TranscriptExcerpt objects.
+        """
+        # Try RAG retrieval first
+        rag_chunks = self._get_rag_chunks(session_id, question, limit=DEFAULT_TRANSCRIPT_LIMIT)
+
+        # Filter to transcript source chunks
+        transcript_chunks = [
+            c for c in rag_chunks
+            if c.source_type == SourceType.TRANSCRIPT
+        ]
+
+        if transcript_chunks:
+            # Use RAG transcript chunks
+            return self._convert_rag_transcripts(
+                session_id, session_name, transcript_chunks
+            )
+
+        # Fallback to legacy keyword matching
+        return self._get_transcripts(session_id, session_name, question)
+
     def _extract_keywords(self, text: str) -> List[str]:
         """Extract keywords from text for matching.
 
@@ -321,3 +403,57 @@ class AssistantContextRetriever:
                 turns.append(ConversationTurn(role=role, content=content))
 
         return turns
+
+    def _get_rag_chunks(
+        self,
+        session_id: int,
+        question: str,
+        limit: int = 12,
+    ) -> List[RetrievedChunk]:
+        """Retrieve relevant RAG chunks for a specific session.
+
+        Uses FTS search to find relevant content within a session.
+
+        Args:
+            session_id: ID of the session to search within.
+            question: User question for FTS search.
+            limit: Maximum number of chunks to return (default 12).
+
+        Returns:
+            List of RetrievedChunk dictionaries matching rag_models fields.
+        """
+        try:
+            rows = self._db.search_rag_fts(question, limit=limit, session_id=session_id)
+        except Exception:
+            return []
+
+        if not rows:
+            return []
+
+        chunks = []
+        for row in rows:
+            # Convert source_type string to SourceType enum
+            source_type_str = row.get("source_type", "transcript")
+            try:
+                source_type = SourceType(source_type_str)
+            except ValueError:
+                source_type = SourceType.TRANSCRIPT
+
+            # Convert rank to score (BM25: lower rank = more relevant)
+            # Invert: higher score = more relevant
+            rank = row.get("rank", 0)
+            score = -rank if rank else 1.0
+
+            chunks.append(RetrievedChunk(
+                chunk_id=row.get("chunk_id", 0),
+                document_id=row.get("document_id", 0),
+                source_type=source_type,
+                source_id=row.get("source_id", 0),
+                session_id=row.get("session_id", session_id),
+                timestamp=row.get("timestamp", 0),
+                title=row.get("title"),
+                content=row.get("content", ""),
+                score=score,
+            ))
+
+        return chunks

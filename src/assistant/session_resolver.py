@@ -195,6 +195,8 @@ class AssistantSessionResolver:
         Search for relevant sessions based on question keywords.
         
         Uses database find_sessions method if available.
+        Tries full joined phrase first, then individual terms.
+        Deduplicates results by session_id while preserving order.
         """
         if self._db is None:
             return []
@@ -206,21 +208,49 @@ class AssistantSessionResolver:
             return []
 
         try:
-            # Use first significant term for search
-            results = self._db.find_sessions(search_terms[0], limit=5)
-            
-            # Convert to SessionCandidate objects
             from .context_models import SessionCandidate
             
-            candidates = []
-            for row in results:
-                candidates.append(SessionCandidate(
-                    session_id=row["id"],
-                    session_name=row["name"],
-                    start_timestamp=row["start_time"],
-                    relevance_score=1.0,  # Default score since find_sessions doesn't return score
-                ))
-            
+            # Track seen session_ids for deduplication
+            seen_ids: set = set()
+            candidates: List[SessionCandidate] = []
+
+            # Strategy 1: Try full joined phrase first if at least 2 terms
+            if len(search_terms) >= 2:
+                full_phrase = " ".join(search_terms[:3])  # Up to 3 terms joined
+                try:
+                    results = self._db.find_sessions(full_phrase, limit=5)
+                    for row in results:
+                        if row["id"] not in seen_ids:
+                            seen_ids.add(row["id"])
+                            candidates.append(SessionCandidate(
+                                session_id=row["id"],
+                                session_name=row["name"],
+                                start_timestamp=row["start_time"],
+                                relevance_score=1.0,
+                            ))
+                except Exception:
+                    pass  # Fall through to individual terms
+
+            # Strategy 2: Try individual terms until we have candidates
+            for term in search_terms:
+                if len(candidates) >= 5:
+                    break
+                try:
+                    results = self._db.find_sessions(term, limit=5)
+                    for row in results:
+                        if row["id"] not in seen_ids:
+                            seen_ids.add(row["id"])
+                            candidates.append(SessionCandidate(
+                                session_id=row["id"],
+                                session_name=row["name"],
+                                start_timestamp=row["start_time"],
+                                relevance_score=1.0,
+                            ))
+                            if len(candidates) >= 5:
+                                break
+                except Exception:
+                    pass  # Continue to next term
+
             return candidates
             
         except Exception:

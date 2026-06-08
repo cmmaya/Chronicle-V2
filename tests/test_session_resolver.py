@@ -296,6 +296,95 @@ class TestAssistantSessionResolver(unittest.TestCase):
         self.assertEqual(result1.scope, result2.scope)
         self.assertEqual(result1.session_ids, result2.session_ids)
 
+    def test_multi_term_search_first_tries_full_phrase(self):
+        """Test multi-term question first searches joined phrase."""
+        mock_db = MagicMock()
+        # Full phrase search returns results
+        mock_db.find_sessions.side_effect = [
+            [{"id": 10, "name": "Project Alpha Meeting", "start_time": 1234567890}],  # Full phrase
+            [{"id": 1, "name": "Project", "start_time": 1234567891}],  # Individual term "project"
+            [{"id": 2, "name": "Alpha", "start_time": 1234567892}],  # Individual term "alpha"
+        ]
+        
+        resolver = AssistantSessionResolver(db=mock_db)
+        
+        result = resolver.resolve(
+            question="Project Alpha Meeting",
+            active_session_id=None,
+            selected_session_id=None,
+            explicit_scope=None,
+        )
+        
+        # First call should be full phrase
+        self.assertEqual(mock_db.find_sessions.call_args_list[0][0][0], "project alpha meeting")
+        self.assertEqual(result.candidates[0].session_id, 10)
+
+    def test_multi_term_falls_back_to_individual_terms(self):
+        """Test falls back to individual terms when full phrase returns empty."""
+        mock_db = MagicMock()
+        # Full phrase returns empty, individual terms return results
+        mock_db.find_sessions.side_effect = [
+            [],  # Full phrase returns empty
+            [{"id": 1, "name": "Project Meeting", "start_time": 1234567891}],
+            [{"id": 2, "name": "Alpha Meeting", "start_time": 1234567892}],
+            [{"id": 3, "name": "Meeting", "start_time": 1234567893}],
+        ]
+        
+        resolver = AssistantSessionResolver(db=mock_db)
+        
+        result = resolver.resolve(
+            question="Project Alpha Meeting",
+            active_session_id=None,
+            selected_session_id=None,
+            explicit_scope=None,
+        )
+        
+        # First call should be full phrase, then individual terms
+        self.assertEqual(mock_db.find_sessions.call_args_list[0][0][0], "project alpha meeting")
+        # Should have at least tried individual terms after empty full phrase
+        self.assertGreaterEqual(len(mock_db.find_sessions.call_args_list), 2)
+        self.assertGreater(len(result.candidates), 0)
+
+    def test_deduplication_by_session_id(self):
+        """Test candidates are deduplicated by session_id."""
+        mock_db = MagicMock()
+        # Different searches return same session with different IDs (shouldn't happen but testing)
+        mock_db.find_sessions.side_effect = [
+            [{"id": 1, "name": "Team Meeting", "start_time": 1234567890}],
+            [{"id": 1, "name": "Team Meeting", "start_time": 1234567890}],
+            [{"id": 2, "name": "Standup", "start_time": 1234567891}],
+        ]
+        
+        resolver = AssistantSessionResolver(db=mock_db)
+        
+        result = resolver.resolve(
+            question="Team Meeting Standup",
+            active_session_id=None,
+            selected_session_id=None,
+            explicit_scope=None,
+        )
+        
+        # Should only have unique session IDs
+        session_ids = [c.session_id for c in result.candidates]
+        self.assertEqual(len(session_ids), len(set(session_ids)))
+
+    def test_db_exception_is_contained(self):
+        """Test database exception is handled gracefully."""
+        mock_db = MagicMock()
+        mock_db.find_sessions.side_effect = Exception("Database error")
+        
+        resolver = AssistantSessionResolver(db=mock_db)
+        
+        result = resolver.resolve(
+            question="Team Meeting",
+            active_session_id=None,
+            selected_session_id=None,
+            explicit_scope=None,
+        )
+        
+        # Should fall back to needs_clarification without crashing
+        self.assertEqual(result.scope, ScopeResolution.NEEDS_CLARIFICATION)
+
 
 if __name__ == "__main__":
     unittest.main()

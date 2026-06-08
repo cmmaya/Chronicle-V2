@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .openrouter_client import OpenRouterClient
+from .rag_context_builder import build_any_session_context
 from .session_resolver import (
     AssistantSessionResolver,
     ResolutionResult,
@@ -368,7 +369,20 @@ class AssistantAnswerService:
             return f"Context retrieval failed: {str(e)}"
 
     def _get_all_sessions_context(self, question: str) -> str:
-        """Get cross-session context using search tools."""
+        """Get cross-session context using unified search with legacy fallback."""
+        # First, try unified RAG search
+        try:
+            results = self._tools.search_everything(question, limit=30)
+            if results and "error" not in results[0]:
+                return build_any_session_context(question, results)
+        except Exception:
+            pass
+
+        # Fall back to legacy context retrieval
+        return self._get_all_sessions_context_legacy(question)
+
+    def _get_all_sessions_context_legacy(self, question: str) -> str:
+        """Get cross-session context using separate search tools (legacy fallback)."""
         parts = []
 
         # First, always include the list of all sessions

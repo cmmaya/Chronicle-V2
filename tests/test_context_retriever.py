@@ -6,16 +6,18 @@ from src.assistant.context import (
     DEFAULT_KEYWORD_MATCHES,
     MAX_TRANSCRIPT_LENGTH,
 )
+from src.assistant.rag_models import SourceType
 
 
 class MockDatabase:
     """Mock database for testing AssistantContextRetriever."""
 
-    def __init__(self, sessions=None, summaries=None, transcripts=None, screenshots=None):
+    def __init__(self, sessions=None, summaries=None, transcripts=None, screenshots=None, rag_fts_results=None):
         self._sessions = sessions or {}
         self._summaries = summaries or {}
         self._transcripts = transcripts or {}
         self._screenshots = screenshots or {}
+        self._rag_fts_results = rag_fts_results or {}
 
     def get_session(self, session_id: int):
         return self._sessions.get(session_id, {})
@@ -28,6 +30,10 @@ class MockDatabase:
 
     def get_screenshots(self, session_id: int):
         return self._screenshots.get(session_id, [])
+
+    def search_rag_fts(self, query: str, limit: int = 20, session_id: int = None):
+        """Search RAG FTS - returns results for testing."""
+        return self._rag_fts_results.get(session_id, [])
 
 
 class TestAssistantContextRetriever(unittest.TestCase):
@@ -180,24 +186,129 @@ class TestAssistantContextRetriever(unittest.TestCase):
         self.assertIn("project", keywords)
         self.assertIn("roadmap", keywords)
 
-    def test_missing_get_transcripts_raises_error(self):
-        """Test that missing get_transcripts raises clear TODO error."""
-        class BrokenDB:
-            def get_session(self, session_id):
-                return {"name": "Test", "start_time": 1000}
-            def get_summaries(self, session_id):
-                return []
-            def get_screenshots(self, session_id):
-                return []
-            # No get_transcripts method
-
-        db = BrokenDB()
+    def test_rag_transcript_retrieval_when_available(self):
+        """Test that RAG transcript chunks are used when available."""
+        # Mock RAG FTS returning transcript chunks
+        db = MockDatabase(
+            rag_fts_results={
+                1: [
+                    {
+                        "chunk_id": 1,
+                        "document_id": 1,
+                        "source_type": "transcript",
+                        "source_id": 10,
+                        "session_id": 1,
+                        "timestamp": 1000,
+                        "title": "microphone",
+                        "content": "Discussion about project alpha",
+                        "rank": 1.0,
+                    },
+                    {
+                        "chunk_id": 2,
+                        "document_id": 1,
+                        "source_type": "transcript",
+                        "source_id": 11,
+                        "session_id": 1,
+                        "timestamp": 2000,
+                        "title": "system",
+                        "content": "Presentation about beta",
+                        "rank": 2.0,
+                    },
+                ]
+            }
+        )
         retriever = AssistantContextRetriever(db)
 
-        with self.assertRaises(NotImplementedError) as ctx:
-            retriever.build_session_context(1, "test")
+        context = retriever.build_session_context(1, "project alpha")
 
-        self.assertIn("BU039", str(ctx.exception))
+        # Should use RAG chunks, not legacy transcripts
+        self.assertEqual(len(context.transcripts), 2)
+        self.assertEqual(context.transcripts[0].text, "Discussion about project alpha")
+        self.assertEqual(context.transcripts[0].source, "microphone")
+        self.assertEqual(context.transcripts[1].source, "system")
+
+    def test_rag_fallback_to_legacy_when_no_chunks(self):
+        """Test that legacy transcripts are used when no RAG chunks exist."""
+        db = MockDatabase(
+            rag_fts_results={1: []},  # No RAG results
+            transcripts={
+                1: [
+                    {"timestamp": 1000, "source": "microphone", "text": "Legacy transcript content"},
+                ]
+            },
+        )
+        retriever = AssistantContextRetriever(db)
+
+        context = retriever.build_session_context(1, "test question")
+
+        # Should fallback to legacy transcripts
+        self.assertEqual(len(context.transcripts), 1)
+        self.assertEqual(context.transcripts[0].text, "Legacy transcript content")
+
+    def test_rag_ignores_non_transcript_chunks(self):
+        """Test that non-transcript RAG chunks are filtered out."""
+        db = MockDatabase(
+            rag_fts_results={
+                1: [
+                    {
+                        "chunk_id": 1,
+                        "document_id": 1,
+                        "source_type": "summary",  # Not transcript
+                        "source_id": 10,
+                        "session_id": 1,
+                        "timestamp": 1000,
+                        "title": "key_points",
+                        "content": "Key summary content",
+                        "rank": 1.0,
+                    },
+                    {
+                        "chunk_id": 2,
+                        "document_id": 1,
+                        "source_type": "transcript",
+                        "source_id": 11,
+                        "session_id": 1,
+                        "timestamp": 2000,
+                        "title": "microphone",
+                        "content": "Actual transcript",
+                        "rank": 2.0,
+                    },
+                ]
+            }
+        )
+        retriever = AssistantContextRetriever(db)
+
+        context = retriever.build_session_context(1, "test")
+
+        # Should only include transcript, not summary
+        self.assertEqual(len(context.transcripts), 1)
+        self.assertEqual(context.transcripts[0].text, "Actual transcript")
+
+    def test_rag_transcript_truncation(self):
+        """Test that long RAG transcripts are truncated."""
+        long_text = "A" * 1000
+        db = MockDatabase(
+            rag_fts_results={
+                1: [
+                    {
+                        "chunk_id": 1,
+                        "document_id": 1,
+                        "source_type": "transcript",
+                        "source_id": 10,
+                        "session_id": 1,
+                        "timestamp": 1000,
+                        "title": "microphone",
+                        "content": long_text,
+                        "rank": 1.0,
+                    },
+                ]
+            }
+        )
+        retriever = AssistantContextRetriever(db)
+
+        context = retriever.build_session_context(1, "test")
+
+        # Should be truncated
+        self.assertLessEqual(len(context.transcripts[0].text), MAX_TRANSCRIPT_LENGTH + 3)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@ from src.assistant.tools import (
     MAX_SUMMARY_LIMIT,
     DEFAULT_SCREENSHOT_LIMIT,
     MAX_SCREENSHOT_LIMIT,
+    DEFAULT_SEARCH_LIMIT,
+    MAX_SEARCH_LIMIT,
+    ALLOWED_SOURCE_TYPES,
 )
 
 
@@ -41,6 +44,7 @@ class MockDatabase:
         self.find_sessions_calls = []
         self.search_transcripts_calls = []
         self.search_summaries_calls = []
+        self.search_rag_fts_calls = []
 
     def get_session(self, session_id):
         self.get_session_calls.append(session_id)
@@ -69,6 +73,15 @@ class MockDatabase:
     def search_summaries(self, query, limit, session_id=None):
         self.search_summaries_calls.append((query, limit, session_id))
         return self.summaries[:limit]
+
+    def search_rag_fts(self, query, limit, session_id=None, source_types=None):
+        self.search_rag_fts_calls.append((query, limit, session_id, source_types))
+        return [
+            {"chunk_id": 1, "document_id": 1, "source_type": "transcript", "source_id": 1,
+             "session_id": 1, "timestamp": 1000, "title": "Meeting 1", "content": "Hello world", "rank": 1.0},
+            {"chunk_id": 2, "document_id": 2, "source_type": "summary", "source_id": 2,
+             "session_id": 1, "timestamp": 2000, "title": "Summary 1", "content": "Full summary", "rank": 2.0},
+        ][:limit]
 
 
 class TestAssistantRetrievalTools:
@@ -330,3 +343,114 @@ class TestAssistantRetrievalTools:
         assert isinstance(results, list)
         assert len(results) == 1
         assert "error" in results[0]
+
+    # === search_everything tests ===
+
+    def test_search_everything_returns_results(self):
+        """Test that search_everything returns matching results."""
+        results = self.tools.search_everything("hello")
+        
+        assert len(results) > 0
+        assert "content" in results[0]
+        assert "source_type" in results[0]
+
+    def test_search_everything_delegates_to_db(self):
+        """Test that search_everything delegates to database."""
+        self.tools.search_everything("test", limit=5, session_id=1, source_types=["transcript"])
+        
+        assert len(self.db.search_rag_fts_calls) == 1
+        assert self.db.search_rag_fts_calls[0] == ("test", 5, 1, ["transcript"])
+
+    def test_search_everything_empty_query_raises(self):
+        """Test that empty query raises ValueError."""
+        with pytest.raises(ValueError, match="Query cannot be empty"):
+            self.tools.search_everything("")
+
+    def test_search_everything_whitespace_only_query_raises(self):
+        """Test that whitespace-only query raises ValueError."""
+        with pytest.raises(ValueError, match="Query cannot be empty"):
+            self.tools.search_everything("   ")
+
+    def test_search_everything_default_limit(self):
+        """Test that default limit is applied."""
+        self.tools.search_everything("test")
+        
+        call = self.db.search_rag_fts_calls[0]
+        assert call[1] == DEFAULT_SEARCH_LIMIT
+
+    def test_search_everything_limit_capped_at_max(self):
+        """Test that limit is capped at MAX_SEARCH_LIMIT."""
+        self.tools.search_everything("test", limit=999)
+        
+        call = self.db.search_rag_fts_calls[0]
+        assert call[1] == MAX_SEARCH_LIMIT
+
+    def test_search_everything_negative_limit_raises(self):
+        """Test that negative limit raises ValueError."""
+        with pytest.raises(ValueError, match="Limit must be at least 1"):
+            self.tools.search_everything("test", limit=-1)
+
+    def test_search_everything_zero_limit_raises(self):
+        """Test that zero limit raises ValueError."""
+        with pytest.raises(ValueError, match="Limit must be at least 1"):
+            self.tools.search_everything("test", limit=0)
+
+    def test_search_everything_non_integer_limit_raises(self):
+        """Test that non-integer limit raises ValueError."""
+        with pytest.raises(ValueError, match="Limit must be an integer"):
+            self.tools.search_everything("test", limit="5")
+
+    def test_search_everything_invalid_session_id_raises(self):
+        """Test that invalid session_id raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid session_id"):
+            self.tools.search_everything("test", session_id=0)
+
+    def test_search_everything_negative_session_id_raises(self):
+        """Test that negative session_id raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid session_id"):
+            self.tools.search_everything("test", session_id=-1)
+
+    def test_search_everything_with_none_session_id(self):
+        """Test that None session_id is allowed."""
+        results = self.tools.search_everything("test", session_id=None)
+        
+        # Should work without error
+        assert isinstance(results, list)
+
+    def test_search_everything_source_types_must_be_list(self):
+        """Test that source_types must be a list."""
+        with pytest.raises(ValueError, match="source_types must be a list"):
+            self.tools.search_everything("test", source_types="transcript")
+
+    def test_search_everything_invalid_source_type_raises(self):
+        """Test that invalid source_type raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid source_type"):
+            self.tools.search_everything("test", source_types=["invalid_type"])
+
+    def test_search_everything_valid_source_types_allowed(self):
+        """Test that valid source_types are allowed."""
+        for source_type in ALLOWED_SOURCE_TYPES:
+            results = self.tools.search_everything("test", source_types=[source_type])
+            
+            # Should work without error
+            assert isinstance(results, list)
+
+    def test_search_everything_returns_normalized_dict(self):
+        """Test that returned result has expected shape."""
+        results = self.tools.search_everything("hello")
+        
+        assert len(results) > 0
+        r = results[0]
+        assert "chunk_id" in r
+        assert "document_id" in r
+        assert "source_type" in r
+        assert "source_id" in r
+        assert "session_id" in r
+        assert "timestamp" in r
+        assert "title" in r
+        assert "content" in r
+        assert "rank" in r
+
+    def test_search_everything_all_tools_callable(self):
+        """Test that search_everything is callable."""
+        assert callable(self.tools.search_everything)

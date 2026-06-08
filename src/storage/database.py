@@ -154,6 +154,59 @@ class Database:
             ''')
             self.connection.commit()
 
+            # RAG metadata tables
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS rag_documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_type TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    session_id INTEGER,
+                    timestamp INTEGER,
+                    title TEXT,
+                    content_hash TEXT,
+                    metadata_json TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS rag_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id INTEGER NOT NULL,
+                    session_id INTEGER,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    token_count INTEGER,
+                    start_timestamp INTEGER,
+                    end_timestamp INTEGER,
+                    metadata_json TEXT,
+                    embedding_model TEXT,
+                    embedding BLOB,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(document_id) REFERENCES rag_documents(id)
+                )
+            ''')
+
+            # RAG indexes
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_documents_source ON rag_documents(source_type, source_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_documents_session ON rag_documents(session_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_chunks_document ON rag_chunks(document_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_chunks_session ON rag_chunks(session_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_chunks_embedding_model ON rag_chunks(embedding_model)')
+
+            # RAG FTS5 table for full-text search
+            cursor.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS rag_fts USING fts5(
+                    content,
+                    source_type UNINDEXED,
+                    session_id UNINDEXED,
+                    document_id UNINDEXED,
+                    chunk_id UNINDEXED
+                )
+            ''')
+
+            self.connection.commit()
+
         except sqlite3.Error as e:
             raise DatabaseError(f'Schema initialization failed: {str(e)}')
 
@@ -996,3 +1049,236 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'Session search failed: {str(e)}')
+
+    def upsert_rag_document(self, source_type: str, source_id: int, session_id: int,
+                            timestamp: int, title: str, content_hash: str,
+                            metadata_json: str) -> int:
+        """Insert or replace a RAG document by source identity.
+
+        Uses source_type + source_id as the logical identity for upsert.
+        
+        Args:
+            source_type: Type of source (e.g., 'transcript', 'summary', 'screenshot')
+            source_id: ID from the source table
+            session_id: ID of the associated session
+            timestamp: Unix timestamp
+            title: Document title
+            content_hash: Hash of the content for deduplication
+            metadata_json: JSON string with additional metadata
+            
+        Returns:
+            ID of the inserted or updated document
+            
+        Raises:
+            DatabaseError: If the operation fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            now = int(datetime.now().timestamp())
+            
+            # First try to update existing record
+            cursor.execute('''
+                UPDATE rag_documents SET
+                    session_id = ?,
+                    timestamp = ?,
+                    title = ?,
+                    content_hash = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE source_type = ? AND source_id = ?
+            ''', (session_id, timestamp, title, content_hash, metadata_json, now, source_type, source_id))
+            
+            if cursor.rowcount == 0:
+                # No existing record, insert new one
+                cursor.execute('''
+                    INSERT INTO rag_documents (source_type, source_id, session_id, timestamp,
+                                              title, content_hash, metadata_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (source_type, source_id, session_id, timestamp, title, content_hash,
+                     metadata_json, now, now))
+            
+            self.connection.commit()
+            
+            # Get the document ID (works for both insert and update)
+            cursor.execute(
+                'SELECT id FROM rag_documents WHERE source_type = ? AND source_id = ?',
+                (source_type, source_id)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else cursor.lastrowid
+        except sqlite3.Error as e:
+            raise DatabaseError(f'RAG document upsert failed: {str(e)}')
+
+    def replace_rag_chunks(self, document_id: int, chunks: List[Dict[str, Any]]) -> None:
+        """Replace all chunks for a document atomically.
+
+        Deletes all existing chunks for the document and inserts the provided
+        chunks in a single transaction.
+        
+        Args:
+            document_id: ID of the document whose chunks to replace
+            chunks: List of chunk dictionaries with keys:
+                    - content: str
+                    - chunk_index: int
+                    - token_count: int (optional)
+                    - start_timestamp: int (optional)
+                    - end_timestamp: int (optional)
+                    - metadata_json: str (optional)
+                    - session_id: int (optional)
+                    
+        Raises:
+            DatabaseError: If the operation fails
+        """
+        try:
+            cursor = self.connection.cursor()
+            now = int(datetime.now().timestamp())
+            
+            # Get session_id from the document for chunk insertion
+            cursor.execute('SELECT session_id FROM rag_documents WHERE id = ?', (document_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise DatabaseError(f'Document {document_id} not found')
+            default_session_id = row[0]
+            
+            cursor.execute('DELETE FROM rag_chunks WHERE document_id = ?', (document_id,))
+            
+            for chunk in chunks:
+                cursor.execute('''
+                    INSERT INTO rag_chunks (document_id, session_id, chunk_index, content,
+                                          token_count, start_timestamp, end_timestamp,
+                                          metadata_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    document_id,
+                    chunk.get('session_id', default_session_id),
+                    chunk.get('chunk_index', 0),
+                    chunk['content'],
+                    chunk.get('token_count'),
+                    chunk.get('start_timestamp'),
+                    chunk.get('end_timestamp'),
+                    chunk.get('metadata_json'),
+                    now
+                ))
+            
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
+            raise DatabaseError(f'Chunk replacement failed: {str(e)}')
+
+    def rebuild_rag_fts(self) -> None:
+        """Rebuild the RAG FTS index from existing rag_chunks.
+
+        Deletes all existing FTS entries and re-indexes all chunks from rag_chunks
+        joined with rag_documents. This ensures the FTS index stays in sync
+        with the source tables.
+
+        Raises:
+            DatabaseError: If the rebuild fails
+        """
+        try:
+            cursor = self.connection.cursor()
+
+            # Delete all existing FTS entries
+            cursor.execute("DELETE FROM rag_fts")
+
+            # Insert all rag_chunks joined with rag_documents
+            cursor.execute('''
+                INSERT INTO rag_fts (content, source_type, session_id, document_id, chunk_id)
+                SELECT 
+                    rc.content,
+                    rd.source_type,
+                    rc.session_id,
+                    rc.document_id,
+                    rc.id
+                FROM rag_chunks rc
+                JOIN rag_documents rd ON rc.document_id = rd.id
+            ''')
+
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
+            raise DatabaseError(f'FTS rebuild failed: {str(e)}')
+
+    def search_rag_fts(self, query: str, limit: int = 20, session_id: Optional[int] = None,
+                       source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Search the RAG FTS index and return source-aware results.
+
+        Args:
+            query: Search query string (required, non-empty)
+            limit: Maximum number of results (default 20, capped at 50)
+            session_id: Optional session ID to filter results to a specific session
+            source_types: Optional list of source types to filter results
+
+        Returns:
+            List of result dictionaries with keys:
+                - chunk_id: int
+                - document_id: int
+                - source_type: str
+                - source_id: int
+                - session_id: int
+                - timestamp: int
+                - title: str
+                - content: str
+                - rank: float (BM25 rank, lower is better)
+
+        Raises:
+            DatabaseError: If search fails or query is empty
+        """
+        # Validate query
+        if not query or not query.strip():
+            raise DatabaseError('Query cannot be empty')
+
+        # Cap limit
+        limit = min(max(1, limit), 50)
+
+        try:
+            cursor = self.connection.cursor()
+
+            # Build the FTS5 search query with bm25 ranking
+            fts_query = query.strip()
+
+            # Build SQL with optional filters
+            sql_parts = ['''
+                SELECT 
+                    f.chunk_id,
+                    f.document_id,
+                    f.source_type,
+                    rd.source_id,
+                    COALESCE(f.session_id, rd.session_id) as session_id,
+                    rd.timestamp,
+                    rd.title,
+                    f.content,
+                    bm25(rag_fts) as rank
+                FROM rag_fts f
+                JOIN rag_documents rd ON f.document_id = rd.id
+            ''']
+
+            where_clauses = []
+            params = []
+
+            # Add session_id filter if provided
+            if session_id is not None:
+                where_clauses.append('f.session_id = ?')
+                params.append(session_id)
+
+            # Add source_types filter if provided
+            if source_types:
+                placeholders = ','.join('?' * len(source_types))
+                where_clauses.append(f'f.source_type IN ({placeholders})')
+                params.extend(source_types)
+
+            # Add WHERE clause if we have filters
+            if where_clauses:
+                sql_parts.append('WHERE ' + ' AND '.join(where_clauses))
+
+            # Add ORDER BY and LIMIT
+            sql_parts.append('ORDER BY rank')
+            sql_parts.append('LIMIT ?')
+            params.append(limit)
+
+            sql = ' '.join(sql_parts)
+            cursor.execute(sql, params)
+
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'FTS search failed: {str(e)}')

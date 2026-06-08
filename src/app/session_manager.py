@@ -10,6 +10,7 @@ from ..screenshots.capture import ScreenshotCapture
 from ..transcription.processor import TranscriptionProcessor
 from ..transcription.live import LiveTranscriber
 from ..summarization import SummaryGenerator
+from ..rag.indexer import index_session_content
 
 from .session import Session
 from .timeline import Timeline
@@ -376,6 +377,19 @@ class SessionManager:
                 self._update_status('Transcription processing finished.')
             except Exception as e:
                 self._update_status(f'Auto transcription failed: {str(e)}', is_error=True)
+        else:
+            # Even without auto-transcribe, check if live transcription already created transcripts
+            # and update the status accordingly
+            if self.db.get_transcripts(session.id):
+                self.db.update_session(session.id, transcription_status='transcribed')
+                self._update_status(f'Transcription status updated for session {session.id}')
+                
+                # Index the session content for RAG search
+                try:
+                    index_session_content(self.db, session.id)
+                    self._update_status(f'RAG indexing completed for session {session.id}')
+                except Exception as e:
+                    self._update_status(f'RAG indexing failed for session {session.id}: {str(e)}', is_error=True)
         
         # Auto-generate summary if enabled (after transcriptions are processed)
         if SESSION.get('auto_summary_after_stop', False):
@@ -431,6 +445,13 @@ class SessionManager:
         session.db.update_session(session_id, summary_status='summarized')
         
         self._update_status(f'Auto-summary completed for session {session_id}')
+        
+        # Index the session content for RAG search (will include the new summary)
+        try:
+            index_session_content(session.db, session_id)
+            self._update_status(f'RAG indexing completed for session {session_id}')
+        except Exception as e:
+            self._update_status(f'RAG indexing failed for session {session_id}: {str(e)}', is_error=True)
     
     def get_active_session(self) -> Optional[Session]:
         """Get the currently active session.
@@ -562,6 +583,13 @@ class SessionManager:
         if self.db.get_transcripts(session.id):
             self.db.update_session(session.id, transcription_status='transcribed')
             self._update_status(f'Transcription completed for session {session.id}')
+            
+            # Index the session content for RAG search
+            try:
+                index_session_content(self.db, session.id)
+                self._update_status(f'RAG indexing completed for session {session.id}')
+            except Exception as e:
+                self._update_status(f'RAG indexing failed for session {session.id}: {str(e)}', is_error=True)
         
         return result
     

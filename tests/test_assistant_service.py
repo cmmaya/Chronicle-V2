@@ -50,6 +50,39 @@ class MockDatabase:
         """Get mock messages for a conversation."""
         return [m for m in self.messages if m["conversation_id"] == conversation_id]
 
+    def search_rag_fts(self, query, limit=20, session_id=None, source_types=None):
+        """Return mock RAG search results."""
+        return []
+
+    def search_everything(self, query, limit=20, session_id=None, source_types=None):
+        """Return mock unified search results."""
+        return [
+            {
+                "chunk_id": 1,
+                "document_id": 1,
+                "source_type": "transcript",
+                "source_id": 1,
+                "session_id": 1,
+                "session_name": "Meeting 1",
+                "timestamp": 1000,
+                "title": "microphone",
+                "content": "This is a transcript about project status.",
+                "rank": 1.0,
+            },
+            {
+                "chunk_id": 2,
+                "document_id": 2,
+                "source_type": "summary",
+                "source_id": 2,
+                "session_id": 2,
+                "session_name": "Meeting 2",
+                "timestamp": 2000,
+                "title": "full",
+                "content": "Meeting summary about budget.",
+                "rank": 2.0,
+            },
+        ]
+
 
 class MockOpenRouterClient:
     """Mock OpenRouter client for testing."""
@@ -282,3 +315,135 @@ class TestAnswerResponse:
         assert response.needs_clarification is True
         assert len(response.candidates) == 1
         assert response.candidates[0]["session_id"] == 1
+
+
+class TestAllSessionsContext:
+    """Test cases for all-session context retrieval (BU080)."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.mock_client = MockOpenRouterClient()
+        self.service = AssistantAnswerService(
+            db=self.db,
+            openrouter_client=self.mock_client,
+        )
+
+    @patch('src.assistant.service.get_selected_model')
+    @patch('src.assistant.service.OpenRouterClient')
+    def test_all_sessions_uses_unified_search_when_available(self, mock_client_class, mock_get_model):
+        """Test that all-session path uses unified search_everything first."""
+        mock_get_model.return_value = "test-model"
+        mock_client_instance = self.mock_client
+        mock_client_class.return_value = mock_client_instance
+
+        with patch.object(self.service._resolver, 'resolve') as mock_resolve:
+            with patch.object(self.service._tools, 'search_everything') as mock_search_everything:
+                mock_resolve.return_value = ResolutionResult(
+                    scope=ScopeResolution.ALL_SESSIONS,
+                    reason="cross-session intent detected",
+                )
+                mock_search_everything.return_value = [
+                    {
+                        "chunk_id": 1,
+                        "document_id": 1,
+                        "source_type": "transcript",
+                        "source_id": 1,
+                        "session_id": 1,
+                        "session_name": "Meeting 1",
+                        "timestamp": 1000,
+                        "title": "microphone",
+                        "content": "This is a transcript about project status.",
+                        "rank": 1.0,
+                    },
+                ]
+
+                result = self.service.ask("What did we discuss across all sessions?")
+
+                assert result.success is True
+                # Should have called unified search
+                assert mock_search_everything.called
+                # Should NOT call legacy search tools
+                # (we can verify this indirectly since unified search succeeded)
+
+    @patch('src.assistant.service.get_selected_model')
+    @patch('src.assistant.service.OpenRouterClient')
+    def test_all_sessions_falls_back_to_legacy_on_error(self, mock_client_class, mock_get_model):
+        """Test that all-session path falls back to legacy when unified search fails."""
+        mock_get_model.return_value = "test-model"
+        mock_client_instance = self.mock_client
+        mock_client_class.return_value = mock_client_instance
+
+        with patch.object(self.service._resolver, 'resolve') as mock_resolve:
+            with patch.object(self.service._tools, 'search_everything') as mock_search_everything:
+                with patch.object(self.service._tools, 'search_summaries') as mock_search_summaries:
+                    with patch.object(self.service._tools, 'search_transcripts') as mock_search_transcripts:
+                        mock_resolve.return_value = ResolutionResult(
+                            scope=ScopeResolution.ALL_SESSIONS,
+                            reason="cross-session intent detected",
+                        )
+                        # Unified search raises exception
+                        mock_search_everything.side_effect = Exception("Search unavailable")
+                        # Legacy search returns results
+                        mock_search_summaries.return_value = [
+                            {"session_name": "Meeting 1", "content": "Summary 1"},
+                        ]
+                        mock_search_transcripts.return_value = [
+                            {"session_name": "Meeting 1", "text": "Transcript 1", "session_id": 1},
+                        ]
+
+                        result = self.service.ask("What did we discuss across all sessions?")
+
+                        assert result.success is True
+                        # Unified search was called (and failed)
+                        assert mock_search_everything.called
+                        # Legacy fallback was triggered
+                        assert mock_search_summaries.called
+                        assert mock_search_transcripts.called
+
+    @patch('src.assistant.service.get_selected_model')
+    @patch('src.assistant.service.OpenRouterClient')
+    def test_all_sessions_falls_back_to_legacy_on_empty_results(self, mock_client_class, mock_get_model):
+        """Test that all-session path falls back to legacy when unified returns empty."""
+        mock_get_model.return_value = "test-model"
+        mock_client_instance = self.mock_client
+        mock_client_class.return_value = mock_client_instance
+
+        with patch.object(self.service._resolver, 'resolve') as mock_resolve:
+            with patch.object(self.service._tools, 'search_everything') as mock_search_everything:
+                with patch.object(self.service._tools, 'search_summaries') as mock_search_summaries:
+                    with patch.object(self.service._tools, 'search_transcripts') as mock_search_transcripts:
+                        mock_resolve.return_value = ResolutionResult(
+                            scope=ScopeResolution.ALL_SESSIONS,
+                            reason="cross-session intent detected",
+                        )
+                        # Unified search returns empty/error
+                        mock_search_everything.return_value = [{"error": "No results"}]
+                        # Legacy search returns results
+                        mock_search_summaries.return_value = [
+                            {"session_name": "Meeting 1", "content": "Summary 1"},
+                        ]
+                        mock_search_transcripts.return_value = [
+                            {"session_name": "Meeting 1", "text": "Transcript 1", "session_id": 1},
+                        ]
+
+                        result = self.service.ask("What did we discuss across all sessions?")
+
+                        assert result.success is True
+                        # Unified search was called
+                        assert mock_search_everything.called
+                        # Legacy fallback was triggered
+                        assert mock_search_summaries.called
+
+    def test_ask_signature_unchanged(self):
+        """Test that ask() signature is unchanged."""
+        import inspect
+        sig = inspect.signature(self.service.ask)
+        params = list(sig.parameters.keys())
+
+        assert "question" in params
+        assert "agent_id" in params
+        assert "explicit_scope" in params
+        assert "active_session_id" in params
+        assert "selected_session_id" in params
+        assert "conversation_id" in params

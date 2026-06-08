@@ -21,8 +21,13 @@ DEFAULT_SUMMARY_LIMIT = 10
 MAX_SUMMARY_LIMIT = 50
 DEFAULT_SCREENSHOT_LIMIT = 10
 MAX_SCREENSHOT_LIMIT = 50
+DEFAULT_SEARCH_LIMIT = 20
+MAX_SEARCH_LIMIT = 50
 DEFAULT_CONTEXT_TRANSCRIPT_LIMIT = 20
 MAX_TIMESTAMP_DIFF = 60  # seconds
+
+
+ALLOWED_SOURCE_TYPES = frozenset(["transcript", "summary", "screenshot", "assistant_message"])
 
 
 class DatabaseLike(Protocol):
@@ -40,6 +45,9 @@ class DatabaseLike(Protocol):
         self, query: str, limit: int, session_id: Optional[int]
     ) -> List[Dict[str, Any]]: ...
     def list_sessions(self) -> List[Dict[str, Any]]: ...
+    def search_rag_fts(
+        self, query: str, limit: int, session_id: Optional[int], source_types: Optional[List[str]]
+    ) -> List[Dict[str, Any]]: ...
 
 
 class AssistantRetrievalTools:
@@ -418,3 +426,82 @@ class AssistantRetrievalTools:
             })
 
         return result
+
+    def search_everything(
+        self,
+        query: str,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+        session_id: Optional[int] = None,
+        source_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Unified full-text search across all RAG-indexed content.
+
+        Searches transcripts, summaries, screenshots, and assistant messages
+        using the FTS index with optional filtering.
+
+        Args:
+            query: Search query string (required, non-empty).
+            limit: Maximum number of results (capped at 50).
+            session_id: Optional session ID to filter results to a specific session.
+            source_types: Optional list of source types to filter results.
+                         Allowed: transcript, summary, screenshot, assistant_message.
+
+        Returns:
+            List of result dictionaries with chunk_id, document_id, source_type,
+            source_id, session_id, timestamp, title, content, rank.
+
+        Raises:
+            ValueError: If query is empty, limit is invalid, session_id is invalid,
+                       or source_types contains invalid values.
+        """
+        # Validate query
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty")
+
+        # Validate and cap limit
+        if not isinstance(limit, int):
+            raise ValueError("Limit must be an integer")
+        if limit < 1:
+            raise ValueError("Limit must be at least 1")
+        limit = min(limit, MAX_SEARCH_LIMIT)
+
+        # Validate session_id if provided
+        if session_id is not None:
+            if not isinstance(session_id, int) or session_id < 1:
+                raise ValueError("Invalid session_id")
+
+        # Validate source_types if provided
+        if source_types is not None:
+            if not isinstance(source_types, list):
+                raise ValueError("source_types must be a list")
+            for st in source_types:
+                if st not in ALLOWED_SOURCE_TYPES:
+                    raise ValueError(f"Invalid source_type: {st}. Allowed: {list(ALLOWED_SOURCE_TYPES)}")
+
+        # Sanitize query
+        query = query.strip()
+
+        try:
+            results = self._db.search_rag_fts(
+                query=query,
+                limit=limit,
+                session_id=session_id,
+                source_types=source_types,
+            )
+            return [
+                {
+                    "chunk_id": r.get("chunk_id"),
+                    "document_id": r.get("document_id"),
+                    "source_type": r.get("source_type"),
+                    "source_id": r.get("source_id"),
+                    "session_id": r.get("session_id"),
+                    "timestamp": r.get("timestamp"),
+                    "title": r.get("title"),
+                    "content": r.get("content"),
+                    "rank": r.get("rank"),
+                }
+                for r in results
+            ]
+        except Exception as e:
+            return [{"error": f"Unified search failed: {str(e)}"}]

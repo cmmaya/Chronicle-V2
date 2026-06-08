@@ -1,8 +1,8 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU066
-- Next BU: BU067
+- Current BU: BU085
+- Next BU: none
 
 ## Target Architecture
 
@@ -81,6 +81,20 @@ BU062 - Home Layout Shell
 BU063 - Session Search Combobox
 BU065 - Selected Session Scope Label
 BU066 - Session Action Icon Row
+BU071 - RAG Metadata Schema
+BU072 - RAG Source Upsert Helpers
+BU073 - Add RAG FTS Rebuild
+BU074 - Add Unified FTS Search
+BU075 - Expose Unified Search Tool
+BU076 - Create RAG Result Models
+BU077 - Add Current Session FTS Retrieval
+BU078 - Replace Current Session Context Path
+BU079 - Add Any Session Context Builder
+BU080 - Wire Any Session Service Retrieval
+BU082 - Tighten Chronicle Assistant Prompt
+BU083 - Add Retrieval Tests
+BU084 - Add Local Embedding Schema Placeholder
+BU085 - Implement RAG Content Indexing
 
 ## In Progress BUs
 None
