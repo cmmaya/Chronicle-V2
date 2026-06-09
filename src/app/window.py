@@ -446,6 +446,10 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.UserRole, conv_id)
                 self.conversations_list.addItem(item)
             
+            # Force UI update
+            self.conversations_list.repaint()
+            logger.info(f"Loaded {len(conversations)} conversations")
+            
         except Exception as e:
             logger.warning(f"Failed to load past conversations: {str(e)}")
     
@@ -2195,11 +2199,6 @@ Keywords: {keywords_str}"""
         self.conversations_list.itemClicked.connect(self._on_conversation_selected)
         conversations_layout.addWidget(self.conversations_list)
         
-        # Refresh button
-        refresh_conv_button = QPushButton("Refresh")
-        refresh_conv_button.clicked.connect(self._load_past_conversations)
-        conversations_layout.addWidget(refresh_conv_button)
-        
         conversations_group.setLayout(conversations_layout)
         left_layout.addWidget(conversations_group)
         
@@ -3933,6 +3932,9 @@ Keywords: {keywords_str}"""
                 if item.widget():
                     item.widget().deleteLater()
         
+        # Refresh the conversations list
+        self._load_past_conversations()
+        
         self._on_status_update("New conversation started")
     
     def _on_ask_clicked(self):
@@ -4050,6 +4052,9 @@ Keywords: {keywords_str}"""
             # Save conversation_id for follow-up questions
             if response.conversation_id:
                 self._current_conversation_id = response.conversation_id
+                logger.info(f"New conversation created with ID: {response.conversation_id}")
+                # Refresh the conversations list to show the new conversation (use QTimer to ensure it runs in main thread)
+                QTimer.singleShot(0, self._load_past_conversations)
             self._on_status_update("Answer received")
         elif response.needs_clarification:
             # Show clarification question and candidates
@@ -5136,6 +5141,9 @@ Keywords: {keywords_str}"""
                 # Save conversation_id for follow-up questions
                 if response.conversation_id:
                     self._current_conversation_id = response.conversation_id
+                    logger.info(f"New conversation created with ID (detached): {response.conversation_id}")
+                    # Refresh the conversations list to show the new conversation (use QTimer to ensure it runs in main thread)
+                    QTimer.singleShot(0, self._load_past_conversations)
                 self._on_status_update("Answer received")
             elif response.needs_clarification:
                 # Show clarification question and candidates
