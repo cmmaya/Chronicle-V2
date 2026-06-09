@@ -3921,6 +3921,18 @@ Keywords: {keywords_str}"""
         self.question_input.clear()
         self._clear_conversation_view()
         self._clear_candidates()
+        
+        # Also clear the detached window conversation if it exists
+        if hasattr(self, '_detached_question_input') and self._detached_question_input:
+            self._detached_question_input.clear()
+        
+        if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
+            # Remove all widgets except the stretch (last item)
+            while self._detached_answer_layout.count() > 1:
+                item = self._detached_answer_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        
         self._on_status_update("New conversation started")
     
     def _on_ask_clicked(self):
