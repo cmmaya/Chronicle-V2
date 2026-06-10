@@ -205,3 +205,6 @@ None
 - Added get_selected_model() and set_selected_model() functions for model selection
 - Added session search with autocomplete completer in main window
 - Added scope label that shows "Scope: <session_name>" when a session is selected
+- Agent dropdown now shows actual agent names ("Chronicle Assistant", "Concise Helper", "Research Helper") instead of generic "Agent" label
+- Added dropdown arrow indicator (v) to all QComboBox widgets
+- Expanded session bar and ask bar width by 1.8x (from 900px to 1620px)

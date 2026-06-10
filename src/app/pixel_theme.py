@@ -23,7 +23,7 @@ def app_qss() -> str:
         background: transparent;
         color: #FFF0BF;
         font-family: "Courier New";
-        font-size: 14px;
+        font-size: 15px;
     }
 
     QLabel {
@@ -51,9 +51,10 @@ def app_qss() -> str:
     }
 
     QFrame#UnifiedSearchBar,
-    QFrame#InputBar {
+    QFrame#ChatInputBar {
         background: #F6E0A6;
-        border: 3px solid #FFEFC1;
+        border: 2px solid #254D9C;
+        border-radius: 7px;
     }
 
     QFrame#TranscriptViewport {
@@ -66,15 +67,16 @@ def app_qss() -> str:
         border: none;
         color: #FFF0BF;
         outline: none;
-        padding: 4px;
+        padding: 3px 8px 3px 3px;
     }
 
     QListWidget::item {
         background: #274F9B;
         color: #FFF0BF;
         border: 2px solid #315DB1;
-        padding: 12px 10px;
-        margin: 4px 2px;
+        border-radius: 7px;
+        padding: 8px 9px;
+        margin: 3px 1px;
     }
 
     QListWidget::item:selected {
@@ -145,7 +147,7 @@ def app_qss() -> str:
     QLineEdit {
         background: #F6E0A6;
         color: #071846;
-        border: 3px solid #FFEFC1;
+        border: 2px solid #254D9C;
         selection-background-color: #274F9B;
         selection-color: #FFF0BF;
         padding: 8px;
@@ -166,8 +168,11 @@ def app_qss() -> str:
         background: #F6E0A6;
         color: #071846;
         border: none;
+        border-radius: 6px;
         padding: 6px 10px;
-        min-height: 30px;
+        min-height: 34px;
+        font-size: 15px;
+        font-weight: 700;
     }
 
     QComboBox:hover {
@@ -179,27 +184,42 @@ def app_qss() -> str:
         width: 28px;
     }
 
+    QComboBox::down-arrow {
+        image: none;
+        width: 0;
+        height: 0;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-top: 6px solid #071846;
+        margin-right: 8px;
+    }
+
     QComboBox QAbstractItemView {
         background: #F6E0A6;
         color: #071846;
-        border: 3px solid #FFEFC1;
+        border: 2px solid #254D9C;
         selection-background-color: #274F9B;
         selection-color: #FFF0BF;
     }
 
     QComboBox#ScopeCombo,
+    QComboBox#AgentCombo,
     QLineEdit#SessionSearchInput {
         background: transparent;
         color: #071846;
         border: none;
         padding: 6px 8px;
+        font-size: 15px;
+        font-weight: 700;
     }
 
     QTextEdit#QuestionInput {
         background: transparent;
         color: #071846;
         border: none;
-        padding: 8px;
+        padding: 8px 10px;
+        font-size: 16px;
+        font-weight: 700;
     }
 
     QTableWidget {
@@ -219,5 +239,6 @@ def app_qss() -> str:
     QPushButton#AppLogsButton {
         min-height: 46px;
         text-align: center;
+        border-radius: 7px;
     }
     """

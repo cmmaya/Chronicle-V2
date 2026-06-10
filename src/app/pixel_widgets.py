@@ -5,6 +5,8 @@ from PySide6.QtWidgets import (
     QToolButton,
     QHBoxLayout,
     QSizePolicy,
+    QStyleOptionButton,
+    QStyle,
 )
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import (
@@ -87,28 +89,18 @@ class PixelPanel(QWidget):
         if rect.width() <= 0 or rect.height() <= 0:
             return
 
-        cut = 10 if not self.inner else 7
+        # Fase 1: borde único, sin doble contorno interno.
+        # El panel interno conserva la misma geometría, pero usa un trazo más ligero
+        # para que se parezca al mockup de referencia y no genere efecto de bisel.
+        cut = 9 if not self.inner else 7
         fill = NAVY_INNER if self.inner else NAVY
         border = BORDER_BLUE_LIGHT if self.inner else BORDER_BLUE
+        pen_width = 2 if not self.inner else 2
 
         path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), cut)
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(border, 3))
+        painter.setPen(QPen(border, pen_width))
         painter.drawPath(path)
-
-        # Línea interna plana. Da definición sin crear efecto bisel.
-        inner_rect = rect.adjusted(6, 6, -6, -6)
-        if inner_rect.width() > 16 and inner_rect.height() > 16:
-            inner_path = pixel_round_rect_path(
-                inner_rect.x(),
-                inner_rect.y(),
-                inner_rect.width(),
-                inner_rect.height(),
-                max(4, cut - 3),
-            )
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor("#17387E"), 1))
-            painter.drawPath(inner_path)
 
         super().paintEvent(event)
 
@@ -157,12 +149,12 @@ class PixelButton(QPushButton):
         self.setObjectName("PixelButton")
 
         if sidebar:
-            self.setMinimumHeight(64)
+            self.setMinimumHeight(52)
         else:
             self.setMinimumHeight(42)
 
         font = QFont("Courier New")
-        font.setPointSize(10)
+        font.setPointSize(12 if sidebar else 10)
         font.setBold(True)
         self.setFont(font)
 
@@ -171,8 +163,9 @@ class PixelButton(QPushButton):
             QPushButton#PixelButton {
                 color: #FFF0BF;
                 background: #274F9B;
-                border: 3px solid #3A67C7;
-                padding: 8px 14px;
+                border: 2px solid #3A67C7;
+                border-radius: 7px;
+                padding: 7px 12px;
                 text-align: left;
             }
 
@@ -198,7 +191,7 @@ class PixelButton(QPushButton):
             QPushButton#PixelButton:disabled {
                 color: #8090B8;
                 background: #18336F;
-                border: 3px solid #284B94;
+                border: 2px solid #284B94;
             }
             """
         )
@@ -222,7 +215,8 @@ class PixelToolButton(QToolButton):
             QToolButton#PixelToolButton {
                 color: #FFF0BF;
                 background: #274F9B;
-                border: 3px solid #3A67C7;
+                border: 2px solid #3A67C7;
+                border-radius: 7px;
                 padding: 6px;
             }
 
@@ -237,7 +231,7 @@ class PixelToolButton(QToolButton):
             QToolButton#PixelToolButton:disabled {
                 color: #8090B8;
                 background: #18336F;
-                border: 3px solid #284B94;
+                border: 2px solid #284B94;
             }
             """
         )
@@ -277,9 +271,10 @@ class PixelBubble(QWidget):
         self.label.setMaximumWidth(max_width)
 
         font = QFont("Courier New")
-        font.setPointSize(11)
+        font.setPointSize(12)
         font.setBold(True)
         self.label.setFont(font)
+        self.label.setAlignment(Qt.AlignCenter)
 
         if variant == "cream":
             self.label.setStyleSheet(
@@ -303,7 +298,7 @@ class PixelBubble(QWidget):
             )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 12, 20, 14)
+        layout.setContentsMargins(22, 14, 22, 16)
         layout.setSpacing(0)
         layout.addWidget(self.label)
 

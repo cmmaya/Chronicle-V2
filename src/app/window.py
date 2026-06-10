@@ -165,8 +165,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Chronicle')
-        self.resize(1365, 768)
-        self.setMinimumSize(1180, 690)
+        self.resize(1800, 768)
+        self.setMinimumSize(1400, 690)
+
         
         # Get project root directory (parent of src/)
         import os
@@ -214,10 +215,10 @@ class MainWindow(QMainWindow):
         # Sidebar collapse state. The collapsed rail keeps action/session icons visible
         # and gives the reclaimed horizontal space only to the answers viewport.
         self._sidebar_collapsed = False
-        self._sidebar_expanded_min_width = 286
-        self._sidebar_expanded_max_width = 318
+        self._sidebar_expanded_min_width = 250
+        self._sidebar_expanded_max_width = 278
         self._sidebar_collapsed_width = 86
-        self._center_control_max_width = 900
+        self._center_control_max_width = 1620  # Expanded horizontal width
         
         # Create UI components
         self._create_menu_bar()
@@ -443,9 +444,16 @@ class MainWindow(QMainWindow):
                 from datetime import datetime
                 date_str = datetime.fromtimestamp(updated_at).strftime("%H:%M %d-%m-%Y")
                 title_text = title if title else f"Conversation #{conv_id}"
+                # Fase 7: las tarjetas del historial tienen dos líneas fijas.
+                # Si el título excede el ancho útil del panel, se trunca con puntos suspensivos
+                # para evitar que invada el scrollbar o rompa la retícula.
+                max_title_chars = 22
+                if len(title_text) > max_title_chars:
+                    title_text = title_text[:max_title_chars - 3].rstrip() + "..."
                 display_text = f"{title_text}\n{date_str}"
                 
                 item = QListWidgetItem(display_text)
+                item.setSizeHint(QSize(0, 58))
                 item.setData(Qt.UserRole, conv_id)
                 item.setToolTip("Session-specific" if session_id else "All sessions")
                 self.conversations_list.addItem(item)
@@ -2209,7 +2217,7 @@ Keywords: {keywords_str}"""
         button.setToolTip(tooltip)
         button.setIcon(self._make_icon(icon_filename))
         button.setText(fallback_text)
-        button.setIconSize(QSize(32, 32))
+        button.setIconSize(QSize(28, 28))
         button.setMinimumSize(54, 54)
         button.clicked.connect(callback)
         return button
@@ -2222,8 +2230,8 @@ Keywords: {keywords_str}"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         central_layout = QHBoxLayout(central_widget)
-        central_layout.setContentsMargins(8, 8, 8, 8)
-        central_layout.setSpacing(10)
+        central_layout.setContentsMargins(6, 6, 6, 6)
+        central_layout.setSpacing(8)
         self.central_layout = central_layout
 
         self.left_shell = self._build_left_sidebar()
@@ -2245,8 +2253,8 @@ Keywords: {keywords_str}"""
         panel.setMinimumWidth(self._sidebar_expanded_min_width)
         panel.setMaximumWidth(self._sidebar_expanded_max_width)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
@@ -2257,48 +2265,51 @@ Keywords: {keywords_str}"""
 
         self.sidebar_menu_button = PixelToolButton()
         self.sidebar_menu_button.setIcon(self._make_icon("icon_menu.svg"))
-        self.sidebar_menu_button.setIconSize(QSize(34, 34))
+        self.sidebar_menu_button.setIconSize(QSize(30, 30))
         self.sidebar_menu_button.setText("☰")
         self.sidebar_menu_button.setToolTip("Collapse sidebar")
-        self.sidebar_menu_button.setMinimumSize(56, 56)
+        self.sidebar_menu_button.setMinimumSize(50, 50)
         self.sidebar_menu_button.clicked.connect(self._toggle_left_sidebar)
         header.addWidget(self.sidebar_menu_button, 0)
         layout.addLayout(header)
 
-        self.new_chat_button = PixelButton("   New Chat", sidebar=True)
+        self.new_chat_button = PixelButton("  New Chat", sidebar=True)
         self.new_chat_button.setIcon(self._make_icon("icon_plus.svg"))
-        self.new_chat_button.setIconSize(QSize(32, 32))
+        self.new_chat_button.setIconSize(QSize(28, 28))
         self.new_chat_button.clicked.connect(self._on_new_chat_clicked)
         layout.addWidget(self.new_chat_button)
 
-        self.search_chats_button = PixelButton("   Search Chats", sidebar=True)
+        self.search_chats_button = PixelButton("  Search Chats", sidebar=True)
         self.search_chats_button.setIcon(self._make_icon("icon_search_light.svg"))
-        self.search_chats_button.setIconSize(QSize(32, 32))
+        self.search_chats_button.setIconSize(QSize(28, 28))
         self.search_chats_button.clicked.connect(lambda: self.session_search_input.setFocus())
         layout.addWidget(self.search_chats_button)
 
-        self.settings_button = PixelButton("   Settings", sidebar=True)
+        self.settings_button = PixelButton("  Settings", sidebar=True)
         self.settings_button.setIcon(self._make_icon("icon_settings.svg"))
-        self.settings_button.setIconSize(QSize(32, 32))
+        self.settings_button.setIconSize(QSize(28, 28))
         self.settings_button.clicked.connect(lambda: self.menuBar().show() if self.menuBar().isHidden() else self.menuBar().hide())
         layout.addWidget(self.settings_button)
 
         self._sidebar_action_buttons = [
-            (self.new_chat_button, "   New Chat", "New chat"),
-            (self.search_chats_button, "   Search Chats", "Search chats"),
-            (self.settings_button, "   Settings", "Settings"),
+            (self.new_chat_button, "  New Chat", "New chat"),
+            (self.search_chats_button, "  Search Chats", "Search chats"),
+            (self.settings_button, "  Settings", "Settings"),
         ]
 
         self.sidebar_history_panel = PixelPanel(inner=True)
         history_panel = self.sidebar_history_panel
         history_layout = QVBoxLayout(history_panel)
-        history_layout.setContentsMargins(10, 10, 10, 10)
-        history_layout.setSpacing(8)
+        history_layout.setContentsMargins(8, 8, 8, 8)
+        history_layout.setSpacing(6)
         history_layout.addWidget(PixelSectionTitle("PAST CONVERSATIONS"))
 
         self.conversations_list = QListWidget()
         self.conversations_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.conversations_list.setSpacing(6)
+        self.conversations_list.setSpacing(4)
+        self.conversations_list.setWordWrap(False)
+        self.conversations_list.setTextElideMode(Qt.ElideRight)
+        self.conversations_list.setUniformItemSizes(True)
         self.conversations_list.itemClicked.connect(self._on_conversation_selected)
         history_layout.addWidget(self.conversations_list, 1)
         layout.addWidget(history_panel, 1)
@@ -2404,14 +2415,14 @@ Keywords: {keywords_str}"""
 
             self.sidebar_menu_button.setText("☰")
             self.sidebar_menu_button.setToolTip("Collapse sidebar")
-            self.sidebar_menu_button.setMinimumSize(56, 56)
+            self.sidebar_menu_button.setMinimumSize(50, 50)
             self.sidebar_menu_button.setMaximumSize(16777215, 16777215)
 
             for button, expanded_text, tooltip in self._sidebar_action_buttons:
                 button.setText(expanded_text)
                 button.setToolTip(tooltip)
                 self._set_style_property(button, "iconOnly", False)
-                button.setMinimumHeight(64)
+                button.setMinimumHeight(52)
                 button.setMaximumSize(16777215, 16777215)
 
             self.sidebar_controls_layout.setDirection(QBoxLayout.LeftToRight)
@@ -2430,19 +2441,22 @@ Keywords: {keywords_str}"""
     def _build_center_workspace(self) -> QWidget:
         """Build the central answers/chat workspace."""
         panel = PixelPanel()
-        panel.setMinimumWidth(660)
+        panel.setMinimumWidth(690)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 14, 14, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(10)
 
         # Unified top selector/search bar: visually one cream control like the mockup,
         # while preserving the existing combo, search input and button attributes.
         top_bar_frame = QFrame()
         top_bar_frame.setObjectName("UnifiedSearchBar")
+        top_bar_frame.setMinimumWidth(720)
         top_bar_frame.setMaximumWidth(self._center_control_max_width)
+        top_bar_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        top_bar_frame.setMinimumHeight(54)
         top_bar = QHBoxLayout(top_bar_frame)
-        top_bar.setContentsMargins(10, 4, 8, 4)
-        top_bar.setSpacing(6)
+        top_bar.setContentsMargins(12, 4, 8, 4)
+        top_bar.setSpacing(8)
 
         self.scope_combo = QComboBox()
         self.scope_combo.setObjectName("ScopeCombo")
@@ -2450,23 +2464,24 @@ Keywords: {keywords_str}"""
         self.scope_combo.addItem("Any Session", "any")
         self.scope_combo.setCurrentIndex(1)
         self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
-        self.scope_combo.setMinimumHeight(48)
-        self.scope_combo.setMinimumWidth(190)
+        self.scope_combo.setMinimumHeight(46)
+        self.scope_combo.setMinimumWidth(172)
+        self.scope_combo.setMaximumWidth(210)
         top_bar.addWidget(self.scope_combo, 0)
 
         self.session_search_input = QLineEdit()
         self.session_search_input.setObjectName("SessionSearchInput")
         self.session_search_input.setPlaceholderText("Search sessions...")
-        self.session_search_input.setMinimumHeight(48)
+        self.session_search_input.setMinimumHeight(46)
         top_bar.addWidget(self.session_search_input, 1)
 
         self.session_search_button = PixelToolButton()
         self.session_search_button.setIcon(self._make_icon("icon_search_dark.svg"))
-        self.session_search_button.setIconSize(QSize(32, 32))
+        self.session_search_button.setIconSize(QSize(28, 28))
         self.session_search_button.setText("⌕")
         self.session_search_button.setToolTip("Show all sessions")
         self.session_search_button.clicked.connect(self._show_all_sessions_window)
-        self.session_search_button.setStyleSheet("QToolButton#IconButton { background: transparent; color: #071C4B; border: none; min-width: 48px; min-height: 48px; max-width: 52px; max-height: 52px; }")
+        self.session_search_button.setStyleSheet("QToolButton { background: transparent; color: #071C4B; border: none; min-width: 46px; min-height: 46px; max-width: 50px; max-height: 50px; }")
         top_bar.addWidget(self.session_search_button, 0)
         self.show_all_sessions_button = self.session_search_button
 
@@ -2477,7 +2492,12 @@ Keywords: {keywords_str}"""
         self._session_completer.activated.connect(self._on_session_completer_selected)
         self.session_search_input.setCompleter(self._session_completer)
         self._refresh_session_completer()
-        layout.addWidget(top_bar_frame, 0, Qt.AlignHCenter)
+
+        # Expandable horizontal container for top bar with 24px margins
+        top_bar_container = QHBoxLayout()
+        top_bar_container.setContentsMargins(24, 0, 24, 0)
+        top_bar_container.addWidget(top_bar_frame)
+        layout.addLayout(top_bar_container, 0)
 
         # Tab buttons removed - keeping UI cleaner
         # Original tabs: ANSWERS and CHAT
@@ -2504,8 +2524,8 @@ Keywords: {keywords_str}"""
         self._answer_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._answer_container = QWidget()
         self._answer_layout = QVBoxLayout(self._answer_container)
-        self._answer_layout.setSpacing(24)
-        self._answer_layout.setContentsMargins(42, 18, 42, 18)
+        self._answer_layout.setSpacing(20)
+        self._answer_layout.setContentsMargins(38, 16, 38, 16)
         self._answer_layout.addStretch()
         self._answer_scroll_area.setWidget(self._answer_container)
         layout.addWidget(self._answer_scroll_area, 1)
@@ -2513,15 +2533,19 @@ Keywords: {keywords_str}"""
 
         input_bar = QFrame()
         input_bar.setObjectName("ChatInputBar")
+        input_bar.setMinimumWidth(720)
         input_bar.setMaximumWidth(self._center_control_max_width)
+        input_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        input_bar.setMinimumHeight(58)
         input_layout = QHBoxLayout(input_bar)
-        input_layout.setContentsMargins(16, 6, 10, 6)
+        input_layout.setContentsMargins(16, 4, 10, 4)
         input_layout.setSpacing(8)
 
         self.question_input = QTextEdit()
+        self.question_input.setObjectName("QuestionInput")
         self.question_input.setPlaceholderText("Ready to help...")
-        self.question_input.setMaximumHeight(58)
-        self.question_input.setMinimumHeight(58)
+        self.question_input.setMaximumHeight(50)
+        self.question_input.setMinimumHeight(50)
         input_layout.addWidget(self.question_input, 1)
 
         self.agent_combo = QComboBox()
@@ -2529,12 +2553,14 @@ Keywords: {keywords_str}"""
         agents = ASSISTANT_AGENTS.get('agents', {})
         default_agent_id = ASSISTANT_AGENTS.get('default', '')
         for agent_id, agent_info in agents.items():
-            # Use the agent's label for display
-            self.agent_combo.addItem(agent_info.get("label", "Agent"), agent_id)
+            # Show actual agent name instead of generic "Agent" label
+            self.agent_combo.addItem(agent_info.get('label', agent_id), agent_id)
         default_index = self.agent_combo.findData(default_agent_id)
         if default_index >= 0:
             self.agent_combo.setCurrentIndex(default_index)
-        self.agent_combo.setMinimumWidth(122)
+        self.agent_combo.setMinimumHeight(50)
+        self.agent_combo.setMinimumWidth(180)
+        self.agent_combo.setMaximumWidth(200)
         input_layout.addWidget(self.agent_combo, 0)
 
         self.ask_button = PixelButton("Ask")
@@ -2553,7 +2579,11 @@ Keywords: {keywords_str}"""
         self.ask_enter_shortcut = QShortcut(QKeySequence("Ctrl+Enter"), self.question_input)
         self.ask_enter_shortcut.activated.connect(self._on_ask_clicked)
 
-        layout.addWidget(input_bar, 0, Qt.AlignHCenter)
+        # Expandable horizontal container for input bar with 24px margins
+        input_bar_container = QHBoxLayout()
+        input_bar_container.setContentsMargins(24, 0, 24, 0)
+        input_bar_container.addWidget(input_bar)
+        layout.addLayout(input_bar_container, 0)
 
         self.candidate_group = PixelPanel(inner=True)
         candidate_layout = QVBoxLayout(self.candidate_group)
@@ -2574,17 +2604,18 @@ Keywords: {keywords_str}"""
         self.app_logs_button = PixelButton("App Logs")
         self.app_logs_button.setObjectName("AppLogsButton")
         self.app_logs_button.setMaximumWidth(self._center_control_max_width)
+        self.app_logs_button.setMinimumHeight(46)
         layout.addWidget(self.app_logs_button, 0, Qt.AlignHCenter)
         return panel
 
     def _build_transcripts_panel(self) -> QWidget:
         """Build the right transcripts panel."""
         panel = PixelPanel()
-        panel.setMinimumWidth(318)
-        panel.setMaximumWidth(370)
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(340)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -2592,7 +2623,7 @@ Keywords: {keywords_str}"""
         top.addStretch()
         self.transcript_filter_button = PixelToolButton()
         self.transcript_filter_button.setIcon(self._make_icon("icon_filter.svg"))
-        self.transcript_filter_button.setIconSize(QSize(32, 32))
+        self.transcript_filter_button.setIconSize(QSize(28, 28))
         self.transcript_filter_button.setText("⌄")
         self.transcript_filter_button.setToolTip("Cycle transcript filter")
         self.transcript_filter_button.clicked.connect(self._cycle_transcription_filter)
@@ -2600,7 +2631,7 @@ Keywords: {keywords_str}"""
 
         self.detach_transcription_button = PixelToolButton()
         self.detach_transcription_button.setIcon(self._make_icon("icon_export.svg"))
-        self.detach_transcription_button.setIconSize(QSize(32, 32))
+        self.detach_transcription_button.setIconSize(QSize(28, 28))
         self.detach_transcription_button.setText("□")
         self.detach_transcription_button.setToolTip("Detach transcripts window")
         self.detach_transcription_button.clicked.connect(self._on_detach_transcription)
@@ -2648,8 +2679,8 @@ Keywords: {keywords_str}"""
         self._transcription_scroll_area.setWidget(self._transcription_container)
 
         self._transcription_layout = QVBoxLayout(self._transcription_container)
-        self._transcription_layout.setSpacing(22)
-        self._transcription_layout.setContentsMargins(14, 16, 14, 16)
+        self._transcription_layout.setSpacing(18)
+        self._transcription_layout.setContentsMargins(12, 14, 12, 14)
         self._transcription_layout.addStretch()
 
         wrapper_layout.addWidget(self._transcription_filter_combo)
@@ -2710,7 +2741,7 @@ Keywords: {keywords_str}"""
 
         align = "right" if role == 'user' else "left"
         variant = "cream" if role == 'user' else "blue"
-        row = aligned_bubble(text, variant=variant, align=align, max_width=585)
+        row = aligned_bubble(text, variant=variant, align=align, max_width=620)
         row.setProperty('role', role)
         row.setProperty('message_text', text)
 
@@ -4919,6 +4950,9 @@ Keywords: {keywords_str}"""
                 self.agent_combo.itemText(i),
                 self.agent_combo.itemData(i)
             )
+        self._detached_agent_combo.setMinimumHeight(50)
+        self._detached_agent_combo.setMinimumWidth(180)
+        self._detached_agent_combo.setMaximumWidth(200)
         agent_layout.addWidget(self._detached_agent_combo)
         
         # Scope selector

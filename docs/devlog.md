@@ -657,4 +657,30 @@ Recovery Notes:
 
 Next:
 
+## UI Improvements - Agent Dropdown and Bar Width
+
+Summary:
+Updated the agent dropdown to show actual agent names ("Chronicle Assistant", "Concise Helper", "Research Helper") instead of generic "Agent" label. Added dropdown arrow indicator to all QComboBox widgets. Expanded session bar and ask bar width by 1.8x.
+
+Files Changed:
+
+- src/app/window.py (changed agent dropdown labels, expanded _center_control_max_width)
+- src/app/pixel_theme.py (added QComboBox::down-arrow style)
+
+Implementation:
+
+- Modified agent_combo to use agent_info.get('label', agent_id) instead of hardcoded "Agent"
+- Changed _center_control_max_width from 900 to 1620 (900 * 1.8)
+- Added CSS border-based arrow using border-left/right transparent and border-top colored to create downward arrow effect
+
+Important Decisions:
+
+- Kept agent IDs unchanged (chronicle_assistant, concise_helper, research_helper)
+- Used CSS borders for dropdown arrow to avoid external icon dependencies
+
+Recovery Notes:
+
+- No database changes required
+- Visual change only - no functional impact on agent selection logic
+
 - BU086 - (Optional) Add UI element to trigger re-indexing for a session
