@@ -6,12 +6,14 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
                                 QToolButton, QToolBar)
-from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel
-from PySide6.QtGui import QAction, QPixmap, QColor
+from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize
+from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence
 from typing import Optional
 import logging
 
 from .session_manager import SessionManager
+from .pixel_theme import app_qss, asset_path
+from .pixel_widgets import PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, aligned_bubble
 from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
@@ -163,7 +165,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Chronicle')
-        self.resize(800, 600)
+        self.resize(1365, 768)
+        self.setMinimumSize(1180, 690)
         
         # Get project root directory (parent of src/)
         import os
@@ -428,23 +431,15 @@ class MainWindow(QMainWindow):
                 created_at = conv.get('created_at', 0)
                 updated_at = conv.get('updated_at', 0)
                 
-                # Format display text
+                # Pixel sidebar display: compact title + time/date, scope in tooltip only.
                 from datetime import datetime
-                date_str = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M")
-                
-                if title:
-                    display_text = f"{title}\n{date_str}"
-                else:
-                    display_text = f"Conversation #{conv_id}\n{date_str}"
-                
-                # Add scope indicator
-                if session_id:
-                    display_text += " (Session-specific)"
-                else:
-                    display_text += " (All sessions)"
+                date_str = datetime.fromtimestamp(updated_at).strftime("%H:%M %d-%m-%Y")
+                title_text = title if title else f"Conversation #{conv_id}"
+                display_text = f"{title_text}\n{date_str}"
                 
                 item = QListWidgetItem(display_text)
                 item.setData(Qt.UserRole, conv_id)
+                item.setToolTip("Session-specific" if session_id else "All sessions")
                 self.conversations_list.addItem(item)
             
             # Force UI update
@@ -468,8 +463,8 @@ class MainWindow(QMainWindow):
             # Clear the current answer display
             self._answer_container = QWidget()
             self._answer_layout = QVBoxLayout(self._answer_container)
-            self._answer_layout.setSpacing(10)
-            self._answer_layout.setContentsMargins(5, 5, 5, 5)
+            self._answer_layout.setSpacing(24)
+            self._answer_layout.setContentsMargins(42, 18, 42, 18)
             self._answer_layout.addStretch()
             
             # Display messages in the conversation view using the same method as new messages
@@ -2193,452 +2188,393 @@ Keywords: {keywords_str}"""
         # Also update SESSION config for session_manager
         SESSION['auto_summary_after_stop'] = auto_summary
     
+    def _make_icon(self, filename: str) -> QIcon:
+        """Load a pixel SVG icon from src/assets/pixel."""
+        try:
+            return QIcon(asset_path(filename))
+        except Exception:
+            return QIcon()
+
+    def _create_icon_tool_button(self, icon_filename: str, fallback_text: str, tooltip: str, callback) -> QToolButton:
+        """Create a square pixel icon tool button with SVG fallback text."""
+        button = PixelToolButton()
+        button.setToolTip(tooltip)
+        button.setIcon(self._make_icon(icon_filename))
+        button.setText(fallback_text)
+        button.setIconSize(QSize(32, 32))
+        button.setMinimumSize(54, 54)
+        button.clicked.connect(callback)
+        return button
+
     def _create_central_widget(self):
-        """Create the central widget with session controls."""
+        """Create the pixel-art three-column Chronicle workspace."""
+        self.setStyleSheet(app_qss())
+        self.menuBar().hide()
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
-        # Main layout - use QSplitter for resizable panels
-        # Three column split: left (history), center (chat/session), right (live transcription)
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.setContentsMargins(10, 10, 10, 10)
-        
-        # Set initial stretch factors via QSplitter
-        # Left panel: Past Conversations
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setSpacing(10)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Session action icon row - above Past Conversations
-        icon_row_layout = QHBoxLayout()
-        icon_row_layout.setSpacing(5)
-        icon_row_layout.setContentsMargins(0, 0, 0, 5)
-        
-        # Play/Stop toggle button
-        self.play_stop_button = QToolButton()
-        self.play_stop_button.setText("▶")
-        self.play_stop_button.setToolTip("Start/Stop Session")
-        self.play_stop_button.setMinimumSize(40, 40)
-        self.play_stop_button.clicked.connect(self._on_play_stop_clicked)
-        icon_row_layout.addWidget(self.play_stop_button)
-        
-        # Pause/Resume button (only visible when session is active)
-        self.pause_icon_button = QToolButton()
-        self.pause_icon_button.setText("⏸")
-        self.pause_icon_button.setToolTip("Pause/Resume Session")
-        self.pause_icon_button.setMinimumSize(40, 40)
-        self.pause_icon_button.clicked.connect(self._on_pause_resume_session)
-        self.pause_icon_button.setVisible(False)
-        icon_row_layout.addWidget(self.pause_icon_button)
-        
-        # Screenshot button
-        self.screenshot_icon_button = QToolButton()
-        self.screenshot_icon_button.setText("📷")
-        self.screenshot_icon_button.setToolTip("Take Screenshot")
-        self.screenshot_icon_button.setMinimumSize(40, 40)
-        self.screenshot_icon_button.clicked.connect(self._on_take_screenshot)
-        icon_row_layout.addWidget(self.screenshot_icon_button)
-        
-        # View Screenshots button
-        self.view_screenshots_icon_button = QToolButton()
-        self.view_screenshots_icon_button.setText("🖼")
-        self.view_screenshots_icon_button.setToolTip("View Screenshots")
-        self.view_screenshots_icon_button.setMinimumSize(40, 40)
-        self.view_screenshots_icon_button.clicked.connect(self._on_view_screenshots_icon_clicked)
-        icon_row_layout.addWidget(self.view_screenshots_icon_button)
-        
-        # View Summary button
-        self.view_summary_icon_button = QToolButton()
-        self.view_summary_icon_button.setText("📝")
-        self.view_summary_icon_button.setToolTip("View Summary")
-        self.view_summary_icon_button.setMinimumSize(40, 40)
-        self.view_summary_icon_button.clicked.connect(self._on_view_summary_icon_clicked)
-        icon_row_layout.addWidget(self.view_summary_icon_button)
-        
-        icon_row_layout.addStretch()
-        left_layout.addLayout(icon_row_layout)
-        
-        # Past Conversations list
-        conversations_group = QGroupBox('Past Conversations')
-        conversations_layout = QVBoxLayout()
-        
+        central_layout = QHBoxLayout(central_widget)
+        central_layout.setContentsMargins(8, 8, 8, 8)
+        central_layout.setSpacing(10)
+
+        self.left_shell = self._build_left_sidebar()
+        self.center_shell = self._build_center_workspace()
+        self.right_shell = self._build_transcripts_panel()
+
+        # Phase 3: reference-like column rhythm: compact left rail, dominant chat,
+        # visible transcript rail. Fixed side widths keep the composition close to
+        # the second mockup across window sizes.
+        central_layout.addWidget(self.left_shell, 0)
+        central_layout.addWidget(self.center_shell, 1)
+        central_layout.addWidget(self.right_shell, 0)
+
+    def _build_left_sidebar(self) -> QWidget:
+        """Build the left Chronicle sidebar: brand, actions, history, controls."""
+        panel = PixelPanel()
+        panel.setMinimumWidth(286)
+        panel.setMaximumWidth(318)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        brand = QLabel("Chronicle")
+        brand.setObjectName("BrandTitle")
+        header.addWidget(brand, 1)
+
+        self.sidebar_menu_button = PixelToolButton()
+        self.sidebar_menu_button.setIcon(self._make_icon("icon_menu.svg"))
+        self.sidebar_menu_button.setIconSize(QSize(34, 34))
+        self.sidebar_menu_button.setText("☰")
+        self.sidebar_menu_button.setToolTip("Menu")
+        self.sidebar_menu_button.setMinimumSize(56, 56)
+        header.addWidget(self.sidebar_menu_button, 0)
+        layout.addLayout(header)
+
+        self.new_chat_button = PixelButton("   New Chat", sidebar=True)
+        self.new_chat_button.setIcon(self._make_icon("icon_plus.svg"))
+        self.new_chat_button.setIconSize(QSize(32, 32))
+        self.new_chat_button.clicked.connect(self._on_new_chat_clicked)
+        layout.addWidget(self.new_chat_button)
+
+        self.search_chats_button = PixelButton("   Search Chats", sidebar=True)
+        self.search_chats_button.setIcon(self._make_icon("icon_search_light.svg"))
+        self.search_chats_button.setIconSize(QSize(32, 32))
+        self.search_chats_button.clicked.connect(lambda: self.session_search_input.setFocus())
+        layout.addWidget(self.search_chats_button)
+
+        self.settings_button = PixelButton("   Settings", sidebar=True)
+        self.settings_button.setIcon(self._make_icon("icon_settings.svg"))
+        self.settings_button.setIconSize(QSize(32, 32))
+        self.settings_button.clicked.connect(lambda: self.menuBar().show() if self.menuBar().isHidden() else self.menuBar().hide())
+        layout.addWidget(self.settings_button)
+
+        history_panel = PixelPanel(inner=True)
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setContentsMargins(10, 10, 10, 10)
+        history_layout.setSpacing(8)
+        history_layout.addWidget(PixelSectionTitle("PAST CONVERSATIONS"))
+
         self.conversations_list = QListWidget()
         self.conversations_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.conversations_list.setSpacing(6)
         self.conversations_list.itemClicked.connect(self._on_conversation_selected)
-        conversations_layout.addWidget(self.conversations_list)
-        
-        conversations_group.setLayout(conversations_layout)
-        left_layout.addWidget(conversations_group)
-        
-        # Center panel: Current Chat/Current Session Area
-        center_panel = QWidget()
-        center_layout = QVBoxLayout(center_panel)
-        center_layout.setSpacing(15)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Title
-        title_label = QLabel('Chronicle')
-        title_label.setAlignment(Qt.AlignCenter)
-        title_font = title_label.font()
-        title_font.setPointSize(24)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        center_layout.addWidget(title_label)
-        
-        # Session name input area
-        session_layout = QHBoxLayout()
-        session_layout.addStretch()
-        self.session_name_label = QLabel('Session Name:')
-        self.session_name_label.setFont(title_font)
-        self.session_name_input = QLabel('New Session')
-        self.session_name_input.setFont(title_font)
-        session_layout.addWidget(self.session_name_label)
-        session_layout.addWidget(self.session_name_input)
-        session_layout.addStretch()
-        center_layout.addLayout(session_layout)
-        
-        # Spacer
-        center_layout.addStretch()
-        
-        # Status display
-        self.status_label = QLabel('Ready')
-        self.status_label.setAlignment(Qt.AlignCenter)
-        status_font = self.status_label.font()
-        status_font.setPointSize(16)
-        self.status_label.setFont(status_font)
-        center_layout.addWidget(self.status_label)
-        
-        session_search_layout = QHBoxLayout()
-        session_search_label = QLabel("Search Session:")
-        session_search_layout.addWidget(session_search_label)
-        
-        # Session search with completer (autocomplete)
+        history_layout.addWidget(self.conversations_list, 1)
+        layout.addWidget(history_panel, 1)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 4, 0, 0)
+        controls.setSpacing(8)
+
+        self.play_stop_button = self._create_icon_tool_button("icon_play.svg", "▶", "Start/Stop Session", self._on_play_stop_clicked)
+        controls.addWidget(self.play_stop_button)
+
+        self.pause_icon_button = self._create_icon_tool_button("icon_pause.svg", "⏸", "Pause/Resume Session", self._on_pause_resume_session)
+        self.pause_icon_button.setVisible(False)
+        controls.addWidget(self.pause_icon_button)
+
+        self.stop_visual_button = self._create_icon_tool_button("icon_stop.svg", "■", "Stop Session", self._on_stop_session)
+        controls.addWidget(self.stop_visual_button)
+
+        self.screenshot_icon_button = self._create_icon_tool_button("icon_camera.svg", "▣", "Take Screenshot", self._on_take_screenshot)
+        controls.addWidget(self.screenshot_icon_button)
+
+        self.view_summary_icon_button = self._create_icon_tool_button("icon_summary.svg", "▤", "View Summary", self._on_view_summary_icon_clicked)
+        controls.addWidget(self.view_summary_icon_button)
+
+        self.view_screenshots_icon_button = self._create_icon_tool_button("icon_export.svg", "□", "View Screenshots", self._on_view_screenshots_icon_clicked)
+        self.view_screenshots_icon_button.setVisible(False)
+        controls.addWidget(self.view_screenshots_icon_button)
+
+        layout.addLayout(controls)
+        return panel
+
+    def _build_center_workspace(self) -> QWidget:
+        """Build the central answers/chat workspace."""
+        panel = PixelPanel()
+        panel.setMinimumWidth(660)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(12)
+
+        # Unified top selector/search bar: visually one cream control like the mockup,
+        # while preserving the existing combo, search input and button attributes.
+        top_bar_frame = QFrame()
+        top_bar_frame.setObjectName("UnifiedSearchBar")
+        top_bar = QHBoxLayout(top_bar_frame)
+        top_bar.setContentsMargins(10, 4, 8, 4)
+        top_bar.setSpacing(6)
+
+        self.scope_combo = QComboBox()
+        self.scope_combo.setObjectName("ScopeCombo")
+        self.scope_combo.addItem("Current Session", "current")
+        self.scope_combo.addItem("Any Session", "any")
+        self.scope_combo.setCurrentIndex(1)
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
+        self.scope_combo.setMinimumHeight(48)
+        self.scope_combo.setMinimumWidth(190)
+        top_bar.addWidget(self.scope_combo, 0)
+
         self.session_search_input = QLineEdit()
-        self.session_search_input.setPlaceholderText("Type to search...")
-        self.session_search_input.setMinimumWidth(150)
-        session_search_layout.addWidget(self.session_search_input)
-        
-        # Setup completer for session search
+        self.session_search_input.setObjectName("SessionSearchInput")
+        self.session_search_input.setPlaceholderText("Search sessions...")
+        self.session_search_input.setMinimumHeight(48)
+        top_bar.addWidget(self.session_search_input, 1)
+
+        self.session_search_button = PixelToolButton()
+        self.session_search_button.setIcon(self._make_icon("icon_search_dark.svg"))
+        self.session_search_button.setIconSize(QSize(32, 32))
+        self.session_search_button.setText("⌕")
+        self.session_search_button.setToolTip("Show all sessions")
+        self.session_search_button.clicked.connect(self._show_all_sessions_window)
+        self.session_search_button.setStyleSheet("QToolButton#IconButton { background: transparent; color: #071C4B; border: none; min-width: 48px; min-height: 48px; max-width: 52px; max-height: 52px; }")
+        top_bar.addWidget(self.session_search_button, 0)
+        self.show_all_sessions_button = self.session_search_button
+
         self._session_completer = QCompleter()
         self._session_completer.setFilterMode(Qt.MatchContains)
         self._session_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self._session_completer.setMaxVisibleItems(5)
         self._session_completer.activated.connect(self._on_session_completer_selected)
         self.session_search_input.setCompleter(self._session_completer)
-        
-        # Button to show all sessions in detached window
-        self.show_all_sessions_button = QPushButton("All Sessions")
-        self.show_all_sessions_button.clicked.connect(self._show_all_sessions_window)
-        session_search_layout.addWidget(self.show_all_sessions_button)
-        
-        # Load sessions for completer
         self._refresh_session_completer()
-        
-        center_layout.addLayout(session_search_layout)
-        
-        # Scope label - shows selected session name
+        layout.addWidget(top_bar_frame)
+
+        tabs = QHBoxLayout()
+        tabs.setContentsMargins(0, 2, 0, 0)
+        tabs.addStretch()
+        self.answers_tab = PixelButton("ANSWERS")
+        self.answers_tab.setObjectName("TabLabel")
+        self.chat_tab = PixelButton("CHAT")
+        self.chat_tab.setObjectName("TabLabel")
+        tabs.addWidget(self.answers_tab)
+        tabs.addSpacing(16)
+        tabs.addWidget(self.chat_tab)
+        tabs.addStretch()
+        layout.addLayout(tabs)
+
         self._scope_label = QLabel("Scope: (none)")
-        self._scope_label.setStyleSheet("color: gray; font-style: italic;")
-        center_layout.addWidget(self._scope_label)
-        
-        # Assistant panel
-        assistant_group = QGroupBox('Assistant')
-        assistant_layout = QVBoxLayout()
-        
-        # Agent selection row
-        agent_layout = QHBoxLayout()
-        agent_label = QLabel("Agent:")
-        agent_layout.addWidget(agent_label)
-        
-        self.agent_combo = QComboBox()
-        # Populate with agents from config
-        agents = ASSISTANT_AGENTS.get('agents', {})
-        default_agent_id = ASSISTANT_AGENTS.get('default', '')
-        for agent_id, agent_info in agents.items():
-            self.agent_combo.addItem(agent_info.get('label', agent_id), agent_id)
-        # Set default selection
-        default_index = self.agent_combo.findData(default_agent_id)
-        if default_index >= 0:
-            self.agent_combo.setCurrentIndex(default_index)
-        agent_layout.addWidget(self.agent_combo)
-        assistant_layout.addLayout(agent_layout)
-        
-        # Scope selection row
-        scope_layout = QHBoxLayout()
-        scope_label = QLabel("Scope:")
-        scope_layout.addWidget(scope_label)
-        
-        self.scope_combo = QComboBox()
-        self.scope_combo.addItem("Current Session", "current")
-        self.scope_combo.addItem("Any Session", "any")
-        # Set default to "Any Session"
-        self.scope_combo.setCurrentIndex(1)
-        self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
-        scope_layout.addWidget(self.scope_combo)
-        scope_layout.addStretch()
-        assistant_layout.addLayout(scope_layout)
-        
-        # Answer display (read-only) - shown at the top, scrollable for conversation history
-        answer_label = QLabel("Answer:")
-        assistant_layout.addWidget(answer_label)
-        
-        # Create scrollable conversation view
+        self._scope_label.setObjectName("ScopeLabel")
+        self._scope_label.setAlignment(Qt.AlignCenter)
+        self._scope_label.setVisible(False)
+        layout.addWidget(self._scope_label)
+
+        self.session_name_label = QLabel("Session Name:")
+        self.session_name_label.setVisible(False)
+        self.session_name_input = QLabel("New Session")
+        self.session_name_input.setVisible(False)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setObjectName("ScopeLabel")
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
+
         self._answer_scroll_area = QScrollArea()
         self._answer_scroll_area.setWidgetResizable(True)
         self._answer_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        
-        # Container for conversation messages
         self._answer_container = QWidget()
         self._answer_layout = QVBoxLayout(self._answer_container)
-        self._answer_layout.setSpacing(10)
-        self._answer_layout.setContentsMargins(5, 5, 5, 5)
-        self._answer_layout.addStretch()  # Push content to top
-        
+        self._answer_layout.setSpacing(24)
+        self._answer_layout.setContentsMargins(42, 18, 42, 18)
+        self._answer_layout.addStretch()
         self._answer_scroll_area.setWidget(self._answer_container)
-        self._answer_scroll_area.setMaximumHeight(500)
-        assistant_layout.addWidget(self._answer_scroll_area)
-        
-        # For backward compatibility, keep a reference (but we use the scroll area now)
-        self.answer_display = None  # Will be replaced by conversation view
-        
-        # Question input - shown at the bottom
-        question_label = QLabel("Question:")
-        assistant_layout.addWidget(question_label)
-        
+        layout.addWidget(self._answer_scroll_area, 1)
+        self.answer_display = None
+
+        input_bar = QFrame()
+        input_bar.setObjectName("ChatInputBar")
+        input_layout = QHBoxLayout(input_bar)
+        input_layout.setContentsMargins(16, 6, 10, 6)
+        input_layout.setSpacing(8)
+
         self.question_input = QTextEdit()
-        self.question_input.setPlaceholderText("Ask a question about your sessions...")
-        self.question_input.setMaximumHeight(80)
-        assistant_layout.addWidget(self.question_input)
-        
-        # Ask and Detach buttons
-        button_layout = QHBoxLayout()
-        
-        self.ask_button = QPushButton("Ask")
+        self.question_input.setPlaceholderText("Ready to help...")
+        self.question_input.setMaximumHeight(58)
+        self.question_input.setMinimumHeight(58)
+        input_layout.addWidget(self.question_input, 1)
+
+        self.agent_combo = QComboBox()
+        self.agent_combo.setObjectName("AgentCombo")
+        agents = ASSISTANT_AGENTS.get('agents', {})
+        default_agent_id = ASSISTANT_AGENTS.get('default', '')
+        for agent_id, agent_info in agents.items():
+            # The compact mockup label is Agent; detailed labels remain in tooltips/data.
+            self.agent_combo.addItem("Agent", agent_id)
+        default_index = self.agent_combo.findData(default_agent_id)
+        if default_index >= 0:
+            self.agent_combo.setCurrentIndex(default_index)
+        self.agent_combo.setMinimumWidth(122)
+        input_layout.addWidget(self.agent_combo, 0)
+
+        self.ask_button = PixelButton("Ask")
         self.ask_button.clicked.connect(self._on_ask_clicked)
-        button_layout.addWidget(self.ask_button)
-        
-        self.new_chat_button = QPushButton("New Chat")
-        self.new_chat_button.clicked.connect(self._on_new_chat_clicked)
-        button_layout.addWidget(self.new_chat_button)
-        
-        self.detach_assistant_button = QPushButton("Detach")
+        self.ask_button.setVisible(False)
+        input_layout.addWidget(self.ask_button, 0)
+
+        self.detach_assistant_button = PixelButton("Detach")
         self.detach_assistant_button.clicked.connect(self._on_detach_assistant)
-        button_layout.addWidget(self.detach_assistant_button)
-        
-        button_layout.addStretch()
-        assistant_layout.addLayout(button_layout)
-        
-        # Candidate session selection (initially hidden)
-        self.candidate_group = QGroupBox("Select a Session:")
-        candidate_layout = QVBoxLayout()
-        
+        self.detach_assistant_button.setVisible(False)
+        input_layout.addWidget(self.detach_assistant_button, 0)
+
+        # Keep the cleaned visual bar usable without the visible Ask button.
+        self.ask_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.question_input)
+        self.ask_shortcut.activated.connect(self._on_ask_clicked)
+        self.ask_enter_shortcut = QShortcut(QKeySequence("Ctrl+Enter"), self.question_input)
+        self.ask_enter_shortcut.activated.connect(self._on_ask_clicked)
+
+        layout.addWidget(input_bar, 0)
+
+        self.candidate_group = PixelPanel(inner=True)
+        candidate_layout = QVBoxLayout(self.candidate_group)
+        candidate_layout.setContentsMargins(10, 10, 10, 10)
+        candidate_layout.addWidget(PixelSectionTitle("SELECT A SESSION"))
         self._candidate_list_widget = QListWidget()
         self._candidate_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._candidate_list_widget.setMaximumHeight(100)
+        self._candidate_list_widget.setMaximumHeight(112)
         self._candidate_list_widget.itemClicked.connect(self._on_candidate_selected)
         candidate_layout.addWidget(self._candidate_list_widget)
-        
-        # Use Selected Session button
-        self.use_candidate_button = QPushButton("Use Selected Session")
+        self.use_candidate_button = PixelButton("Use Selected Session")
         self.use_candidate_button.clicked.connect(self._on_use_candidate_clicked)
         self.use_candidate_button.setEnabled(False)
         candidate_layout.addWidget(self.use_candidate_button)
-        
-        self.candidate_group.setLayout(candidate_layout)
-        self.candidate_group.setVisible(False)  # Hidden by default
-        assistant_layout.addWidget(self.candidate_group)
-        
-        assistant_group.setLayout(assistant_layout)
-        center_layout.addWidget(assistant_group)
-        
-        # ========== RIGHT PANEL: Live Transcriptions (unchanged) ==========
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
-        # Live transcription display area - using chat-like view
-        live_transcription_group = QGroupBox('Live Transcriptions')
-        live_transcription_layout = QVBoxLayout()
-        
-        # Create the chat-like transcription view
-        transcription_view = self._create_transcription_view()
-        live_transcription_layout.addWidget(transcription_view)
-        
-        # Detach button
-        self.detach_transcription_button = QPushButton('Detach Window')
+        self.candidate_group.setVisible(False)
+        layout.addWidget(self.candidate_group)
+
+        self.app_logs_button = PixelButton("App Logs")
+        self.app_logs_button.setObjectName("AppLogsButton")
+        layout.addWidget(self.app_logs_button)
+        return panel
+
+    def _build_transcripts_panel(self) -> QWidget:
+        """Build the right transcripts panel."""
+        panel = PixelPanel()
+        panel.setMinimumWidth(318)
+        panel.setMaximumWidth(370)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+        top.addStretch()
+        self.transcript_filter_button = PixelToolButton()
+        self.transcript_filter_button.setIcon(self._make_icon("icon_filter.svg"))
+        self.transcript_filter_button.setIconSize(QSize(32, 32))
+        self.transcript_filter_button.setText("⌄")
+        self.transcript_filter_button.setToolTip("Cycle transcript filter")
+        self.transcript_filter_button.clicked.connect(self._cycle_transcription_filter)
+        top.addWidget(self.transcript_filter_button)
+
+        self.detach_transcription_button = PixelToolButton()
+        self.detach_transcription_button.setIcon(self._make_icon("icon_export.svg"))
+        self.detach_transcription_button.setIconSize(QSize(32, 32))
+        self.detach_transcription_button.setText("□")
+        self.detach_transcription_button.setToolTip("Detach transcripts window")
         self.detach_transcription_button.clicked.connect(self._on_detach_transcription)
-        live_transcription_layout.addWidget(self.detach_transcription_button)
-        
-        live_transcription_group.setLayout(live_transcription_layout)
-        right_layout.addWidget(live_transcription_group)
-        
-        # Add all three panels to the splitter
-        main_splitter.addWidget(left_panel)
-        main_splitter.addWidget(center_panel)
-        main_splitter.addWidget(right_panel)
-        
-        # Set stretch factors: left=1, center=2, right=1
-        main_splitter.setStretchFactor(0, 1)
-        main_splitter.setStretchFactor(1, 2)
-        main_splitter.setStretchFactor(2, 1)
-        
-        # Set the splitter as the central widget's layout
-        central_layout = QVBoxLayout(central_widget)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.addWidget(main_splitter)
-    
+        top.addWidget(self.detach_transcription_button)
+        layout.addLayout(top)
+
+        layout.addWidget(PixelSectionTitle("TRANSCRIPTS WINDOW", center=True))
+        transcription_view = self._create_transcription_view()
+        layout.addWidget(transcription_view, 1)
+        return panel
+
+    def _cycle_transcription_filter(self):
+        """Cycle the hidden transcript filter combo from the pixel funnel button."""
+        if not hasattr(self, '_transcription_filter_combo'):
+            return
+        next_index = (self._transcription_filter_combo.currentIndex() + 1) % self._transcription_filter_combo.count()
+        self._transcription_filter_combo.setCurrentIndex(next_index)
     def _create_status_bar(self):
         """Create the status bar."""
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage('Ready')
+        self.status_bar.hide()
     
     def _create_transcription_view(self) -> QWidget:
-        """Create a scrollable chat-like view for displaying live transcriptions.
-        
-        Returns:
-            QWidget: The widget containing the transcription view
-        """
-        # Create wrapper widget to return
-        wrapper = QWidget()
+        """Create the right-panel pixel transcript stream."""
+        wrapper = QFrame()
+        wrapper.setObjectName("TranscriptViewport")
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
-        wrapper_layout.setSpacing(5)
-        
-        # Filter controls row
-        filter_layout = QHBoxLayout()
-        filter_layout.setContentsMargins(0, 0, 0, 0)
-        
-        filter_label = QLabel("Filter:")
-        filter_label.setFont(self.status_label.font())
-        filter_layout.addWidget(filter_label)
-        
-        # Filter combo box
+        wrapper_layout.setSpacing(0)
+
         self._transcription_filter_combo = QComboBox()
         self._transcription_filter_combo.addItem("All", "all")
-        self._transcription_filter_combo.addItem("You (mic)", "mic")
-        self._transcription_filter_combo.addItem("Them (system)", "system")
+        self._transcription_filter_combo.addItem("Mic", "mic")
+        self._transcription_filter_combo.addItem("System", "system")
         self._transcription_filter_combo.currentIndexChanged.connect(self._on_transcription_filter_changed)
-        filter_layout.addWidget(self._transcription_filter_combo)
-        
-        filter_layout.addStretch()
-        wrapper_layout.addLayout(filter_layout)
-        
-        # Create scroll area
+        self._transcription_filter_combo.setVisible(False)
+
         self._transcription_scroll_area = QScrollArea()
         self._transcription_scroll_area.setWidgetResizable(True)
         self._transcription_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        
-        # Create container widget
+
         self._transcription_container = QWidget()
         self._transcription_scroll_area.setWidget(self._transcription_container)
-        
-        # Create vertical layout for the container
+
         self._transcription_layout = QVBoxLayout(self._transcription_container)
-        self._transcription_layout.setSpacing(10)
-        self._transcription_layout.setContentsMargins(10, 10, 10, 10)
-        self._transcription_layout.addStretch()  # Push content to top
-        
-        wrapper_layout.addWidget(self._transcription_scroll_area)
-        
+        self._transcription_layout.setSpacing(22)
+        self._transcription_layout.setContentsMargins(14, 16, 14, 16)
+        self._transcription_layout.addStretch()
+
+        wrapper_layout.addWidget(self._transcription_filter_combo)
+        wrapper_layout.addWidget(self._transcription_scroll_area, 1)
         return wrapper
-    
+
     def add_transcription_to_view(self, text: str, source: str, timestamp: str = ''):
-        """Add a transcription to the chat-like view.
-        
-        Args:
-            text: The transcription text
-            source: The source ('mic' or 'system')
-            timestamp: Optional timestamp string
-        """
-        # Create a frame for each transcription bubble
-        bubble_frame = QFrame()
-        bubble_frame.setFrameShape(QFrame.StyledPanel)
-        bubble_frame.setFrameShadow(QFrame.Raised)
-        
-        # Store the source as a property for filtering
-        bubble_frame.setProperty('source', source)
-        
-        # Check if this bubble should be visible based on current filter
+        """Add a transcription bubble to the pixel transcript window."""
+        display_source = "Mic" if source == 'mic' else "System"
+        display_text = f"{display_source}: {text}"
+        align = "right" if source == 'mic' else "left"
+        variant = "blue" if source == 'mic' else "cream"
+
+        row = aligned_bubble(display_text, variant=variant, align=align, max_width=250)
+        row.setProperty('source', source)
+        row.setToolTip(timestamp or '')
+
         if self._transcription_filter == 'mic' and source != 'mic':
-            bubble_frame.hide()
+            row.hide()
         elif self._transcription_filter == 'system' and source != 'system':
-            bubble_frame.hide()
-        
-        # Set layout for the bubble
-        bubble_layout = QVBoxLayout(bubble_frame)
-        bubble_layout.setContentsMargins(10, 8, 10, 8)
-        bubble_layout.setSpacing(4)
-        
-        # Header with source and timestamp
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Source label
-        source_label = QLabel(f"{'🎤 Mic' if source == 'mic' else '🔊 System'}")
-        source_font = source_label.font()
-        source_font.setPointSize(10)
-        source_font.setBold(True)
-        source_label.setFont(source_font)
-        
-        # Timestamp label
-        time_label = QLabel(timestamp)
-        time_label.setStyleSheet("color: gray;")
-        time_font = time_label.font()
-        time_font.setPointSize(9)
-        time_label.setFont(time_font)
-        
-        header_layout.addWidget(source_label)
-        header_layout.addStretch()
-        header_layout.addWidget(time_label)
-        
-        bubble_layout.addLayout(header_layout)
-        
-        # Transcription text
-        text_label = QLabel(text)
-        text_label.setWordWrap(True)
-        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        
-        bubble_layout.addWidget(text_label)
-        
-        # Style based on source
-        if source == 'mic':
-            # Mic - left aligned with blue-ish background
-            bubble_frame.setStyleSheet("""
-                QFrame {
-                    background-color: #E3F2FD;
-                    border-radius: 10px;
-                    border: 1px solid #90CAF9;
-                }
-            """)
-            header_layout.insertStretch(0, 0)  # Left align
-        else:
-            # System - left aligned with green-ish background
-            bubble_frame.setStyleSheet("""
-                QFrame {
-                    background-color: #E8F5E9;
-                    border-radius: 10px;
-                    border: 1px solid #A5D6A7;
-                }
-            """)
-            header_layout.insertStretch(0, 0)  # Left align
-        
-        # Add to layout (before the stretch)
+            row.hide()
+
         self._transcription_layout.insertWidget(
-            self._transcription_layout.count() - 1,  # Insert before stretch
-            bubble_frame
+            self._transcription_layout.count() - 1,
+            row
         )
-        
-        # Auto-scroll to bottom
+
         self._transcription_scroll_area.verticalScrollBar().setValue(
             self._transcription_scroll_area.verticalScrollBar().maximum()
         )
-        
-        # Also update detached window if it exists
+
         if hasattr(self, '_detached_display') and self._detached_display:
-            # For detached window, we use the simpler QTextEdit approach
-            pass  # Detached window uses different display method
-    
+            pass
+
     def _clear_transcription_view(self):
         """Clear all transcriptions from the view."""
         # Clear history
@@ -2655,99 +2591,37 @@ Keywords: {keywords_str}"""
                     item.widget().deleteLater()
     
     def _add_message_to_conversation(self, role: str, text: str):
-        """Add a message to the conversation view.
-        
-        Args:
-            role: 'user' or 'assistant'
-            text: The message text
-        
-        Returns:
-            The bubble_frame widget that was added (can be used to replace later)
-        """
+        """Add a pixel-styled message bubble to the conversation view."""
         if not hasattr(self, '_answer_layout') or not self._answer_layout:
             return None
-        
-        # If this is a "Thinking..." message and we already have one, remove the old one
+
         if text == "Thinking..." and self._thinking_message_widget:
             self._thinking_message_widget.deleteLater()
             self._thinking_message_widget = None
-        
-        # Create a bubble frame
-        bubble_frame = QFrame()
-        bubble_frame.setFrameShape(QFrame.StyledPanel)
-        bubble_frame.setFrameShadow(QFrame.Raised)
-        
-        # Store reference if this is "Thinking..." message
+
+        align = "right" if role == 'user' else "left"
+        variant = "cream" if role == 'user' else "blue"
+        row = aligned_bubble(text, variant=variant, align=align, max_width=585)
+        row.setProperty('role', role)
+        row.setProperty('message_text', text)
+
         if text == "Thinking...":
-            self._thinking_message_widget = bubble_frame
-        
-        # Store role as property for later retrieval
-        bubble_frame.setProperty('role', role)
-        # Store text as property for later retrieval
-        bubble_frame.setProperty('message_text', text)
-        
-        # Set layout for the bubble
-        bubble_layout = QVBoxLayout(bubble_frame)
-        bubble_layout.setContentsMargins(10, 8, 10, 8)
-        bubble_layout.setSpacing(4)
-        
-        # Header with role label
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        role_label = QLabel(f"{'You' if role == 'user' else 'Assistant'}")
-        role_font = role_label.font()
-        role_font.setPointSize(10)
-        role_font.setBold(True)
-        role_label.setFont(role_font)
-        
-        header_layout.addWidget(role_label)
-        header_layout.addStretch()
-        bubble_layout.addLayout(header_layout)
-        
-        # Message text
-        text_label = QLabel(text)
-        text_label.setWordWrap(True)
-        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bubble_layout.addWidget(text_label)
-        
-        # Style based on role
-        if role == 'user':
-            # User - right aligned with blue-ish background
-            bubble_frame.setStyleSheet("""
-                QFrame {
-                    background-color: #E3F2FD;
-                    border-radius: 10px;
-                    border: 1px solid #90CAF9;
-                }
-            """)
-        else:
-            # Assistant - left aligned with green-ish background
-            bubble_frame.setStyleSheet("""
-                QFrame {
-                    background-color: #E8F5E9;
-                    border-radius: 10px;
-                    border: 1px solid #A5D6A7;
-                }
-            """)
-        
-        # Add to layout (before the stretch)
+            self._thinking_message_widget = row
+
         self._answer_layout.insertWidget(
-            self._answer_layout.count() - 1,  # Insert before stretch
-            bubble_frame
+            self._answer_layout.count() - 1,
+            row
         )
-        
-        # Auto-scroll to bottom to show new message
+
         self._answer_scroll_area.verticalScrollBar().setValue(
             self._answer_scroll_area.verticalScrollBar().maximum()
         )
-        
-        # Also update detached window if it exists
+
         if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
             self._add_message_to_detached_conversation(role, text)
-        
-        return bubble_frame
-    
+
+        return row
+
     def _clear_conversation_view(self):
         """Clear all messages from the conversation view."""
         if hasattr(self, '_answer_layout') and self._answer_layout:
@@ -2760,80 +2634,32 @@ Keywords: {keywords_str}"""
         self._thinking_message_widget = None
     
     def _replace_thinking_message(self, new_text: str):
-        """Replace the 'Thinking...' message with the actual response.
-        
-        Args:
-            new_text: The new text to replace Thinking... with
-        """
+        """Replace the pixel 'Thinking...' bubble with the assistant response."""
         if not hasattr(self, '_answer_layout') or not self._answer_layout:
             return
-        
-        # If there's a Thinking... message, replace it
+
         if self._thinking_message_widget:
-            # Find the index of the Thinking... widget
             index = self._answer_layout.indexOf(self._thinking_message_widget)
             if index >= 0:
-                # Remove the old widget
                 self._answer_layout.takeAt(index)
                 self._thinking_message_widget.deleteLater()
-        
-        # Create a new bubble with the response text
-        bubble_frame = QFrame()
-        bubble_frame.setFrameShape(QFrame.StyledPanel)
-        bubble_frame.setFrameShadow(QFrame.Raised)
-        
-        bubble_layout = QVBoxLayout(bubble_frame)
-        bubble_layout.setContentsMargins(10, 8, 10, 8)
-        bubble_layout.setSpacing(4)
-        
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        role_label = QLabel("Assistant")
-        role_font = role_label.font()
-        role_font.setPointSize(10)
-        role_font.setBold(True)
-        role_label.setFont(role_font)
-        
-        header_layout.addWidget(role_label)
-        header_layout.addStretch()
-        bubble_layout.addLayout(header_layout)
-        
-        text_label = QLabel(new_text)
-        text_label.setWordWrap(True)
-        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bubble_layout.addWidget(text_label)
-        
-        bubble_frame.setStyleSheet("""
-            QFrame {
-                background-color: #E8F5E9;
-                border-radius: 10px;
-                border: 1px solid #A5D6A7;
-            }
-        """)
-        
-        # Insert at the same position where Thinking was
+
+        row = aligned_bubble(new_text, variant="blue", align="left", max_width=560)
+        row.setProperty('role', 'assistant')
+        row.setProperty('message_text', new_text)
         self._answer_layout.insertWidget(
             self._answer_layout.count() - 1,
-            bubble_frame
+            row
         )
-        
-        # Store role and text as properties for later retrieval (for copying to detached)
-        bubble_frame.setProperty('role', 'assistant')
-        bubble_frame.setProperty('message_text', new_text)
-        
-        # Reset thinking tracker
         self._thinking_message_widget = None
-        
-        # Auto-scroll to bottom
+
         self._answer_scroll_area.verticalScrollBar().setValue(
             self._answer_scroll_area.verticalScrollBar().maximum()
         )
-        
-        # Also update detached window if it exists
+
         if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
             self._add_message_to_detached_conversation('assistant', new_text)
-    
+
     def _add_message_to_detached_conversation(self, role: str, text: str):
         """Add a message to the detached window's conversation view.
         
@@ -3408,9 +3234,11 @@ Keywords: {keywords_str}"""
             self.session_name_input.setText(active_session.name)
             
             # Update icon row
+            self.play_stop_button.setIcon(self._make_icon("icon_stop.svg"))
             self.play_stop_button.setText("⏹")
             self.play_stop_button.setToolTip("Stop Session")
             self.pause_icon_button.setVisible(True)
+            self.pause_icon_button.setIcon(self._make_icon("icon_pause.svg"))
             self.pause_icon_button.setText("⏸")
             self.pause_icon_button.setToolTip("Pause Session")
             self.screenshot_icon_button.setEnabled(True)
@@ -3420,15 +3248,18 @@ Keywords: {keywords_str}"""
             self.session_name_input.setText(active_session.name)
             
             # Update icon row
+            self.play_stop_button.setIcon(self._make_icon("icon_stop.svg"))
             self.play_stop_button.setText("⏹")
             self.play_stop_button.setToolTip("Stop Session")
             self.pause_icon_button.setVisible(True)
+            self.pause_icon_button.setIcon(self._make_icon("icon_play.svg"))
             self.pause_icon_button.setText("▶")
             self.pause_icon_button.setToolTip("Resume Session")
             self.screenshot_icon_button.setEnabled(True)
             
         elif active_session and active_session.status == Session.STATUS_PROCESSING:
             # Update icon row
+            self.play_stop_button.setIcon(self._make_icon("icon_play.svg"))
             self.play_stop_button.setText("▶")
             self.play_stop_button.setToolTip("Start Session")
             self.pause_icon_button.setVisible(False)
@@ -3440,6 +3271,7 @@ Keywords: {keywords_str}"""
             self._is_recording = False
             
             # Update icon row
+            self.play_stop_button.setIcon(self._make_icon("icon_play.svg"))
             self.play_stop_button.setText("▶")
             self.play_stop_button.setToolTip("Start Session")
             self.pause_icon_button.setVisible(False)
