@@ -2421,8 +2421,8 @@ Keywords: {keywords_str}"""
         agents = ASSISTANT_AGENTS.get('agents', {})
         default_agent_id = ASSISTANT_AGENTS.get('default', '')
         for agent_id, agent_info in agents.items():
-            # The compact mockup label is Agent; detailed labels remain in tooltips/data.
-            self.agent_combo.addItem("Agent", agent_id)
+            # Use the agent's label for display
+            self.agent_combo.addItem(agent_info.get("label", "Agent"), agent_id)
         default_index = self.agent_combo.findData(default_agent_id)
         if default_index >= 0:
             self.agent_combo.setCurrentIndex(default_index)
@@ -3833,6 +3833,9 @@ Keywords: {keywords_str}"""
             self._add_message_to_conversation('assistant', "Please enter a question.")
             return
         
+        # Clear the search bar after getting the question
+        self.question_input.clear()
+        
         # Add user's question to conversation view
         self._add_message_to_conversation('user', question)
         
@@ -4937,6 +4940,9 @@ Keywords: {keywords_str}"""
         if not question:
             self._add_message_to_conversation('assistant', "Please enter a question.")
             return
+        
+        # Clear the search bar after getting the question
+        self._detached_question_input.clear()
         
         # Add user's question to conversation view
         self._add_message_to_conversation('user', question)
