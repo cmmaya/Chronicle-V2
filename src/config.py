@@ -63,7 +63,7 @@ SUMMARIZATION = {
 SESSION = {
     # Auto-generate summary after session stops
     # When True, a summary will be generated automatically when the session is stopped
-    "auto_summary_after_stop": False,
+    "auto_summary_after_stop": True,
 }
 
 

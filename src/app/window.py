@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
-                                QToolButton)
+                                QToolButton, QToolBar)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel
 from PySide6.QtGui import QAction, QPixmap, QColor
 from typing import Optional
@@ -210,6 +210,7 @@ class MainWindow(QMainWindow):
         
         # Create UI components
         self._create_menu_bar()
+        self._load_preferences()
         self._create_central_widget()
         self._create_status_bar()
         
@@ -2105,6 +2106,22 @@ Keywords: {keywords_str}"""
         
         settings_menu = menu_bar.addMenu('Settings')
         
+        # Enable live transcription option
+        self.live_transcription_action = QAction('Enable Live Transcription', self)
+        self.live_transcription_action.setCheckable(True)
+        self.live_transcription_action.setChecked(True)
+        self.live_transcription_action.triggered.connect(lambda checked: self._on_live_transcription_toggled(checked))
+        settings_menu.addAction(self.live_transcription_action)
+        
+        # Auto-generate summary option
+        self.auto_summary_action = QAction('Auto-generate Summary', self)
+        self.auto_summary_action.setCheckable(True)
+        self.auto_summary_action.setChecked(True)
+        self.auto_summary_action.triggered.connect(lambda checked: self._on_auto_summary_toggled(checked))
+        settings_menu.addAction(self.auto_summary_action)
+        
+        settings_menu.addSeparator()
+        
         # VAD settings action
         vad_action = QAction('VAD Settings...', self)
         vad_action.triggered.connect(self._show_vad_settings)
@@ -2123,6 +2140,58 @@ Keywords: {keywords_str}"""
         help_menu.addAction(about_action)
         
         self.setMenuBar(menu_bar)
+
+    def _on_live_transcription_toggled(self, checked):
+        """Handle live transcription toggle from menu."""
+        self.live_transcription_action.setChecked(checked)
+        self._save_preferences()
+
+    def _on_auto_summary_toggled(self, checked):
+        """Handle auto summary toggle from menu."""
+        self.auto_summary_action.setChecked(checked)
+        self._save_preferences()
+
+    def _get_preferences_path(self):
+        """Get the path to the preferences file."""
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return os.path.join(project_root, 'preferences.json')
+
+    def _load_preferences(self):
+        """Load preferences from file."""
+        import os, json
+        prefs_path = self._get_preferences_path()
+        if os.path.exists(prefs_path):
+            try:
+                with open(prefs_path, 'r') as f:
+                    prefs = json.load(f)
+                    # Also update SESSION config for session_manager
+                    SESSION['auto_summary_after_stop'] = prefs.get('auto_summary_after_stop', True)
+                    # Set menu actions state
+                    if hasattr(self, 'live_transcription_action'):
+                        self.live_transcription_action.setChecked(prefs.get('enable_live_transcription', True))
+                    if hasattr(self, 'auto_summary_action'):
+                        self.auto_summary_action.setChecked(prefs.get('auto_summary_after_stop', True))
+                    return prefs
+            except Exception:
+                pass
+        return {'enable_live_transcription': True, 'auto_summary_after_stop': True}
+
+    def _save_preferences(self):
+        """Save preferences to file."""
+        import os, json
+        prefs_path = self._get_preferences_path()
+        # Use menu actions state (they always exist)
+        enable_live = self.live_transcription_action.isChecked() if hasattr(self, 'live_transcription_action') else True
+        auto_summary = self.auto_summary_action.isChecked() if hasattr(self, 'auto_summary_action') else True
+        prefs = {
+            'enable_live_transcription': enable_live,
+            'auto_summary_after_stop': auto_summary
+        }
+        with open(prefs_path, 'w') as f:
+            json.dump(prefs, f)
+        # Also update SESSION config for session_manager
+        SESSION['auto_summary_after_stop'] = auto_summary
     
     def _create_central_widget(self):
         """Create the central widget with session controls."""
@@ -2228,20 +2297,6 @@ Keywords: {keywords_str}"""
         session_layout.addWidget(self.session_name_input)
         session_layout.addStretch()
         center_layout.addLayout(session_layout)
-        
-        # Spacer
-        center_layout.addStretch()
-        
-        # Live transcription checkbox
-        self.live_transcription_checkbox = QCheckBox('Enable live transcription')
-        self.live_transcription_checkbox.setChecked(True)
-        center_layout.addWidget(self.live_transcription_checkbox)
-        
-        # Auto summary checkbox
-        self.auto_summary_checkbox = QCheckBox('Auto-generate summary after session stop')
-        self.auto_summary_checkbox.setChecked(SESSION.get('auto_summary_after_stop', False))
-        self.auto_summary_checkbox.toggled.connect(lambda checked: SESSION.__setitem__('auto_summary_after_stop', checked))
-        center_layout.addWidget(self.auto_summary_checkbox)
         
         # Spacer
         center_layout.addStretch()
@@ -3406,7 +3461,7 @@ Keywords: {keywords_str}"""
             session_name = f"Session {now.strftime('%Y-%m-%d %H:%M')}"
             
             # Start session via manager (auto-starts recording)
-            enable_live = self.live_transcription_checkbox.isChecked()
+            enable_live = self.live_transcription_action.isChecked()
             self.session_manager.start_session(session_name, auto_record=True, enable_live_transcription=enable_live)
             
             # Update UI
