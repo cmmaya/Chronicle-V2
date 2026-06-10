@@ -1,241 +1,376 @@
-"""Reusable pixel-styled widgets for Chronicle."""
-from __future__ import annotations
-
-from pathlib import Path
-
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPixmap, QTransform
 from PySide6.QtWidgets import (
-    QFrame,
-    QGraphicsDropShadowEffect,
-    QHBoxLayout,
+    QWidget,
     QLabel,
     QPushButton,
     QToolButton,
-    QVBoxLayout,
-    QWidget,
+    QHBoxLayout,
+    QSizePolicy,
+)
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import (
+    QColor,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QBrush,
+    QFont,
 )
 
-from .pixel_theme import COLORS, asset_path
+
+# =========================
+# Palette
+# =========================
+
+NAVY = QColor("#061946")
+NAVY_INNER = QColor("#071D52")
+
+BORDER_BLUE = QColor("#254D9C")
+BORDER_BLUE_LIGHT = QColor("#3A67C7")
+
+BUTTON_BLUE = QColor("#274F9B")
+BUTTON_BLUE_HOVER = QColor("#315DB1")
+BUTTON_BLUE_PRESSED = QColor("#1E3F82")
+
+CREAM = QColor("#F6E0A6")
+CREAM_BORDER = QColor("#FFEFC1")
+
+BUBBLE_BLUE = QColor("#294F9D")
+BUBBLE_BLUE_BORDER = QColor("#3765BD")
+
+TEXT_LIGHT = QColor("#FFF0BF")
+TEXT_DARK = QColor("#071846")
 
 
-def _hard_shadow(widget: QWidget, *, dx: int = 5, dy: int = 5, color: str | None = None) -> None:
-    """Attach a hard, non-blurred pixel-art drop shadow."""
-    effect = QGraphicsDropShadowEffect(widget)
-    effect.setBlurRadius(0)
-    effect.setOffset(dx, dy)
-    effect.setColor(QColor(color or COLORS["blue_bubble_shadow"]))
-    widget.setGraphicsEffect(effect)
+# =========================
+# Pixel geometry helpers
+# =========================
+
+def pixel_round_rect_path(x: int, y: int, w: int, h: int, cut: int = 10) -> QPainterPath:
+    """
+    Rectángulo con esquinas pixeladas.
+    No usa curvas; todo son segmentos rectos.
+    """
+    path = QPainterPath()
+    path.moveTo(x + cut, y)
+    path.lineTo(x + w - cut, y)
+    path.lineTo(x + w, y + cut)
+    path.lineTo(x + w, y + h - cut)
+    path.lineTo(x + w - cut, y + h)
+    path.lineTo(x + cut, y + h)
+    path.lineTo(x, y + h - cut)
+    path.lineTo(x, y + cut)
+    path.closeSubpath()
+    return path
 
 
-def _asset_exists(filename: str) -> bool:
-    return Path(asset_path(filename)).exists()
+# =========================
+# Panels
+# =========================
 
-
-def _asset_pixmap(filename: str) -> QPixmap:
-    return QPixmap(asset_path(filename))
-
-
-def _set_rotated_pixmap(label: QLabel, base: QPixmap, degrees: int) -> None:
-    if degrees:
-        label.setPixmap(base.transformed(QTransform().rotate(degrees), Qt.SmoothTransformation))
-    else:
-        label.setPixmap(base)
-
-
-class PixelPanel(QFrame):
-    """A bordered panel used for the main Chronicle columns.
-
-    If panel_corner_deco.svg exists, the panel automatically places the same
-    corner marker in all four corners. The labels are decorative only and do
-    not affect child layouts.
+class PixelPanel(QWidget):
+    """
+    Panel plano con borde pixelado, sin sombra ni bisel.
+    Úsalo para sidebar, workspace, panel de transcripciones y cajas internas.
     """
 
-    def __init__(self, parent=None, *, inner: bool = False, decorated: bool | None = None):
+    def __init__(self, parent=None, inner: bool = False):
         super().__init__(parent)
-        self._inner = inner
-        self._corner_labels: list[QLabel] = []
-        self.setObjectName("PixelPanelInner" if inner else "PixelPanel")
-        self.setFrameShape(QFrame.NoFrame)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        if not inner:
-            _hard_shadow(self, dx=4, dy=4, color="#031033")
+        self.inner = inner
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
 
-        should_decorate = (not inner) if decorated is None else decorated
-        if should_decorate and _asset_exists("panel_corner_deco.svg"):
-            base = _asset_pixmap("panel_corner_deco.svg")
-            rotations = (0, 90, 270, 180)
-            for degrees in rotations:
-                label = QLabel(self)
-                label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-                label.setFixedSize(18, 18)
-                label.setScaledContents(True)
-                _set_rotated_pixmap(label, base, degrees)
-                label.raise_()
-                self._corner_labels.append(label)
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if len(self._corner_labels) != 4:
+        rect = self.rect().adjusted(2, 2, -3, -3)
+        if rect.width() <= 0 or rect.height() <= 0:
             return
-        pad = 6
-        w = self.width()
-        h = self.height()
-        size = 18
-        positions = (
-            (pad, pad),
-            (w - size - pad, pad),
-            (pad, h - size - pad),
-            (w - size - pad, h - size - pad),
-        )
-        for label, (x, y) in zip(self._corner_labels, positions):
-            label.move(max(0, x), max(0, y))
 
+        cut = 10 if not self.inner else 7
+        fill = NAVY_INNER if self.inner else NAVY
+        border = BORDER_BLUE_LIGHT if self.inner else BORDER_BLUE
+
+        path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), cut)
+        painter.setBrush(QBrush(fill))
+        painter.setPen(QPen(border, 3))
+        painter.drawPath(path)
+
+        # Línea interna plana. Da definición sin crear efecto bisel.
+        inner_rect = rect.adjusted(6, 6, -6, -6)
+        if inner_rect.width() > 16 and inner_rect.height() > 16:
+            inner_path = pixel_round_rect_path(
+                inner_rect.x(),
+                inner_rect.y(),
+                inner_rect.width(),
+                inner_rect.height(),
+                max(4, cut - 3),
+            )
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#17387E"), 1))
+            painter.drawPath(inner_path)
+
+        super().paintEvent(event)
+
+
+# =========================
+# Titles
+# =========================
 
 class PixelSectionTitle(QLabel):
-    """Uppercase section title matching the mockup."""
+    def __init__(self, text: str, parent=None, center: bool = False):
+        super().__init__(text, parent)
+        self.setObjectName("PixelSectionTitle")
+        self.setAlignment(Qt.AlignCenter if center else Qt.AlignLeft)
 
-    def __init__(self, text: str, parent=None, *, center: bool = False):
-        super().__init__(text.upper(), parent)
-        self.setObjectName("SectionTitle")
-        self.setAlignment(Qt.AlignCenter if center else Qt.AlignLeft | Qt.AlignVCenter)
+        font = QFont("Courier New")
+        font.setPointSize(11)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 2)
+        self.setFont(font)
 
+        self.setStyleSheet(
+            """
+            QLabel#PixelSectionTitle {
+                color: #FFE9A8;
+                background: transparent;
+                border: none;
+            }
+            """
+        )
+
+
+# =========================
+# Buttons
+# =========================
 
 class PixelButton(QPushButton):
-    """Standard pixel button."""
+    """
+    Botón pixelado plano.
+    Acepta sidebar=True para compatibilidad con MainWindow.
+    """
 
-    def __init__(self, text: str = "", parent=None, *, sidebar: bool = False, icon_only: bool = False):
+    def __init__(self, text: str = "", parent=None, sidebar: bool = False):
         super().__init__(text, parent)
-        if sidebar:
-            self.setObjectName("SidebarButton")
-        elif icon_only:
-            self.setObjectName("IconButton")
+        self.sidebar = sidebar
         self.setCursor(Qt.PointingHandCursor)
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setObjectName("PixelButton")
+
+        if sidebar:
+            self.setMinimumHeight(64)
+        else:
+            self.setMinimumHeight(42)
+
+        font = QFont("Courier New")
+        font.setPointSize(10)
+        font.setBold(True)
+        self.setFont(font)
+
+        self.setStyleSheet(
+            """
+            QPushButton#PixelButton {
+                color: #FFF0BF;
+                background: #274F9B;
+                border: 3px solid #3A67C7;
+                padding: 8px 14px;
+                text-align: left;
+            }
+
+            QPushButton#PixelButton:hover {
+                background: #315DB1;
+            }
+
+            QPushButton#PixelButton:pressed {
+                background: #1E3F82;
+                padding-top: 10px;
+                padding-left: 16px;
+            }
+
+            QPushButton#PixelButton[iconOnly="true"] {
+                text-align: center;
+                padding: 6px;
+            }
+
+            QPushButton#PixelButton[iconOnly="true"]:pressed {
+                padding: 7px 5px 5px 7px;
+            }
+
+            QPushButton#PixelButton:disabled {
+                color: #8090B8;
+                background: #18336F;
+                border: 3px solid #284B94;
+            }
+            """
+        )
 
 
 class PixelToolButton(QToolButton):
-    """Icon-style pixel tool button."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("IconButton")
         self.setCursor(Qt.PointingHandCursor)
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setMinimumSize(QSize(52, 52))
+        self.setIconSize(QSize(28, 28))
+        self.setObjectName("PixelToolButton")
+
+        font = QFont("Courier New")
+        font.setPointSize(11)
+        font.setBold(True)
+        self.setFont(font)
+
+        self.setStyleSheet(
+            """
+            QToolButton#PixelToolButton {
+                color: #FFF0BF;
+                background: #274F9B;
+                border: 3px solid #3A67C7;
+                padding: 6px;
+            }
+
+            QToolButton#PixelToolButton:hover {
+                background: #315DB1;
+            }
+
+            QToolButton#PixelToolButton:pressed {
+                background: #1E3F82;
+            }
+
+            QToolButton#PixelToolButton:disabled {
+                color: #8090B8;
+                background: #18336F;
+                border: 3px solid #284B94;
+            }
+            """
+        )
 
 
-class PixelBubble(QFrame):
-    """Pixel chat bubble with blocky body, hard shadow, and square tail.
+# =========================
+# Chat bubbles
+# =========================
 
-    variant: 'cream' or 'blue'.
-    tail: 'left' or 'right'.
+class PixelBubble(QWidget):
+    """
+    Burbuja plana tipo mockup 2:
+    sin bisel, sin sombra, con esquinas pixeladas y cola pixelada.
     """
 
-    def __init__(self, text: str, parent=None, *, variant: str = "blue", tail: str = "left", max_width: int = 520):
+    def __init__(
+        self,
+        text: str,
+        variant: str = "blue",
+        tail: str = "left",
+        max_width: int = 520,
+        parent=None,
+    ):
         super().__init__(parent)
         self.variant = variant
         self.tail = tail
-        self.setMaximumWidth(max_width)
-        self.setFrameShape(QFrame.NoFrame)
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.cut = 7
+        self.tail_size = 13
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Minimum)
 
-        self.body = QFrame(self)
-        self.body.setFrameShape(QFrame.NoFrame)
-        self.body.setAttribute(Qt.WA_StyledBackground, True)
-        body_layout = QVBoxLayout(self.body)
-        body_layout.setContentsMargins(20, 14, 20, 14)
-        body_layout.setSpacing(0)
-
-        self.label = QLabel(text, self.body)
+        self.label = QLabel(text)
         self.label.setWordWrap(True)
         self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        body_layout.addWidget(self.label)
-        outer.addWidget(self.body)
+        self.label.setMaximumWidth(max_width)
 
-        tail_row = QHBoxLayout()
-        tail_row.setContentsMargins(0, 0, 0, 0)
-        tail_row.setSpacing(0)
+        font = QFont("Courier New")
+        font.setPointSize(11)
+        font.setBold(True)
+        self.label.setFont(font)
 
-        tail_asset_name = f"bubble_tail_{variant}_{tail}.svg"
-        self.tail_uses_asset = _asset_exists(tail_asset_name)
-        self.tail_asset_label: QLabel | None = None
-
-        if self.tail_uses_asset:
-            self.tail_block = QLabel(self)
-            self.tail_block.setFixedSize(18, 18)
-            self.tail_block.setScaledContents(True)
-            self.tail_block.setPixmap(_asset_pixmap(tail_asset_name))
-            self.tail_asset_label = self.tail_block
+        if variant == "cream":
+            self.label.setStyleSheet(
+                """
+                QLabel {
+                    color: #071846;
+                    background: transparent;
+                    border: none;
+                }
+                """
+            )
         else:
-            self.tail_block = QFrame(self)
-            self.tail_block.setFixedSize(18, 10)
-            self.tail_block.setAttribute(Qt.WA_StyledBackground, True)
+            self.label.setStyleSheet(
+                """
+                QLabel {
+                    color: #FFF0BF;
+                    background: transparent;
+                    border: none;
+                }
+                """
+            )
 
-        self.tail_shadow = QFrame(self)
-        self.tail_shadow.setFixedSize(10, 10)
-        self.tail_shadow.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(20, 12, 20, 14)
+        layout.setSpacing(0)
+        layout.addWidget(self.label)
 
-        if tail == "right":
-            tail_row.addStretch()
-            tail_row.addWidget(self.tail_block)
-            tail_row.addWidget(self.tail_shadow)
-            tail_row.addSpacing(10)
+    def _bubble_path(self) -> QPainterPath:
+        rect = self.rect().adjusted(1, 1, -3, -3)
+
+        if self.tail == "left":
+            body = rect.adjusted(self.tail_size, 0, 0, 0)
         else:
-            tail_row.addSpacing(10)
-            tail_row.addWidget(self.tail_shadow)
-            tail_row.addWidget(self.tail_block)
-            tail_row.addStretch()
-        outer.addLayout(tail_row)
+            body = rect.adjusted(0, 0, -self.tail_size, 0)
 
-        self._apply_style()
+        path = pixel_round_rect_path(body.x(), body.y(), body.width(), body.height(), self.cut)
+        tail_y = body.bottom() - 14
 
-    def _apply_style(self):
-        c = COLORS
+        if self.tail == "left":
+            path.moveTo(body.left(), tail_y)
+            path.lineTo(body.left() - self.tail_size, tail_y + 7)
+            path.lineTo(body.left(), tail_y + 11)
+            path.closeSubpath()
+        else:
+            path.moveTo(body.right(), tail_y)
+            path.lineTo(body.right() + self.tail_size, tail_y + 7)
+            path.lineTo(body.right(), tail_y + 11)
+            path.closeSubpath()
+
+        return path
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
         if self.variant == "cream":
-            bg = c["cream"]
-            shadow = c["cream_shadow"]
-            fg = c["text_dark"]
-            border = c["cream_light"]
+            fill = CREAM
+            border = CREAM_BORDER
         else:
-            bg = c["blue_bubble"]
-            shadow = c["blue_bubble_shadow"]
-            fg = c["text_light"]
-            border = c["blue_bubble_light"]
+            fill = BUBBLE_BLUE
+            border = BUBBLE_BLUE_BORDER
 
-        self.body.setStyleSheet(
-            "QFrame {"
-            f" background-color: {bg};"
-            f" border-top: 3px solid {border};"
-            f" border-left: 3px solid {border};"
-            f" border-right: 6px solid {shadow};"
-            f" border-bottom: 6px solid {shadow};"
-            "}"
-        )
-        if not self.tail_uses_asset:
-            self.tail_block.setStyleSheet(f"QFrame {{ background-color: {bg}; border: 0; }}")
-        self.tail_shadow.setStyleSheet(f"QFrame {{ background-color: {shadow}; border: 0; }}")
-        self.label.setStyleSheet(
-            f"QLabel {{ color: {fg}; background: transparent; font-size: 15px; line-height: 135%; font-weight: 800; }}"
-        )
+        path = self._bubble_path()
+        painter.setBrush(QBrush(fill))
+        painter.setPen(QPen(border, 2))
+        painter.drawPath(path)
+
+        super().paintEvent(event)
 
 
-def aligned_bubble(text: str, *, variant: str, align: str, max_width: int = 520) -> QWidget:
-    """Return a row widget containing an aligned PixelBubble."""
+def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_width: int = 520) -> QWidget:
+    """
+    Retorna una fila con burbuja alineada.
+    MainWindow ya usa esta función para chat y transcripts.
+    """
     row = QWidget()
-    row.setStyleSheet("background: transparent;")
+    row.setAttribute(Qt.WA_StyledBackground, False)
+    row.setAutoFillBackground(False)
+
     layout = QHBoxLayout(row)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(0)
-    bubble = PixelBubble(text, variant=variant, tail="right" if align == "right" else "left", max_width=max_width)
-    row.setProperty("bubble", bubble)
+
+    tail = "right" if align == "right" else "left"
+    bubble = PixelBubble(text=text, variant=variant, tail=tail, max_width=max_width)
+
     if align == "right":
-        layout.addStretch()
-        layout.addWidget(bubble)
+        layout.addStretch(1)
+        layout.addWidget(bubble, 0, Qt.AlignRight)
     else:
-        layout.addWidget(bubble)
-        layout.addStretch()
+        layout.addWidget(bubble, 0, Qt.AlignLeft)
+        layout.addStretch(1)
+
     return row

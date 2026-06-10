@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
-                                QToolButton, QToolBar)
+                                QToolButton, QToolBar, QBoxLayout, QSizePolicy)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize
 from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence
 from typing import Optional
@@ -210,6 +210,14 @@ class MainWindow(QMainWindow):
         
         # Session search components
         self._recent_sessions = []  # Store sessions for dropdown
+
+        # Sidebar collapse state. The collapsed rail keeps action/session icons visible
+        # and gives the reclaimed horizontal space only to the answers viewport.
+        self._sidebar_collapsed = False
+        self._sidebar_expanded_min_width = 286
+        self._sidebar_expanded_max_width = 318
+        self._sidebar_collapsed_width = 86
+        self._center_control_max_width = 900
         
         # Create UI components
         self._create_menu_bar()
@@ -2216,14 +2224,17 @@ Keywords: {keywords_str}"""
         central_layout = QHBoxLayout(central_widget)
         central_layout.setContentsMargins(8, 8, 8, 8)
         central_layout.setSpacing(10)
+        self.central_layout = central_layout
 
         self.left_shell = self._build_left_sidebar()
         self.center_shell = self._build_center_workspace()
         self.right_shell = self._build_transcripts_panel()
 
-        # Phase 3: reference-like column rhythm: compact left rail, dominant chat,
-        # visible transcript rail. Fixed side widths keep the composition close to
-        # the second mockup across window sizes.
+        # Three zones:
+        # - left_shell is collapsible
+        # - right_shell remains fixed
+        # - center_shell is the only column with horizontal stretch
+        # Inside center_shell, only the answers viewport consumes the extra width.
         central_layout.addWidget(self.left_shell, 0)
         central_layout.addWidget(self.center_shell, 1)
         central_layout.addWidget(self.right_shell, 0)
@@ -2231,8 +2242,8 @@ Keywords: {keywords_str}"""
     def _build_left_sidebar(self) -> QWidget:
         """Build the left Chronicle sidebar: brand, actions, history, controls."""
         panel = PixelPanel()
-        panel.setMinimumWidth(286)
-        panel.setMaximumWidth(318)
+        panel.setMinimumWidth(self._sidebar_expanded_min_width)
+        panel.setMaximumWidth(self._sidebar_expanded_max_width)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
@@ -2240,16 +2251,17 @@ Keywords: {keywords_str}"""
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
-        brand = QLabel("Chronicle")
-        brand.setObjectName("BrandTitle")
-        header.addWidget(brand, 1)
+        self.sidebar_brand = QLabel("Chronicle")
+        self.sidebar_brand.setObjectName("BrandTitle")
+        header.addWidget(self.sidebar_brand, 1)
 
         self.sidebar_menu_button = PixelToolButton()
         self.sidebar_menu_button.setIcon(self._make_icon("icon_menu.svg"))
         self.sidebar_menu_button.setIconSize(QSize(34, 34))
         self.sidebar_menu_button.setText("☰")
-        self.sidebar_menu_button.setToolTip("Menu")
+        self.sidebar_menu_button.setToolTip("Collapse sidebar")
         self.sidebar_menu_button.setMinimumSize(56, 56)
+        self.sidebar_menu_button.clicked.connect(self._toggle_left_sidebar)
         header.addWidget(self.sidebar_menu_button, 0)
         layout.addLayout(header)
 
@@ -2271,7 +2283,14 @@ Keywords: {keywords_str}"""
         self.settings_button.clicked.connect(lambda: self.menuBar().show() if self.menuBar().isHidden() else self.menuBar().hide())
         layout.addWidget(self.settings_button)
 
-        history_panel = PixelPanel(inner=True)
+        self._sidebar_action_buttons = [
+            (self.new_chat_button, "   New Chat", "New chat"),
+            (self.search_chats_button, "   Search Chats", "Search chats"),
+            (self.settings_button, "   Settings", "Settings"),
+        ]
+
+        self.sidebar_history_panel = PixelPanel(inner=True)
+        history_panel = self.sidebar_history_panel
         history_layout = QVBoxLayout(history_panel)
         history_layout.setContentsMargins(10, 10, 10, 10)
         history_layout.setSpacing(8)
@@ -2284,9 +2303,15 @@ Keywords: {keywords_str}"""
         history_layout.addWidget(self.conversations_list, 1)
         layout.addWidget(history_panel, 1)
 
+        self.sidebar_collapse_spacer = QWidget()
+        self.sidebar_collapse_spacer.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+        self.sidebar_collapse_spacer.setVisible(False)
+        layout.addWidget(self.sidebar_collapse_spacer, 1)
+
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 4, 0, 0)
         controls.setSpacing(8)
+        self.sidebar_controls_layout = controls
 
         self.play_stop_button = self._create_icon_tool_button("icon_play.svg", "▶", "Start/Stop Session", self._on_play_stop_clicked)
         controls.addWidget(self.play_stop_button)
@@ -2308,8 +2333,99 @@ Keywords: {keywords_str}"""
         self.view_screenshots_icon_button.setVisible(False)
         controls.addWidget(self.view_screenshots_icon_button)
 
+        self._sidebar_session_control_buttons = [
+            self.play_stop_button,
+            self.pause_icon_button,
+            self.stop_visual_button,
+            self.screenshot_icon_button,
+            self.view_summary_icon_button,
+            self.view_screenshots_icon_button,
+        ]
+
         layout.addLayout(controls)
         return panel
+
+    def _set_style_property(self, widget: QWidget, name: str, value):
+        """Set a dynamic Qt style property and force QSS to re-evaluate it."""
+        widget.setProperty(name, value)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
+    def _toggle_left_sidebar(self):
+        """Collapse/expand the left navigation panel."""
+        self._set_left_sidebar_collapsed(not self._sidebar_collapsed)
+
+    def _set_left_sidebar_collapsed(self, collapsed: bool):
+        """
+        Collapsed layout contract:
+        - the left rail becomes icon-only;
+        - New Chat, Search Chats and Settings remain visible as icons;
+        - session controls remain visible as icon buttons at the bottom;
+        - history/brand text disappear;
+        - the right transcript panel and center control bars keep their dimensions;
+        - only the answer scroll viewport receives the reclaimed horizontal space.
+        """
+        self._sidebar_collapsed = collapsed
+
+        if collapsed:
+            self.left_shell.setMinimumWidth(self._sidebar_collapsed_width)
+            self.left_shell.setMaximumWidth(self._sidebar_collapsed_width)
+            self.sidebar_brand.setVisible(False)
+            self.sidebar_history_panel.setVisible(False)
+            self.sidebar_collapse_spacer.setVisible(True)
+
+            self.sidebar_menu_button.setText("›")
+            self.sidebar_menu_button.setToolTip("Expand sidebar")
+            self.sidebar_menu_button.setMinimumSize(54, 54)
+            self.sidebar_menu_button.setMaximumSize(54, 54)
+
+            for button, _expanded_text, tooltip in self._sidebar_action_buttons:
+                button.setText("")
+                button.setToolTip(tooltip)
+                self._set_style_property(button, "iconOnly", True)
+                button.setMinimumSize(54, 54)
+                button.setMaximumSize(54, 54)
+
+            self.sidebar_controls_layout.setDirection(QBoxLayout.TopToBottom)
+            self.sidebar_controls_layout.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+            self.sidebar_controls_layout.setSpacing(8)
+            for button in self._sidebar_session_control_buttons:
+                button.setMinimumSize(54, 54)
+                button.setMaximumSize(54, 54)
+
+            self._answer_layout.setContentsMargins(32, 18, 32, 18)
+        else:
+            self.left_shell.setMinimumWidth(self._sidebar_expanded_min_width)
+            self.left_shell.setMaximumWidth(self._sidebar_expanded_max_width)
+            self.sidebar_brand.setVisible(True)
+            self.sidebar_history_panel.setVisible(True)
+            self.sidebar_collapse_spacer.setVisible(False)
+
+            self.sidebar_menu_button.setText("☰")
+            self.sidebar_menu_button.setToolTip("Collapse sidebar")
+            self.sidebar_menu_button.setMinimumSize(56, 56)
+            self.sidebar_menu_button.setMaximumSize(16777215, 16777215)
+
+            for button, expanded_text, tooltip in self._sidebar_action_buttons:
+                button.setText(expanded_text)
+                button.setToolTip(tooltip)
+                self._set_style_property(button, "iconOnly", False)
+                button.setMinimumHeight(64)
+                button.setMaximumSize(16777215, 16777215)
+
+            self.sidebar_controls_layout.setDirection(QBoxLayout.LeftToRight)
+            self.sidebar_controls_layout.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+            self.sidebar_controls_layout.setSpacing(8)
+            for button in self._sidebar_session_control_buttons:
+                button.setMinimumSize(54, 54)
+                button.setMaximumSize(16777215, 16777215)
+
+            self._answer_layout.setContentsMargins(42, 18, 42, 18)
+
+        self.left_shell.updateGeometry()
+        self.center_shell.updateGeometry()
+        self._answer_scroll_area.updateGeometry()
 
     def _build_center_workspace(self) -> QWidget:
         """Build the central answers/chat workspace."""
@@ -2323,6 +2439,7 @@ Keywords: {keywords_str}"""
         # while preserving the existing combo, search input and button attributes.
         top_bar_frame = QFrame()
         top_bar_frame.setObjectName("UnifiedSearchBar")
+        top_bar_frame.setMaximumWidth(self._center_control_max_width)
         top_bar = QHBoxLayout(top_bar_frame)
         top_bar.setContentsMargins(10, 4, 8, 4)
         top_bar.setSpacing(6)
@@ -2360,7 +2477,7 @@ Keywords: {keywords_str}"""
         self._session_completer.activated.connect(self._on_session_completer_selected)
         self.session_search_input.setCompleter(self._session_completer)
         self._refresh_session_completer()
-        layout.addWidget(top_bar_frame)
+        layout.addWidget(top_bar_frame, 0, Qt.AlignHCenter)
 
         # Tab buttons removed - keeping UI cleaner
         # Original tabs: ANSWERS and CHAT
@@ -2396,6 +2513,7 @@ Keywords: {keywords_str}"""
 
         input_bar = QFrame()
         input_bar.setObjectName("ChatInputBar")
+        input_bar.setMaximumWidth(self._center_control_max_width)
         input_layout = QHBoxLayout(input_bar)
         input_layout.setContentsMargins(16, 6, 10, 6)
         input_layout.setSpacing(8)
@@ -2435,7 +2553,7 @@ Keywords: {keywords_str}"""
         self.ask_enter_shortcut = QShortcut(QKeySequence("Ctrl+Enter"), self.question_input)
         self.ask_enter_shortcut.activated.connect(self._on_ask_clicked)
 
-        layout.addWidget(input_bar, 0)
+        layout.addWidget(input_bar, 0, Qt.AlignHCenter)
 
         self.candidate_group = PixelPanel(inner=True)
         candidate_layout = QVBoxLayout(self.candidate_group)
@@ -2455,7 +2573,8 @@ Keywords: {keywords_str}"""
 
         self.app_logs_button = PixelButton("App Logs")
         self.app_logs_button.setObjectName("AppLogsButton")
-        layout.addWidget(self.app_logs_button)
+        self.app_logs_button.setMaximumWidth(self._center_control_max_width)
+        layout.addWidget(self.app_logs_button, 0, Qt.AlignHCenter)
         return panel
 
     def _build_transcripts_panel(self) -> QWidget:
@@ -2508,7 +2627,7 @@ Keywords: {keywords_str}"""
     
     def _create_transcription_view(self) -> QWidget:
         """Create the right-panel pixel transcript stream."""
-        wrapper = QFrame()
+        wrapper = PixelPanel(inner=True)
         wrapper.setObjectName("TranscriptViewport")
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
