@@ -2362,18 +2362,8 @@ Keywords: {keywords_str}"""
         self._refresh_session_completer()
         layout.addWidget(top_bar_frame)
 
-        tabs = QHBoxLayout()
-        tabs.setContentsMargins(0, 2, 0, 0)
-        tabs.addStretch()
-        self.answers_tab = PixelButton("ANSWERS")
-        self.answers_tab.setObjectName("TabLabel")
-        self.chat_tab = PixelButton("CHAT")
-        self.chat_tab.setObjectName("TabLabel")
-        tabs.addWidget(self.answers_tab)
-        tabs.addSpacing(16)
-        tabs.addWidget(self.chat_tab)
-        tabs.addStretch()
-        layout.addLayout(tabs)
+        # Tab buttons removed - keeping UI cleaner
+        # Original tabs: ANSWERS and CHAT
 
         self._scope_label = QLabel("Scope: (none)")
         self._scope_label.setObjectName("ScopeLabel")
