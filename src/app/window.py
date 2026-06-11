@@ -252,33 +252,43 @@ class MainWindow(QMainWindow):
     
     def _clear_scope(self):
         """Clear the current scope and reset to default state."""
-        # Clear selected session
-        self._selected_session_id = None
-        
-        # Clear transcriptions view
-        self._clear_transcription_view()
-        
-        # Close detached window if exists
-        if hasattr(self, '_detached_window') and self._detached_window:
-            self._on_close_detached_window()
-        
-        # Check if there's an active session and set scope to it
+        # Check if there's an active session
+        has_active_session = False
         if self.session_manager:
             active_session = self.session_manager.get_active_session()
-            if active_session:
-                self._selected_session_id = active_session.id
-                # Load all transcripts from the active session (not just recent ones)
-                # Allow live transcriptions to be shown alongside
-                self._load_transcripts_for_session(active_session.id, allow_live=True)
-                self._on_status_update(f"Scope set to active session: {active_session.name}")
-            else:
-                self._on_status_update("Scope cleared - no active session")
+            has_active_session = active_session is not None
+        
+        if has_active_session:
+            # Case 1: There's an active session - set scope to "Current Session"
+            active_session = self.session_manager.get_active_session()
+            self._selected_session_id = active_session.id
+            self.scope_combo.setCurrentIndex(0)  # "Current Session"
+            # Clear transcriptions view first, then load fresh
+            self._clear_transcription_view()
+            self._load_transcripts_for_session(active_session.id, allow_live=True)
+            self._on_status_update(f"Scope set to active session: {active_session.name}")
+        else:
+            # Case 2: No active session - clear selection and set scope to "Any Session"
+            # Clear selected session
+            self._selected_session_id = None
+            
+            # Clear transcriptions view
+            self._clear_transcription_view()
+            
+            # Close detached window if exists
+            if hasattr(self, '_detached_window') and self._detached_window:
+                self._on_close_detached_window()
+            
+            # Reset scope combo to "Any Session" (index 1)
+            self.scope_combo.setCurrentIndex(1)
+            
+            # Clear the session search input
+            self.session_search_input.clear()
+            
+            self._on_status_update("Scope cleared - no active session")
         
         # Update the scope label
         self._update_scope_label()
-        
-        # Reset scope combo to "Any Session" (index 1)
-        self.scope_combo.setCurrentIndex(1)
         
         logger.info("Scope cleared via ESC key")
 
@@ -3539,6 +3549,15 @@ Keywords: {keywords_str}"""
             
             # Update UI
             self._update_ui_state()
+            
+            # Update scope to "Current Session" with the newly started session
+            active_session = self.session_manager.get_active_session()
+            if active_session:
+                self._selected_session_id = active_session.id
+                self.scope_combo.setCurrentIndex(0)  # "Current Session"
+                self.session_search_input.setText(active_session.name)
+                self._update_scope_label()
+                self._load_session_transcripts_for_current_session(allow_live=True)
             
         except Exception as e:
             self._on_status_update(f'Failed to start session: {str(e)}', is_error=True)
