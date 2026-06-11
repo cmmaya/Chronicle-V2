@@ -274,7 +274,7 @@ class PixelBubble(QWidget):
         font.setPointSize(12)
         font.setBold(True)
         self.label.setFont(font)
-        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         if variant == "cream":
             self.label.setStyleSheet(
@@ -283,6 +283,7 @@ class PixelBubble(QWidget):
                     color: #071846;
                     background: transparent;
                     border: none;
+                    padding-right: 6px;
                 }
                 """
             )
@@ -293,12 +294,13 @@ class PixelBubble(QWidget):
                     color: #FFF0BF;
                     background: transparent;
                     border: none;
+                    padding-right: 6px;
                 }
                 """
             )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(22, 14, 22, 16)
+        layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(0)
         layout.addWidget(self.label)
 

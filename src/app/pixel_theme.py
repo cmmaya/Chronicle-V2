@@ -202,6 +202,23 @@ def app_qss() -> str:
         selection-color: #FFF0BF;
     }
 
+    /* Style for QCompleter popup (session search dropdown) */
+    QCompleter {
+        background-color: #071D52;
+        color: #FFFFFF;
+        border: 2px solid #3E6B9B;
+    }
+
+    QCompleter QAbstractItemView {
+        background-color: #071D52;
+        color: #FFFFFF;
+        border: 2px solid #3E6B9B;
+        selection-background-color: #3E6B9B;
+        selection-color: #FFFFFF;
+        font-family: "Courier New";
+        font-size: 14px;
+    }
+
     QComboBox#ScopeCombo,
     QComboBox#AgentCombo,
     QLineEdit#SessionSearchInput {

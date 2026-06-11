@@ -6,14 +6,14 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
                                 QToolButton, QToolBar, QBoxLayout, QSizePolicy)
-from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize
+from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint
 from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence
 from typing import Optional
 import logging
 
 from .session_manager import SessionManager
 from .pixel_theme import app_qss, asset_path
-from .pixel_widgets import PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, aligned_bubble
+from .pixel_widgets import PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, aligned_bubble, NAVY_INNER
 from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
@@ -167,6 +167,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('Chronicle')
         self.resize(1800, 768)
         self.setMinimumSize(1400, 690)
+        self.showMaximized()
 
         
         # Get project root directory (parent of src/)
@@ -2491,12 +2492,25 @@ Keywords: {keywords_str}"""
         self._session_completer.setMaxVisibleItems(5)
         self._session_completer.activated.connect(self._on_session_completer_selected)
         self.session_search_input.setCompleter(self._session_completer)
+        
+        # Apply navy style to completer popup
+        self._session_completer.popup().setStyleSheet("""
+            QAbstractItemView {
+                background-color: #071D52;
+                color: #FFFFFF;
+                border: 2px solid #3E6B9B;
+                selection-background-color: #3E6B9B;
+                selection-color: #FFFFFF;
+                font-family: "Courier New";
+                font-size: 14px;
+            }
+        """)
         self._refresh_session_completer()
 
-        # Expandable horizontal container for top bar with 24px margins
+        # Fixed-width horizontal container for top bar
         top_bar_container = QHBoxLayout()
-        top_bar_container.setContentsMargins(24, 0, 24, 0)
-        top_bar_container.addWidget(top_bar_frame)
+        top_bar_container.setContentsMargins(0, 0, 0, 0)
+        top_bar_container.addWidget(top_bar_frame, 0, Qt.AlignHCenter)
         layout.addLayout(top_bar_container, 0)
 
         # Tab buttons removed - keeping UI cleaner
@@ -2579,10 +2593,10 @@ Keywords: {keywords_str}"""
         self.ask_enter_shortcut = QShortcut(QKeySequence("Ctrl+Enter"), self.question_input)
         self.ask_enter_shortcut.activated.connect(self._on_ask_clicked)
 
-        # Expandable horizontal container for input bar with 24px margins
+        # Fixed-width horizontal container for input bar
         input_bar_container = QHBoxLayout()
-        input_bar_container.setContentsMargins(24, 0, 24, 0)
-        input_bar_container.addWidget(input_bar)
+        input_bar_container.setContentsMargins(0, 0, 0, 0)
+        input_bar_container.addWidget(input_bar, 0, Qt.AlignHCenter)
         layout.addLayout(input_bar_container, 0)
 
         self.candidate_group = PixelPanel(inner=True)
@@ -2644,11 +2658,60 @@ Keywords: {keywords_str}"""
         return panel
 
     def _cycle_transcription_filter(self):
-        """Cycle the hidden transcript filter combo from the pixel funnel button."""
+        """Show a dropdown menu with transcript filter options."""
         if not hasattr(self, '_transcription_filter_combo'):
             return
-        next_index = (self._transcription_filter_combo.currentIndex() + 1) % self._transcription_filter_combo.count()
-        self._transcription_filter_combo.setCurrentIndex(next_index)
+        
+        # Create the menu if it doesn't exist
+        menu = QMenu(self.transcript_filter_button)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #071D52;
+                border: 2px solid #3E6B9B;
+                color: #FFFFFF;
+                padding: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #3E6B9B;
+            }
+            QMenu::indicator {
+                width: 14px;
+                height: 14px;
+            }
+        """)
+        
+        # Get current filter to check the active option
+        current_filter = self._transcription_filter
+        
+        # Add filter options
+        all_action = menu.addAction("All")
+        all_action.setCheckable(True)
+        all_action.setChecked(current_filter == 'all')
+        
+        mic_action = menu.addAction("Mic")
+        mic_action.setCheckable(True)
+        mic_action.setChecked(current_filter == 'mic')
+        
+        system_action = menu.addAction("System")
+        system_action.setCheckable(True)
+        system_action.setChecked(current_filter == 'system')
+        
+        # Connect actions to filter change
+        def set_filter(filter_value):
+            # Find and set the combo index
+            for i in range(self._transcription_filter_combo.count()):
+                if self._transcription_filter_combo.itemData(i) == filter_value:
+                    self._transcription_filter_combo.setCurrentIndex(i)
+                    break
+        
+        all_action.triggered.connect(lambda: set_filter('all'))
+        mic_action.triggered.connect(lambda: set_filter('mic'))
+        system_action.triggered.connect(lambda: set_filter('system'))
+        
+        # Show menu below the button
+        menu.exec(self.transcript_filter_button.mapToGlobal(
+            QPoint(0, self.transcript_filter_button.height())))
+    
     def _create_status_bar(self):
         """Create the status bar."""
         self.status_bar = QStatusBar()
@@ -2741,7 +2804,7 @@ Keywords: {keywords_str}"""
 
         align = "right" if role == 'user' else "left"
         variant = "cream" if role == 'user' else "blue"
-        row = aligned_bubble(text, variant=variant, align=align, max_width=620)
+        row = aligned_bubble(text, variant=variant, align=align, max_width=400)
         row.setProperty('role', role)
         row.setProperty('message_text', text)
 
@@ -2784,7 +2847,7 @@ Keywords: {keywords_str}"""
                 self._answer_layout.takeAt(index)
                 self._thinking_message_widget.deleteLater()
 
-        row = aligned_bubble(new_text, variant="blue", align="left", max_width=560)
+        row = aligned_bubble(new_text, variant="blue", align="left", max_width=400)
         row.setProperty('role', 'assistant')
         row.setProperty('message_text', new_text)
         self._answer_layout.insertWidget(
@@ -3150,11 +3213,16 @@ Keywords: {keywords_str}"""
             self._detached_window.raise_()
             return
         
+        # Hide the transcripts panel in the main UI
+        self.right_shell.hide()
+        
         # Create detached window with no parent (standalone window)
         # This ensures it doesn't minimize when main window minimizes
         self._detached_window = QDialog(None)  # No parent - standalone window
-        self._detached_window.setWindowTitle('Live Transcriptions')
-        self._detached_window.resize(400, 500)
+        self._detached_window.setWindowTitle('Transcriptions')
+        self._detached_window.resize(320, 550)
+        self._detached_window.setMinimumSize(300, 400)
+        self._detached_window.setMaximumSize(340, 800)
         
         # Set window flags: stay on top but not as modal
         self._detached_window.setWindowFlags(
@@ -3167,58 +3235,134 @@ Keywords: {keywords_str}"""
         # Prevent the detached window from activating the main window when minimized
         self._detached_window.setAttribute(Qt.WA_QuitOnClose, False)
         
-        layout = QVBoxLayout(self._detached_window)
+        # Connect the finished signal to restore the transcripts panel when closed
+        self._detached_window.finished.connect(self._on_close_detached_window)
         
-        # Label
-        label = QLabel('Live Transcriptions')
-        label_font = label.font()
-        label_font.setPointSize(16)
-        label_font.setBold(True)
-        label.setFont(label_font)
-        layout.addWidget(label)
+        # Use PixelPanel for consistent styling - same structure as main transcripts panel
         
-        # Filter controls row
-        filter_layout = QHBoxLayout()
+        # Main panel (outer) - similar to _build_transcripts_panel
+        main_panel = PixelPanel()
+        main_panel.setMinimumWidth(300)
+        main_panel.setMaximumWidth(340)
         
-        filter_label = QLabel("Filter:")
-        filter_layout.addWidget(filter_label)
+        self._detached_window.setLayout(QVBoxLayout(self._detached_window))
+        self._detached_window.layout().setContentsMargins(0, 0, 0, 0)
+        self._detached_window.layout().addWidget(main_panel)
         
-        # Filter combo box for detached window
+        layout = QVBoxLayout(main_panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        
+        # Top controls row with filter button
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+        top.addStretch()
+        
+        # Use same filter button style as main panel
+        self._detached_filter_button = PixelToolButton()
+        self._detached_filter_button.setIcon(self._make_icon("icon_filter.svg"))
+        self._detached_filter_button.setIconSize(QSize(28, 28))
+        self._detached_filter_button.setText("⌄")
+        self._detached_filter_button.setToolTip("Filter transcripts")
+        self._detached_filter_button.clicked.connect(self._show_detached_filter_menu)
+        top.addWidget(self._detached_filter_button)
+        
+        # Hidden filter combo for state management
         self._detached_filter_combo = QComboBox()
         self._detached_filter_combo.addItem("All", "all")
-        self._detached_filter_combo.addItem("You (mic)", "mic")
-        self._detached_filter_combo.addItem("Them (system)", "system")
+        self._detached_filter_combo.addItem("Mic", "mic")
+        self._detached_filter_combo.addItem("System", "system")
         self._detached_filter_combo.currentIndexChanged.connect(self._on_detached_filter_changed)
-        filter_layout.addWidget(self._detached_filter_combo)
+        self._detached_filter_combo.setVisible(False)
         
-        filter_layout.addStretch()
-        layout.addLayout(filter_layout)
+        layout.addLayout(top)
         
-        # Use same chat-like view as main window
+        layout.addWidget(PixelSectionTitle("TRANSCRIPTIONS WINDOW", center=True))
+        
+        # Inner panel with background - same as _create_transcription_view
+        # Use PixelPanel(inner=True) which has its own border painted
+        wrapper = PixelPanel(inner=True)
+        wrapper.setObjectName("TranscriptViewport")
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(2, 2, 2, 2)  # Small margin to show border
+        wrapper_layout.setSpacing(0)
+        
+        wrapper_layout.addWidget(self._detached_filter_combo)
+        
+        # Use same scroll area and layout style as main panel
         self._detached_scroll_area = QScrollArea()
         self._detached_scroll_area.setWidgetResizable(True)
         self._detached_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._detached_scroll_area.setStyleSheet("background-color: #071D52; border: none;")
         
         self._detached_container = QWidget()
+        self._detached_container.setStyleSheet("background-color: #071D52;")
         self._detached_scroll_area.setWidget(self._detached_container)
         
         self._detached_layout = QVBoxLayout(self._detached_container)
-        self._detached_layout.setSpacing(10)
-        self._detached_layout.setContentsMargins(10, 10, 10, 10)
+        self._detached_layout.setSpacing(18)
+        self._detached_layout.setContentsMargins(12, 14, 12, 14)
         self._detached_layout.addStretch()
         
-        layout.addWidget(self._detached_scroll_area)
+        wrapper_layout.addWidget(self._detached_scroll_area, 1)
         
-        # Close button
-        close_button = QPushButton('Close')
-        close_button.clicked.connect(self._on_close_detached_window)
-        layout.addWidget(close_button)
+        layout.addWidget(wrapper, 1)
         
         # Copy existing transcriptions from history
         for text in self._transcription_history:
             self._add_transcription_to_detached(text)
         
         self._detached_window.show()
+    
+    def _show_detached_filter_menu(self):
+        """Show dropdown menu for filter options in detached window."""
+        if not hasattr(self, '_detached_filter_combo'):
+            return
+        
+        menu = QMenu(self._detached_filter_button)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #071D52;
+                border: 2px solid #3E6B9B;
+                color: #FFFFFF;
+                padding: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #3E6B9B;
+            }
+            QMenu::indicator {
+                width: 14px;
+                height: 14px;
+            }
+        """)
+        
+        current_filter = self._transcription_filter
+        
+        all_action = menu.addAction("All")
+        all_action.setCheckable(True)
+        all_action.setChecked(current_filter == 'all')
+        
+        mic_action = menu.addAction("Mic")
+        mic_action.setCheckable(True)
+        mic_action.setChecked(current_filter == 'mic')
+        
+        system_action = menu.addAction("System")
+        system_action.setCheckable(True)
+        system_action.setChecked(current_filter == 'system')
+        
+        def set_filter(filter_value):
+            for i in range(self._detached_filter_combo.count()):
+                if self._detached_filter_combo.itemData(i) == filter_value:
+                    self._detached_filter_combo.setCurrentIndex(i)
+                    break
+        
+        all_action.triggered.connect(lambda: set_filter('all'))
+        mic_action.triggered.connect(lambda: set_filter('mic'))
+        system_action.triggered.connect(lambda: set_filter('system'))
+        
+        menu.exec(self._detached_filter_button.mapToGlobal(
+            QPoint(0, self._detached_filter_button.height())))
     
     def _on_detached_filter_changed(self, index: int):
         """Handle the filter selection change in the detached window.
@@ -3258,16 +3402,15 @@ Keywords: {keywords_str}"""
                         bubble_frame.hide()
     
     def _add_transcription_to_detached(self, text: str):
-        """Add a transcription to the detached window using chat-like bubbles.
+        """Add a transcription to the detached window using aligned bubbles.
         
         Args:
             text: The transcription text (format: "[HH:MM:SS] Source: text")
         """
         # Parse the formatted text
         import re
-        timestamp = ''
         source = 'mic'
-        clean_text = text
+        display_text = text
         
         match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]\s+(Mic|System):\s+(.+)', text)
         if match:
@@ -3275,75 +3418,25 @@ Keywords: {keywords_str}"""
             source_match = match.group(2).lower()
             source = 'mic' if source_match == 'mic' else 'system'
             clean_text = match.group(3)
+            display_source = "Mic" if source == 'mic' else "System"
+            display_text = f"{display_source}: {clean_text}"
         
-        # Create bubble frame
-        bubble_frame = QFrame()
-        bubble_frame.setFrameShape(QFrame.StyledPanel)
-        bubble_frame.setFrameShadow(QFrame.Raised)
+        align = "right" if source == 'mic' else "left"
+        variant = "blue" if source == 'mic' else "cream"
         
-        # Store the source as a property for filtering
-        bubble_frame.setProperty('source', source)
+        row = aligned_bubble(display_text, variant=variant, align=align, max_width=250)
+        row.setProperty('source', source)
         
         # Check if this bubble should be visible based on current filter
         filter_value = self._detached_filter_combo.currentData() if hasattr(self, '_detached_filter_combo') else 'all'
         if filter_value == 'mic' and source != 'mic':
-            bubble_frame.hide()
+            row.hide()
         elif filter_value == 'system' and source != 'system':
-            bubble_frame.hide()
-        
-        bubble_layout = QVBoxLayout(bubble_frame)
-        bubble_layout.setContentsMargins(10, 8, 10, 8)
-        bubble_layout.setSpacing(4)
-        
-        # Header
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        source_label = QLabel(f"{'🎤 Mic' if source == 'mic' else '🔊 System'}")
-        source_font = source_label.font()
-        source_font.setPointSize(10)
-        source_font.setBold(True)
-        source_label.setFont(source_font)
-        
-        time_label = QLabel(timestamp)
-        time_label.setStyleSheet("color: gray;")
-        time_font = time_label.font()
-        time_font.setPointSize(9)
-        time_label.setFont(time_font)
-        
-        header_layout.addWidget(source_label)
-        header_layout.addStretch()
-        header_layout.addWidget(time_label)
-        
-        bubble_layout.addLayout(header_layout)
-        
-        # Text
-        text_label = QLabel(clean_text)
-        text_label.setWordWrap(True)
-        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bubble_layout.addWidget(text_label)
-        
-        # Style based on source
-        if source == 'mic':
-            bubble_frame.setStyleSheet("""
-                QFrame {
-                    background-color: #E3F2FD;
-                    border-radius: 10px;
-                    border: 1px solid #90CAF9;
-                }
-            """)
-        else:
-            bubble_frame.setStyleSheet("""
-                QFrame {
-                    background-color: #E8F5E9;
-                    border-radius: 10px;
-                    border: 1px solid #A5D6A7;
-                }
-            """)
+            row.hide()
         
         self._detached_layout.insertWidget(
             self._detached_layout.count() - 1,
-            bubble_frame
+            row
         )
         
         # Auto-scroll
@@ -3353,7 +3446,15 @@ Keywords: {keywords_str}"""
     
     def _on_close_detached_window(self):
         """Close the detached transcription window."""
+        # Restore the transcripts panel in the main UI
+        self.right_shell.show()
+        
         if self._detached_window:
+            # Disconnect the signal to prevent re-entrancy
+            try:
+                self._detached_window.finished.disconnect(self._on_close_detached_window)
+            except RuntimeError:
+                pass  # Signal was already disconnected
             self._detached_window.close()
             self._detached_window = None
             self._detached_display = None
