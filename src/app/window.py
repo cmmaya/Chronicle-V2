@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
                                 QToolButton, QToolBar, QBoxLayout, QSizePolicy)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint
-from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence
+from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence, QFont
 from typing import Optional
 import logging
 
@@ -2625,11 +2625,27 @@ Keywords: {keywords_str}"""
         self.candidate_group.setVisible(False)
         layout.addWidget(self.candidate_group)
 
-        self.app_logs_button = PixelButton("App Logs")
-        self.app_logs_button.setObjectName("AppLogsButton")
-        self.app_logs_button.setMaximumWidth(self._center_control_max_width)
-        self.app_logs_button.setMinimumHeight(46)
-        layout.addWidget(self.app_logs_button, 0, Qt.AlignHCenter)
+        # App Logs widget - muestra solo el último log (una línea)
+        self.app_logs_container = QWidget()
+        self.app_logs_container.setObjectName("AppLogsContainer")
+        self.app_logs_container.setMaximumWidth(1620)
+        self.app_logs_container.setMinimumHeight(30)
+        self.app_logs_layout = QVBoxLayout(self.app_logs_container)
+        self.app_logs_layout.setContentsMargins(0, 0, 0, 0)
+        self.app_logs_layout.setSpacing(0)
+        self.app_logs_layout.addStretch()
+
+        # Establecer fuente un poco más pequeña
+        log_font = QFont("Courier New")
+        log_font.setPointSize(10)
+        log_font.setBold(True)
+        self.app_logs_container.setFont(log_font)
+
+        layout.addWidget(self.app_logs_container, 0, Qt.AlignBottom | Qt.AlignHCenter)
+
+        # Almacenar mensajes de log para referencia (solo guardamos el último)
+        self._app_logs_messages = []
+
         return panel
 
     def _build_transcripts_panel(self) -> QWidget:
@@ -3122,11 +3138,70 @@ Keywords: {keywords_str}"""
         print(f"[DEBUG] Status update: {message}")
         self.status_label.setText(message)
         self.status_bar.showMessage(message)
-        
+
         if is_error:
             self.status_label.setStyleSheet("color: red;")
         else:
             self.status_label.setStyleSheet("")
+
+        # Also show in app logs widget
+        self._add_app_log(message, is_error)
+
+    def _add_app_log(self, message: str, is_error: bool = False):
+        """Add a log message to the app logs widget (shows only the last message).
+
+        Args:
+            message: The log message to display
+            is_error: Whether this is an error message (not used - same style for all)
+        """
+        if not hasattr(self, 'app_logs_layout'):
+            return
+
+        # Remove previous log message (only keep one)
+        while self._app_logs_messages:
+            old_log = self._app_logs_messages.pop()
+            old_log.deleteLater()
+
+        # Create log message as clickable label
+        log_label = QPushButton(message)
+        log_label.setObjectName("AppLogMessage")
+        log_label.setCursor(Qt.PointingHandCursor)
+        log_label.setFlat(True)
+
+        # Mismo estilo: Courier New 10pt bold
+        log_label.setStyleSheet("""
+            QPushButton#AppLogMessage {
+                color: #FFF0BF;
+                background: transparent;
+                border: none;
+                text-align: left;
+                padding: 0px 4px;
+                font-family: 'Courier New';
+                font-size: 10pt;
+                font-weight: bold;
+            }
+            QPushButton#AppLogMessage:hover {
+                background: transparent;
+            }
+            QPushButton#AppLogMessage:pressed {
+                background: transparent;
+            }
+        """)
+
+        # Make it clickable to hide
+        log_label.clicked.connect(lambda: self._hide_app_log(log_label))
+
+        # Insert before the stretch
+        self.app_logs_layout.insertWidget(self.app_logs_layout.count() - 1, log_label)
+
+        # Store reference
+        self._app_logs_messages.append(log_label)
+
+    def _hide_app_log(self, log_label):
+        """Hide a log message when clicked."""
+        log_label.hide()
+        if log_label in self._app_logs_messages:
+            self._app_logs_messages.remove(log_label)
     
     def _on_live_transcription(self, result: dict):
         """Handle live transcription results from the session manager.
