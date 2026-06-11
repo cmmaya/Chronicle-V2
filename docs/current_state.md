@@ -1,7 +1,7 @@
 # Current State
 
 ## Execution Status
-- Current BU: BU085
+- Current BU: none
 - Next BU: none
 
 ## Target Architecture
@@ -208,3 +208,10 @@ None
 - Agent dropdown now shows actual agent names ("Chronicle Assistant", "Concise Helper", "Research Helper") instead of generic "Agent" label
 - Added dropdown arrow indicator (v) to all QComboBox widgets
 - Expanded session bar and ask bar width by 1.8x (from 900px to 1620px)
+- Refined UI log messages in window.py to be more concise and user-friendly:
+  - 'App Started' - app initialization
+  - 'Session Started' - session started
+  - 'Session Paused' / 'Session Resumed' - pause/resume
+  - 'Screenshot Taken' - screenshot capture
+  - 'Transcript Window Detached' - transcription window detached
+  - Removed verbose messages: 'Loading session...', 'Processing transcriptions...', 'Generating summary...', scope change notifications, session rename notifications

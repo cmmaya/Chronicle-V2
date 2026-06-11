@@ -683,4 +683,36 @@ Recovery Notes:
 - No database changes required
 - Visual change only - no functional impact on agent selection logic
 
+## UI Log Message Refinement
+
+Summary:
+Refined UI log messages in window.py to be more concise and user-friendly. Replaced verbose, debug-like messages with shorter, more meaningful high-level status updates.
+
+Files Changed:
+
+- src/app/window.py
+
+Implementation:
+
+- Changed 'Ready' to 'App Started' in _init_session_manager
+- Added 'Session Started' message in _on_start_session
+- Simplified pause/resume messages to 'Session Paused' and 'Session Resumed' (removed session name)
+- Changed 'Screenshot saved' to 'Screenshot Taken' in _execute_screenshot_capture
+- Added 'Transcript Window Detached' in _on_detach_transcription
+- Simplified transcription messages: removed 'Loading session...', 'Processing transcriptions...', verbose chunk counts
+- Simplified summarization messages: removed 'Loading session...', 'Generating summary...', 'RAG indexing completed'
+- Removed scope change notifications ('Scope set to active session...', 'Scope cleared - no active session')
+- Removed session rename notifications ('Session renamed to...')
+
+Important Decisions:
+
+- Primary log messages are: 'App Started', 'Session Started', 'Session Paused', 'Session Resumed', 'Screenshot Taken', 'Transcript Window Detached'
+- Error messages still displayed to user (is_error=True)
+- Backend logging (logger) unchanged
+
+Recovery Notes:
+
+- No database changes required
+- Visual change only - affects status bar and app logs widget display
+
 - BU086 - (Optional) Add UI element to trigger re-indexing for a session

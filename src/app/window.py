@@ -266,7 +266,6 @@ class MainWindow(QMainWindow):
             # Clear transcriptions view first, then load fresh
             self._clear_transcription_view()
             self._load_transcripts_for_session(active_session.id, allow_live=True)
-            self._on_status_update(f"Scope set to active session: {active_session.name}")
         else:
             # Case 2: No active session - clear selection and set scope to "Any Session"
             # Clear selected session
@@ -284,8 +283,6 @@ class MainWindow(QMainWindow):
             
             # Clear the session search input
             self.session_search_input.clear()
-            
-            self._on_status_update("Scope cleared - no active session")
         
         # Update the scope label
         self._update_scope_label()
@@ -347,7 +344,7 @@ class MainWindow(QMainWindow):
             self._update_ui_state()
             self._load_past_conversations()
             self._refresh_session_completer()
-            self.status_label.setText('Ready')
+            self._on_status_update('App Started')
         except Exception as e:
             self._on_status_update(f'Failed to initialize: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to initialize: {str(e)}')
@@ -531,7 +528,6 @@ class MainWindow(QMainWindow):
             self.session_manager.db.update_session(session_id, name=new_name)
             
             logger.info(f"Renamed session {session_id} to '{new_name}'")
-            self._on_status_update(f"Session renamed to '{new_name}'")
             
         except Exception as e:
             logger.error(f"Failed to rename session: {str(e)}")
@@ -563,9 +559,6 @@ class MainWindow(QMainWindow):
     def _on_transcribe_clicked(self, session_id: int, combo: QComboBox):
         """Handle the transcribe action for a session."""
         try:
-            # Update status
-            self._on_status_update(f'Transcribing session {session_id}...')
-            
             # Run transcription in background using timer to allow UI to update
             QTimer.singleShot(50, lambda: self._run_transcription(session_id, combo))
             
@@ -578,12 +571,9 @@ class MainWindow(QMainWindow):
     def _run_transcription(self, session_id: int, combo: QComboBox):
         """Run the transcription process for a session."""
         try:
-            self._on_status_update('Loading session...')
-            
             # Load the session using session manager
             session = self.session_manager.load_session(session_id)
             
-            self._on_status_update('Processing transcriptions...')
             QApplication.processEvents()
             
             # Process transcriptions
@@ -594,7 +584,8 @@ class MainWindow(QMainWindow):
                 self.session_manager.db.update_session(session_id, transcription_status='transcribed')
                 mic_count = len(results.get('microphone', []))
                 sys_count = len(results.get('system', []))
-                self._on_status_update(f'Transcribed {mic_count} mic chunks, {sys_count} system chunks')
+                if mic_count > 0 or sys_count > 0:
+                    self._on_status_update(f'Transcribed {mic_count + sys_count} audio chunks')
             else:
                 self._on_status_update('No audio files found to transcribe')
             
@@ -613,9 +604,6 @@ class MainWindow(QMainWindow):
     def _on_summarize_clicked(self, session_id: int, combo: QComboBox):
         """Handle the summarize action for a session."""
         try:
-            # Update status
-            self._on_status_update(f'Summarizing session {session_id}...')
-            
             # Run summarization in background using timer to allow UI to update
             QTimer.singleShot(50, lambda: self._run_summarization(session_id, combo))
             
@@ -628,12 +616,9 @@ class MainWindow(QMainWindow):
     def _run_summarization(self, session_id: int, combo: QComboBox):
         """Run the summarization process for a session."""
         try:
-            self._on_status_update('Loading session...')
-            
             # Load the session using session manager
             session = self.session_manager.load_session(session_id)
             
-            self._on_status_update('Generating summary...')
             QApplication.processEvents()
             
             # Get transcripts from database
@@ -673,12 +658,10 @@ class MainWindow(QMainWindow):
             try:
                 from src.rag.indexer import index_session_content
                 index_session_content(self.session_manager.db, session_id)
-                self._on_status_update('RAG indexing completed')
             except Exception as e:
                 logger.error(f"RAG indexing failed: {str(e)}")
-                self._on_status_update(f"RAG indexing failed: {str(e)}", is_error=True)
             
-            self._on_status_update('Summary generated successfully')
+            self._on_status_update('Summary generated')
             
             # Update summary icon state to reflect the new summary
             self._update_summary_icon_state()
@@ -2335,12 +2318,8 @@ Keywords: {keywords_str}"""
         controls.setSpacing(8)
         self.sidebar_controls_layout = controls
 
-        self.play_stop_button = self._create_icon_tool_button("icon_play.svg", "▶", "Start/Stop Session", self._on_play_stop_clicked)
+        self.play_stop_button = self._create_icon_tool_button("icon_play.svg", "▶", "Start Session", self._on_play_stop_clicked)
         controls.addWidget(self.play_stop_button)
-
-        self.pause_icon_button = self._create_icon_tool_button("icon_pause.svg", "⏸", "Pause/Resume Session", self._on_pause_resume_session)
-        self.pause_icon_button.setVisible(False)
-        controls.addWidget(self.pause_icon_button)
 
         self.stop_visual_button = self._create_icon_tool_button("icon_stop.svg", "■", "Stop Session", self._on_stop_session)
         controls.addWidget(self.stop_visual_button)
@@ -2357,7 +2336,6 @@ Keywords: {keywords_str}"""
 
         self._sidebar_session_control_buttons = [
             self.play_stop_button,
-            self.pause_icon_button,
             self.stop_visual_button,
             self.screenshot_icon_button,
             self.view_summary_icon_button,
@@ -2583,8 +2561,8 @@ Keywords: {keywords_str}"""
         if default_index >= 0:
             self.agent_combo.setCurrentIndex(default_index)
         self.agent_combo.setMinimumHeight(50)
-        self.agent_combo.setMinimumWidth(180)
-        self.agent_combo.setMaximumWidth(200)
+        self.agent_combo.setMinimumWidth(200)
+        self.agent_combo.setMaximumWidth(220)
         input_layout.addWidget(self.agent_combo, 0)
 
         self.ask_button = PixelButton("Ask")
@@ -3076,8 +3054,10 @@ Keywords: {keywords_str}"""
             transcripts = self.session_manager.db.get_transcripts(session_id)
             
             if not transcripts:
-                logger.info(f"No transcripts found for session {session_id}")
-                self._on_status_update(f"No transcripts found for session {session_id}")
+                # Don't show message for active/current session - no transcripts expected yet
+                if not allow_live:
+                    logger.info(f"No transcripts found for session {session_id}")
+                    self._on_status_update(f"No transcripts found for session {session_id}")
                 return
             
             logger.info(f"Found {len(transcripts)} transcripts for session {session_id}")
@@ -3399,6 +3379,7 @@ Keywords: {keywords_str}"""
             self._add_transcription_to_detached(text)
         
         self._detached_window.show()
+        self._on_status_update('Transcript Window Detached')
     
     def _show_detached_filter_menu(self):
         """Show dropdown menu for filter options in detached window."""
@@ -3559,28 +3540,20 @@ Keywords: {keywords_str}"""
             self._is_recording = True
             self.session_name_input.setText(active_session.name)
             
-            # Update icon row
-            self.play_stop_button.setIcon(self._make_icon("icon_stop.svg"))
-            self.play_stop_button.setText("⏹")
-            self.play_stop_button.setToolTip("Stop Session")
-            self.pause_icon_button.setVisible(True)
-            self.pause_icon_button.setIcon(self._make_icon("icon_pause.svg"))
-            self.pause_icon_button.setText("⏸")
-            self.pause_icon_button.setToolTip("Pause Session")
+            # Update play button to pause icon (single button toggle behavior)
+            self.play_stop_button.setIcon(self._make_icon("icon_pause.svg"))
+            self.play_stop_button.setText("⏸")
+            self.play_stop_button.setToolTip("Pause Session")
             self.screenshot_icon_button.setEnabled(True)
             
         elif active_session and active_session.status == Session.STATUS_PAUSED:
             self._is_recording = False
             self.session_name_input.setText(active_session.name)
             
-            # Update icon row
-            self.play_stop_button.setIcon(self._make_icon("icon_stop.svg"))
-            self.play_stop_button.setText("⏹")
-            self.play_stop_button.setToolTip("Stop Session")
-            self.pause_icon_button.setVisible(True)
-            self.pause_icon_button.setIcon(self._make_icon("icon_play.svg"))
-            self.pause_icon_button.setText("▶")
-            self.pause_icon_button.setToolTip("Resume Session")
+            # Update pause button to play icon (single button toggle behavior)
+            self.play_stop_button.setIcon(self._make_icon("icon_play.svg"))
+            self.play_stop_button.setText("▶")
+            self.play_stop_button.setToolTip("Resume Session")
             self.screenshot_icon_button.setEnabled(True)
             
         elif active_session and active_session.status == Session.STATUS_PROCESSING:
@@ -3588,7 +3561,6 @@ Keywords: {keywords_str}"""
             self.play_stop_button.setIcon(self._make_icon("icon_play.svg"))
             self.play_stop_button.setText("▶")
             self.play_stop_button.setToolTip("Start Session")
-            self.pause_icon_button.setVisible(False)
             self.screenshot_icon_button.setEnabled(False)
             
         else:
@@ -3600,8 +3572,6 @@ Keywords: {keywords_str}"""
             self.play_stop_button.setIcon(self._make_icon("icon_play.svg"))
             self.play_stop_button.setText("▶")
             self.play_stop_button.setToolTip("Start Session")
-            self.pause_icon_button.setVisible(False)
-            self.screenshot_icon_button.setEnabled(False)
             self.screenshot_icon_button.setEnabled(False)
         
         # Update summary icon button based on selected session
@@ -3624,6 +3594,7 @@ Keywords: {keywords_str}"""
             
             # Update UI
             self._update_ui_state()
+            self._on_status_update('Session recording started')
             
             # Update scope to "Current Session" with the newly started session
             active_session = self.session_manager.get_active_session()
@@ -3669,10 +3640,10 @@ Keywords: {keywords_str}"""
             
             if active_session.status == Session.STATUS_ACTIVE:
                 self.session_manager.pause_session()
-                self._on_status_update(f"Session '{active_session.name}' paused")
+                self._on_status_update('Session Paused')
             elif active_session.status == Session.STATUS_PAUSED:
                 self.session_manager.resume_session()
-                self._on_status_update(f"Session '{active_session.name}' resumed")
+                self._on_status_update('Session Resumed')
             
             # Update UI state
             self._update_ui_state()
@@ -3715,7 +3686,7 @@ Keywords: {keywords_str}"""
             self.raise_()
 
             if screenshot_path:
-                self._on_status_update(f'Screenshot saved')
+                self._on_status_update('Screenshot Taken')
             else:
                 self._on_status_update('Screenshot cancelled', is_error=False)
 
@@ -3732,11 +3703,19 @@ Keywords: {keywords_str}"""
             QMessageBox.critical(self, 'Error', f'Failed to take screenshot: {str(e)}')
     
     def _on_play_stop_clicked(self):
-        """Handle play/stop icon button click."""
+        """Handle play/stop icon button click - toggles between start/pause/resume."""
         active_session = self.session_manager.get_active_session() if self.session_manager else None
-        if active_session and active_session.status in (Session.STATUS_ACTIVE, Session.STATUS_PAUSED):
-            # Session is running - stop it
-            self._on_stop_session()
+        
+        if active_session and active_session.status == Session.STATUS_ACTIVE:
+            # Session is recording - pause it (toggle button to play)
+            self.session_manager.pause_session()
+            self._on_status_update('Session Paused')
+            self._update_ui_state()
+        elif active_session and active_session.status == Session.STATUS_PAUSED:
+            # Session is paused - resume it (toggle button to pause)
+            self.session_manager.resume_session()
+            self._on_status_update('Session Resumed')
+            self._update_ui_state()
         else:
             # No session running - start one
             self._on_start_session()
@@ -4659,7 +4638,6 @@ Keywords: {keywords_str}"""
             # Update in database
             self.session_manager.db.update_session(session_id, name=new_name)
             logger.info(f"Renamed session {session_id} to '{new_name}'")
-            self._on_status_update(f"Session renamed to '{new_name}'")
             
             # Update the local data
             for session in sessions_data:
@@ -5146,8 +5124,8 @@ Keywords: {keywords_str}"""
                 self.agent_combo.itemData(i)
             )
         self._detached_agent_combo.setMinimumHeight(50)
-        self._detached_agent_combo.setMinimumWidth(180)
-        self._detached_agent_combo.setMaximumWidth(200)
+        self._detached_agent_combo.setMinimumWidth(200)
+        self._detached_agent_combo.setMaximumWidth(220)
         agent_layout.addWidget(self._detached_agent_combo)
         
         # Scope selector
