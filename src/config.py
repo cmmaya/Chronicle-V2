@@ -112,6 +112,13 @@ ALLOWED_MODELS = [
     "mistralai/mistral-large",
 ]
 
+# Sampling temperature for the Any Session answer call (BU090). Lower than the
+# client default (0.7) so the machine-parsed metadata trailer is emitted
+# reliably. Tune here rather than in code; do not set to 0.0 (some models in
+# ALLOWED_MODELS degenerate into repetition). Drop to 0.1 if the trailer is
+# missing or malformed in more than ~5% of responses across the models in use.
+ANY_SESSION_TEMPERATURE = 0.2
+
 DEFAULT_MODEL = "deepseek/deepseek-v3.2"
 
 # Internal storage for selected model

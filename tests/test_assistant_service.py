@@ -98,7 +98,7 @@ class MockOpenRouterClient:
 
     def chat(self, messages, model=None, temperature=None):
         """Return mock chat response."""
-        self.calls.append({"messages": messages, "model": model})
+        self.calls.append({"messages": messages, "model": model, "temperature": temperature})
         if self.should_fail:
             raise Exception("API error")
         response = self.chat_results[self.call_count % len(self.chat_results)]
@@ -447,3 +447,89 @@ class TestAllSessionsContext:
         assert "active_session_id" in params
         assert "selected_session_id" in params
         assert "conversation_id" in params
+
+
+class TestAnswerContractAndHandoff:
+    """Tests for the Any Session answer contract and scope handoff (BU090)."""
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.mock_client = MockOpenRouterClient()
+        self.service = AssistantAnswerService(db=self.db, openrouter_client=self.mock_client)
+
+    def _run(self, mock_client_class, mock_get_model, scope, chat_result):
+        from src.assistant.session_resolver import ScopeResolution, ResolutionResult
+
+        mock_get_model.return_value = "test-model"
+        mock_client_class.return_value = self.mock_client
+        self.mock_client.chat_results = [chat_result]
+        self.mock_client.call_count = 0
+
+        with patch.object(self.service._resolver, "resolve") as mock_resolve:
+            with patch.object(self.service._tools, "search_everything") as mock_se:
+                mock_se.return_value = [{"error": "none"}]
+                mock_resolve.return_value = ResolutionResult(scope=scope, session_ids=([1] if scope != ScopeResolution.ALL_SESSIONS else []), reason="test")
+                return self.service.ask("What exactly did Ana say about the budget?")
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_contract_absent_from_specific_session_prompt(self, mock_client_class, mock_get_model):
+        from src.assistant.session_resolver import ScopeResolution
+
+        self._run(mock_client_class, mock_get_model, ScopeResolution.SELECTED_SESSION, "answer")
+        system_msg = self.mock_client.calls[0]["messages"][0]["content"]
+        assert "RESPONSE CONTRACT" not in system_msg
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_contract_present_in_any_session_prompt(self, mock_client_class, mock_get_model):
+        from src.assistant.session_resolver import ScopeResolution
+
+        self._run(mock_client_class, mock_get_model, ScopeResolution.ALL_SESSIONS, "answer\n\n@@CHRONICLE_META@@\n{\"intent\":\"overview\",\"evidence\":\"sufficient\",\"sessions\":[]}")
+        system_msg = self.mock_client.calls[0]["messages"][0]["content"]
+        assert "RESPONSE CONTRACT" in system_msg
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_any_session_uses_named_temperature(self, mock_client_class, mock_get_model):
+        from src.assistant.session_resolver import ScopeResolution
+        from src.config import ANY_SESSION_TEMPERATURE
+
+        self._run(mock_client_class, mock_get_model, ScopeResolution.ALL_SESSIONS, "a\n\n@@CHRONICLE_META@@\n{}")
+        assert mock_client_class.call_args.kwargs.get("temperature") == ANY_SESSION_TEMPERATURE
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_specific_session_keeps_client_default_temperature(self, mock_client_class, mock_get_model):
+        from src.assistant.session_resolver import ScopeResolution
+
+        self._run(mock_client_class, mock_get_model, ScopeResolution.SELECTED_SESSION, "answer")
+        assert mock_client_class.call_args.kwargs.get("temperature") is None
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_persisted_answer_has_no_sentinel_or_metadata(self, mock_client_class, mock_get_model):
+        from src.assistant.session_resolver import ScopeResolution
+
+        result = self._run(
+            mock_client_class, mock_get_model, ScopeResolution.ALL_SESSIONS,
+            "Ana approved it.\n\n@@CHRONICLE_META@@\n{\"intent\":\"detail\",\"evidence\":\"partial\",\"sessions\":[2]}",
+        )
+        messages = self.db.get_messages(result.conversation_id)
+        assistant_msg = next(m for m in messages if m["role"] == "assistant")
+        assert "@@CHRONICLE_META@@" not in assistant_msg["content"]
+        assert assistant_msg["content"] == "Ana approved it."
+        assert result.answer == "Ana approved it."
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_detail_intent_surfaces_on_response(self, mock_client_class, mock_get_model):
+        from src.assistant.session_resolver import ScopeResolution
+
+        result = self._run(
+            mock_client_class, mock_get_model, ScopeResolution.ALL_SESSIONS,
+            "High level only.\n\n@@CHRONICLE_META@@\n{\"intent\":\"detail\",\"evidence\":\"partial\",\"sessions\":[2]}",
+        )
+        assert result.intent == "detail"
+        assert result.evidence == "partial"
+        assert result.scope_used == "any_session"

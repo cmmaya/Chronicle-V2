@@ -383,5 +383,165 @@ class TestDatabaseRAGMethods(unittest.TestCase):
         self.assertLessEqual(len(results), 50)
 
 
+    def _index_chunks(self, source_id, chunks, session_id=None, source_type="transcript"):
+        """Helper: create a document with the given chunks and rebuild FTS."""
+        doc_id = self.db.upsert_rag_document(
+            source_type=source_type,
+            source_id=source_id,
+            session_id=session_id if session_id is not None else self.session_id,
+            timestamp=1705312800,
+            title="Doc %d" % source_id,
+            content_hash="hash%d" % source_id,
+            metadata_json='{}'
+        )
+        self.db.replace_rag_chunks(
+            doc_id,
+            [{"content": c, "chunk_index": i} for i, c in enumerate(chunks)]
+        )
+        self.db.rebuild_rag_fts()
+        return doc_id
+
+    def test_search_rag_fts_excludes_non_matching_chunks(self):
+        """Test MATCH is applied: non-matching chunks are excluded."""
+        self._index_chunks(2000, [
+            "The meeting discussed the project timeline",
+            "Budget was approved for the first quarter",
+        ])
+
+        results = self.db.search_rag_fts("timeline")
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("timeline", results[0]['content'])
+
+    def test_search_rag_fts_ranks_by_relevance(self):
+        """Test ranks are non-zero and ordered by ascending BM25."""
+        self._index_chunks(2100, [
+            "timeline mentioned once here",
+            "timeline timeline timeline dominates this chunk",
+            "unrelated content about catering",
+        ])
+
+        results = self.db.search_rag_fts("timeline")
+
+        self.assertEqual(len(results), 2)
+        ranks = [r['rank'] for r in results]
+        # No longer uniformly zero
+        self.assertTrue(all(r != 0 for r in ranks))
+        # Ascending BM25: lower is more relevant
+        self.assertEqual(ranks, sorted(ranks))
+        # The chunk with more occurrences ranks first
+        self.assertIn("dominates", results[0]['content'])
+
+    def test_search_rag_fts_multiple_terms_match_any(self):
+        """Test multi-term queries OR their terms so partial matches rank."""
+        self._index_chunks(2200, [
+            "the budget was approved",
+            "the timeline slipped",
+            "catering is unrelated",
+        ])
+
+        results = self.db.search_rag_fts("budget timeline")
+
+        self.assertEqual(len(results), 2)
+        contents = " ".join(r['content'] for r in results)
+        self.assertIn("budget", contents)
+        self.assertIn("timeline", contents)
+
+    def test_search_rag_fts_punctuation_query_does_not_raise(self):
+        """Test punctuation-heavy queries do not raise an FTS5 syntax error."""
+        self._index_chunks(2300, ["The budget was approved"])
+
+        for query in ['budget?!', 'budget "approved"', "what's the budget -- really?",
+                      'budget*', '^budget:', 'budget AND approved', '(budget)']:
+            with self.subTest(query=query):
+                results = self.db.search_rag_fts(query)
+                self.assertIsInstance(results, list)
+
+    def test_search_rag_fts_quoted_query_still_matches(self):
+        """Test a quote-containing query still finds the chunk."""
+        self._index_chunks(2400, ["The budget was approved"])
+
+        results = self.db.search_rag_fts('"budget"')
+
+        self.assertEqual(len(results), 1)
+
+    def test_search_rag_fts_punctuation_only_query_returns_empty(self):
+        """Test a query of only punctuation returns an empty list."""
+        self._index_chunks(2500, ["The budget was approved"])
+
+        for query in ['???', '--', '*^:', '"""']:
+            with self.subTest(query=query):
+                self.assertEqual(self.db.search_rag_fts(query), [])
+
+    def test_search_rag_fts_operator_only_query_returns_empty(self):
+        """Test a query of only bare FTS operators returns an empty list."""
+        self._index_chunks(2600, ["The budget was approved"])
+
+        self.assertEqual(self.db.search_rag_fts("AND OR NOT NEAR"), [])
+
+    def test_search_rag_fts_session_filter_applies_with_match(self):
+        """Test the session_id filter still narrows results alongside MATCH."""
+        session_id2 = self.db.create_session(
+            name="Other Meeting",
+            start_time=datetime(2024, 1, 16, 9, 0),
+            status="completed"
+        )
+        self._index_chunks(2700, ["budget approved in session one"])
+        self._index_chunks(2800, ["budget approved in session two"],
+                           session_id=session_id2)
+
+        results = self.db.search_rag_fts("budget", session_id=self.session_id)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['session_id'], self.session_id)
+        self.assertIn("session one", results[0]['content'])
+
+    def test_search_rag_fts_source_types_filter_applies_with_match(self):
+        """Test the source_types filter still narrows results alongside MATCH."""
+        self._index_chunks(2900, ["budget keyword in a transcript"])
+        self._index_chunks(3000, ["budget keyword in a summary"],
+                           source_type="summary")
+
+        results = self.db.search_rag_fts("budget", source_types=["summary"])
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['source_type'], "summary")
+
+    def test_search_rag_fts_no_match_returns_empty(self):
+        """Test a well-formed query with no hits returns an empty list."""
+        self._index_chunks(3100, ["The budget was approved"])
+
+        self.assertEqual(self.db.search_rag_fts("helicopter"), [])
+
+    def test_search_rag_fts_accented_terms_preserved(self):
+        """Test non-ASCII terms survive sanitisation (meetings are in Spanish)."""
+        self._index_chunks(3200, ["Se aprobo el presupuesto de la reunion"])
+
+        self.assertEqual(len(self.db.search_rag_fts("presupuesto")), 1)
+
+
+class TestSanitizeFTSQuery(unittest.TestCase):
+    """Unit tests for the FTS5 query sanitiser."""
+
+    def test_terms_are_quoted_and_or_joined(self):
+        from src.storage.database import sanitize_fts_query
+        self.assertEqual(sanitize_fts_query("budget timeline"), '"budget" OR "timeline"')
+
+    def test_punctuation_is_stripped(self):
+        from src.storage.database import sanitize_fts_query
+        self.assertEqual(sanitize_fts_query("""what's the "budget"? -- really*"""),
+                         '"what" OR "s" OR "the" OR "budget" OR "really"')
+
+    def test_bare_operators_are_dropped(self):
+        from src.storage.database import sanitize_fts_query
+        self.assertEqual(sanitize_fts_query("budget AND timeline"), '"budget" OR "timeline"')
+
+    def test_empty_when_nothing_usable(self):
+        from src.storage.database import sanitize_fts_query
+        for query in ['', '   ', '???', 'AND OR', None]:
+            with self.subTest(query=query):
+                self.assertEqual(sanitize_fts_query(query), '')
+
+
 if __name__ == "__main__":
     unittest.main()

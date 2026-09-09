@@ -1,12 +1,37 @@
 from pathlib import Path
 import sqlite3
 import os
+import re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
 class DatabaseError(Exception):
     pass
+
+
+# FTS5 bare operators that must never reach the query parser as syntax.
+FTS_OPERATORS = frozenset({'AND', 'OR', 'NOT', 'NEAR'})
+
+# Terms are whatever survives as word characters; every FTS5 metacharacter
+# (" * ^ : - ( ) etc.) is discarded by construction.
+_FTS_TERM_PATTERN = re.compile(r'\w+', re.UNICODE)
+
+
+def sanitize_fts_query(query: str) -> str:
+    """Turn arbitrary user text into a safe FTS5 MATCH expression.
+
+    Punctuation and FTS5 metacharacters are dropped, bare operators are
+    removed, and the remaining terms are quoted and joined with OR so that
+    partial matches still rank.
+
+    Returns an empty string when no usable term remains.
+    """
+    terms = [t for t in _FTS_TERM_PATTERN.findall(query or '')
+             if t.upper() not in FTS_OPERATORS]
+    if not terms:
+        return ''
+    return ' OR '.join('"{}"'.format(t) for t in terms)
 
 
 class Database:
@@ -179,6 +204,7 @@ class Database:
                     token_count INTEGER,
                     start_timestamp INTEGER,
                     end_timestamp INTEGER,
+                    source TEXT,
                     metadata_json TEXT,
                     embedding_model TEXT,
                     embedding BLOB,
@@ -186,6 +212,13 @@ class Database:
                     FOREIGN KEY(document_id) REFERENCES rag_documents(id)
                 )
             ''')
+
+            # Migration: per-chunk audio source (microphone / system) for
+            # databases created before time-windowed transcript chunking.
+            try:
+                cursor.execute('ALTER TABLE rag_chunks ADD COLUMN source TEXT')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # RAG indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_documents_source ON rag_documents(source_type, source_id)')
@@ -202,6 +235,26 @@ class Database:
                     session_id UNINDEXED,
                     document_id UNINDEXED,
                     chunk_id UNINDEXED
+                )
+            ''')
+
+            # Session router (BU089): one compact profile + embedding per session.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS session_profiles (
+                    session_id INTEGER PRIMARY KEY,
+                    profile_text TEXT NOT NULL,
+                    keywords TEXT,
+                    embedding BLOB,
+                    embedding_model TEXT,
+                    content_hash TEXT,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS session_profiles_fts USING fts5(
+                    profile_text,
+                    session_id UNINDEXED
                 )
             ''')
 
@@ -1123,6 +1176,7 @@ class Database:
                     - token_count: int (optional)
                     - start_timestamp: int (optional)
                     - end_timestamp: int (optional)
+                    - source: str (optional, e.g. 'microphone' / 'system')
                     - metadata_json: str (optional)
                     - session_id: int (optional)
                     
@@ -1146,8 +1200,9 @@ class Database:
                 cursor.execute('''
                     INSERT INTO rag_chunks (document_id, session_id, chunk_index, content,
                                           token_count, start_timestamp, end_timestamp,
-                                          metadata_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          source, metadata_json, embedding_model, embedding,
+                                          created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     document_id,
                     chunk.get('session_id', default_session_id),
@@ -1156,14 +1211,61 @@ class Database:
                     chunk.get('token_count'),
                     chunk.get('start_timestamp'),
                     chunk.get('end_timestamp'),
+                    chunk.get('source'),
                     chunk.get('metadata_json'),
+                    chunk.get('embedding_model'),
+                    chunk.get('embedding'),
                     now
                 ))
-            
+
             self.connection.commit()
         except sqlite3.Error as e:
             self.connection.rollback()
             raise DatabaseError(f'Chunk replacement failed: {str(e)}')
+
+    def get_rag_document(self, source_type: str, source_id: int) -> Optional[Dict[str, Any]]:
+        """Return one RAG document row by source identity, or ``None``.
+
+        Used by the indexer to decide whether a re-chunk is needed: if the stored
+        ``content_hash`` matches the freshly computed one, nothing has changed.
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'SELECT * FROM rag_documents WHERE source_type = ? AND source_id = ?',
+                (source_type, source_id),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            raise DatabaseError(f'RAG document retrieval failed: {str(e)}')
+
+    def count_chunks_missing_embedding(
+        self, document_id: int, embedding_model: Optional[str]
+    ) -> int:
+        """How many of a document's chunks lack a vector for ``embedding_model``.
+
+        A non-zero count means the document must be re-embedded - either it was
+        never embedded, or the embedding model / revision has changed since.
+        """
+        try:
+            cursor = self.connection.cursor()
+            if embedding_model is None:
+                cursor.execute(
+                    'SELECT COUNT(*) FROM rag_chunks WHERE document_id = ?',
+                    (document_id,),
+                )
+            else:
+                cursor.execute(
+                    'SELECT COUNT(*) FROM rag_chunks '
+                    'WHERE document_id = ? '
+                    'AND (embedding IS NULL OR embedding_model IS NOT ?)',
+                    (document_id, embedding_model),
+                )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Chunk embedding count failed: {str(e)}')
 
     def rebuild_rag_fts(self) -> None:
         """Rebuild the RAG FTS index from existing rag_chunks.
@@ -1216,10 +1318,18 @@ class Database:
                 - source_type: str
                 - source_id: int
                 - session_id: int
-                - timestamp: int
+                - timestamp: int (chunk start time, falling back to the
+                  document timestamp for chunks indexed before BU087)
+                - start_timestamp: int | None (per-chunk)
+                - end_timestamp: int | None (per-chunk)
+                - source: str | None (per-chunk, 'microphone' / 'system')
                 - title: str
                 - content: str
                 - rank: float (BM25 rank, lower is better)
+
+            Results are ordered by ascending BM25 rank (most relevant first).
+            Returns an empty list when the query contains no usable search
+            terms after FTS5 sanitisation.
 
         Raises:
             DatabaseError: If search fails or query is empty
@@ -1235,7 +1345,11 @@ class Database:
             cursor = self.connection.cursor()
 
             # Build the FTS5 search query with bm25 ranking
-            fts_query = query.strip()
+            fts_query = sanitize_fts_query(query)
+            if not fts_query:
+                # Nothing searchable survived sanitisation; never fall back to
+                # an unfiltered scan.
+                return []
 
             # Build SQL with optional filters
             sql_parts = ['''
@@ -1245,16 +1359,21 @@ class Database:
                     f.source_type,
                     rd.source_id,
                     COALESCE(f.session_id, rd.session_id) as session_id,
-                    rd.timestamp,
+                    COALESCE(rc.start_timestamp, rd.timestamp) as timestamp,
+                    rc.start_timestamp,
+                    rc.end_timestamp,
+                    rc.source,
                     rd.title,
                     f.content,
                     bm25(rag_fts) as rank
                 FROM rag_fts f
                 JOIN rag_documents rd ON f.document_id = rd.id
+                LEFT JOIN rag_chunks rc ON rc.id = f.chunk_id
             ''']
 
-            where_clauses = []
-            params = []
+            # MATCH is mandatory: without it every chunk is returned unranked.
+            where_clauses = ['f.content MATCH ?']
+            params = [fts_query]
 
             # Add session_id filter if provided
             if session_id is not None:
@@ -1267,9 +1386,7 @@ class Database:
                 where_clauses.append(f'f.source_type IN ({placeholders})')
                 params.extend(source_types)
 
-            # Add WHERE clause if we have filters
-            if where_clauses:
-                sql_parts.append('WHERE ' + ' AND '.join(where_clauses))
+            sql_parts.append('WHERE ' + ' AND '.join(where_clauses))
 
             # Add ORDER BY and LIMIT
             sql_parts.append('ORDER BY rank')
@@ -1282,3 +1399,115 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'FTS search failed: {str(e)}')
+
+    # -- Session router profiles (BU089) ------------------------------------
+
+    def upsert_session_profile(
+        self,
+        session_id: int,
+        profile_text: str,
+        keywords: Optional[str] = None,
+        embedding: Optional[bytes] = None,
+        embedding_model: Optional[str] = None,
+        content_hash: Optional[str] = None,
+    ) -> None:
+        """Insert or replace the router profile for a session.
+
+        Also refreshes the session's row in ``session_profiles_fts`` so the
+        lexical half of the router stays in sync.
+        """
+        try:
+            cursor = self.connection.cursor()
+            now = int(datetime.now().timestamp())
+            cursor.execute('''
+                INSERT INTO session_profiles
+                    (session_id, profile_text, keywords, embedding,
+                     embedding_model, content_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    profile_text = excluded.profile_text,
+                    keywords = excluded.keywords,
+                    embedding = excluded.embedding,
+                    embedding_model = excluded.embedding_model,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at
+            ''', (session_id, profile_text, keywords, embedding,
+                  embedding_model, content_hash, now))
+
+            cursor.execute(
+                'DELETE FROM session_profiles_fts WHERE session_id = ?',
+                (session_id,),
+            )
+            cursor.execute(
+                'INSERT INTO session_profiles_fts (profile_text, session_id) '
+                'VALUES (?, ?)',
+                (profile_text, session_id),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
+            raise DatabaseError(f'Session profile upsert failed: {str(e)}')
+
+    def get_session_profiles(self) -> List[Dict[str, Any]]:
+        """Return every session profile joined with its session name and start time."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT sp.session_id, sp.profile_text, sp.keywords, sp.embedding,
+                       sp.embedding_model, sp.content_hash, sp.updated_at,
+                       s.name AS session_name, s.start_time
+                FROM session_profiles sp
+                JOIN sessions s ON s.id = sp.session_id
+                ORDER BY s.start_time DESC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session profile listing failed: {str(e)}')
+
+    def get_session_profile(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Return one session profile row, or ``None``."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'SELECT * FROM session_profiles WHERE session_id = ?',
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session profile retrieval failed: {str(e)}')
+
+    def session_profiles_signature(self) -> tuple:
+        """Cheap (count, max updated_at) signature for cache invalidation."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM session_profiles'
+            )
+            row = cursor.fetchone()
+            return (row[0], row[1]) if row else (0, 0)
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session profile signature failed: {str(e)}')
+
+    def search_session_profiles_fts(
+        self, query: str, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """BM25 search over profile text. Returns ``session_id`` + ``rank`` (lower better)."""
+        if not query or not query.strip():
+            return []
+        fts_query = sanitize_fts_query(query)
+        if not fts_query:
+            return []
+        limit = min(max(1, limit), 100)
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT session_id, bm25(session_profiles_fts) AS rank
+                FROM session_profiles_fts
+                WHERE profile_text MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            ''', (fts_query, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session profile FTS search failed: {str(e)}')

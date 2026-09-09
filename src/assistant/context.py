@@ -46,6 +46,10 @@ class AssistantContextRetriever:
             db: Database instance implementing required methods.
         """
         self._db = db
+        # chunk_id -> audio source, filled by the last _get_rag_chunks call.
+        # RetrievedChunk has no source field, so the per-chunk source recorded
+        # by the indexer travels alongside it.
+        self._chunk_sources: dict[int, str] = {}
 
     def build_session_context(
         self,
@@ -248,10 +252,12 @@ class AssistantContextRetriever:
             if len(text) > MAX_TRANSCRIPT_LENGTH:
                 text = text[:MAX_TRANSCRIPT_LENGTH] + "..."
 
-            # Determine source from title or default to microphone
-            source = "microphone"
-            if chunk.title:
-                if "system" in chunk.title.lower():
+            # Per-chunk source recorded at indexing time; chunks indexed before
+            # BU087 have none, so fall back to the document title.
+            source = self._chunk_sources.get(chunk.chunk_id)
+            if not source:
+                source = "microphone"
+                if chunk.title and "system" in chunk.title.lower():
                     source = "system"
 
             excerpts.append(TranscriptExcerpt(
@@ -431,7 +437,12 @@ class AssistantContextRetriever:
             return []
 
         chunks = []
+        self._chunk_sources = {}
         for row in rows:
+            chunk_source = row.get("source")
+            if chunk_source:
+                self._chunk_sources[row.get("chunk_id", 0)] = chunk_source
+
             # Convert source_type string to SourceType enum
             source_type_str = row.get("source_type", "transcript")
             try:

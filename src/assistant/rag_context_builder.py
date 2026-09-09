@@ -7,6 +7,11 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+# Per-excerpt and total budgets shared by every Any Session context builder.
+MAX_EXCERPT_CHARS = 500
+MAX_CONTEXT_CHARS = 12000
+MAX_CHUNKS_PER_SESSION = 4
+
 
 def build_any_session_context(
     query: str,
@@ -93,6 +98,89 @@ def build_any_session_context(
         return "(No relevant context found in any session)"
 
     return "\n".join(parts)
+
+
+def build_routed_session_context(
+    db: Any,
+    query: str,
+    routed: List[Any],
+    max_chars: int = MAX_CONTEXT_CHARS,
+) -> str:
+    """Build Any Session context from router-selected sessions (BU089).
+
+    For each routed session: a header with the match reason, the session
+    summary (truncated), and a bounded number of the session's top chunks for
+    ``query`` (Tier-2 search scoped to that session only). Honours the
+    per-excerpt and total character budgets.
+
+    Args:
+        db: Database with ``get_summaries`` and ``search_rag_fts``.
+        query: The user's question.
+        routed: List of ``RoutedSession`` (session_id, name, start_time, score, reason).
+        max_chars: Total character budget.
+
+    Returns:
+        Formatted context string, or the no-context message when nothing fits.
+    """
+    if not routed:
+        return "(No relevant context found in any session)"
+
+    parts: List[str] = []
+    length = 0
+
+    def add(text: str) -> bool:
+        nonlocal length
+        if length + len(text) > max_chars:
+            return False
+        parts.append(text)
+        length += len(text)
+        return True
+
+    for candidate in routed:
+        session_id = getattr(candidate, "session_id", None)
+        if session_id is None:
+            continue
+        name = getattr(candidate, "name", f"Session {session_id}")
+        reason = getattr(candidate, "reason", "") or ""
+        header = f"\n## {name}"
+        if reason:
+            header += f"  ({reason})"
+        header += "\n"
+        if not add(header):
+            break
+
+        # Session summary
+        try:
+            summaries = db.get_summaries(session_id) or []
+        except Exception:
+            summaries = []
+        summary_text = max(
+            (s.get("content", "") or "" for s in summaries),
+            key=len,
+            default="",
+        ).strip()
+        if summary_text:
+            add(f"[summary]: {_truncate(summary_text)}\n")
+
+        # Tier-2: top chunks inside this session only
+        try:
+            chunks = db.search_rag_fts(query, limit=MAX_CHUNKS_PER_SESSION, session_id=session_id)
+        except Exception:
+            chunks = []
+        for chunk in chunks:
+            if not add(_format_result(chunk)):
+                return "\n".join(parts)
+
+    if not any(p.strip() and not p.startswith("\n## ") for p in parts):
+        return "(No relevant context found in any session)"
+    return "\n".join(parts)
+
+
+def _truncate(text: str, limit: int = MAX_EXCERPT_CHARS) -> str:
+    text = text or ""
+    if len(text) > limit:
+        return text[:limit].rstrip() + "..."
+    return text
 
 
 def _format_result(result: Dict[str, Any]) -> str:

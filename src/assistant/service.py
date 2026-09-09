@@ -1,18 +1,23 @@
 """Assistant answer service - coordinates session resolution, context retrieval, and answering."""
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .openrouter_client import OpenRouterClient
-from .rag_context_builder import build_any_session_context
+from .rag_context_builder import build_any_session_context, build_routed_session_context
+from .response_contract import RESPONSE_CONTRACT, parse_answer
+from ..rag.router import route_sessions
 from .session_resolver import (
     AssistantSessionResolver,
     ResolutionResult,
     ScopeResolution,
 )
 from .tools import AssistantRetrievalTools
-from ..config import ASSISTANT_AGENTS, get_selected_model
+from ..config import ANY_SESSION_TEMPERATURE, ASSISTANT_AGENTS, get_selected_model
 from ..storage.database import Database
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,10 +30,23 @@ class AnswerResponse:
     candidates: List[Dict[str, Any]] = None
     conversation_id: Optional[int] = None
     error: Optional[str] = None
+    # Router-selected sessions for Any Session answers (BU089); empty otherwise.
+    routed_sessions: List[Dict[str, Any]] = None
+    # Answer contract signal (BU090). Internal only - never rendered, logged only.
+    intent: Optional[str] = None
+    evidence: Optional[str] = None
+    # "any_session" or "current_session"; which scope produced this answer.
+    scope_used: Optional[str] = None
+    # Routed sessions to seed the Specific Session handoff picker (BU090).
+    candidate_sessions: List[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.candidates is None:
             self.candidates = []
+        if self.routed_sessions is None:
+            self.routed_sessions = []
+        if self.candidate_sessions is None:
+            self.candidate_sessions = []
 
 
 class AssistantAnswerService:
@@ -57,6 +75,8 @@ class AssistantAnswerService:
         self._tools = AssistantRetrievalTools(db)
         self._openrouter_client = openrouter_client
         self._agents = ASSISTANT_AGENTS.get("agents", {})
+        # Populated by _get_all_sessions_context; surfaced on AnswerResponse.
+        self._last_routed_sessions: List[Dict[str, Any]] = []
 
     def ask(
         self,
@@ -84,6 +104,10 @@ class AssistantAnswerService:
                 - needs_clarification=True with clarification_question for ambiguous cases
                 - success=False with error message on failure
         """
+        # Reset per-request router state so a stale list never leaks into a
+        # non-Any-Session response.
+        self._last_routed_sessions = []
+
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
             question=question,
@@ -149,9 +173,10 @@ class AssistantAnswerService:
         # Step 5: Retrieve context based on scope
         context_text = ""
         session_ids = resolution.session_ids
+        is_any_session = resolution.scope == ScopeResolution.ALL_SESSIONS
 
         if needs_session_context:
-            if resolution.scope == ScopeResolution.ALL_SESSIONS:
+            if is_any_session:
                 # Cross-session: use search tools
                 context_text = self._get_all_sessions_context(question)
             else:
@@ -166,34 +191,28 @@ class AssistantAnswerService:
             context_text = ""
 
         # Step 6: Build messages for OpenRouter
-        messages = self._build_messages(agent, context_text, question, conversation_id)
+        messages = self._build_messages(
+            agent, context_text, question, conversation_id, is_any_session
+        )
 
         # Step 6: Call OpenRouter API
         try:
             # Use selected model from settings (don't pass explicit model)
-            answer = self._call_openrouter(messages)
+            answer = self._call_openrouter(
+                messages,
+                temperature=ANY_SESSION_TEMPERATURE if is_any_session else None,
+            )
         except Exception as e:
             return AnswerResponse(
                 success=False,
                 error=f"OpenRouter API call failed: {str(e)}",
             )
 
-        # Step 7: Persist conversation
-        try:
-            conv_id = self._persist_conversation(
-                conversation_id,
-                session_ids[0] if session_ids else None,
-                question,
-                answer,
-            )
-        except Exception as e:
-            # Don't fail the answer if persistence fails - just log
-            conv_id = conversation_id
-
-        return AnswerResponse(
-            success=True,
-            answer=answer,
-            conversation_id=conv_id,
+        # Step 6b: In Any Session mode, split the answer contract trailer off the
+        # raw response BEFORE persistence so the sentinel never re-enters the
+        # prompt as conversation history on later turns.
+        return self._finalize_answer(
+            answer, is_any_session, conversation_id, session_ids, question
         )
 
     async def ask_async(
@@ -222,6 +241,10 @@ class AssistantAnswerService:
                 - needs_clarification=True with clarification_question for ambiguous cases
                 - success=False with error message on failure
         """
+        # Reset per-request router state so a stale list never leaks into a
+        # non-Any-Session response.
+        self._last_routed_sessions = []
+
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
             question=question,
@@ -287,9 +310,10 @@ class AssistantAnswerService:
         # Step 5: Retrieve context based on scope
         context_text = ""
         session_ids = resolution.session_ids
+        is_any_session = resolution.scope == ScopeResolution.ALL_SESSIONS
 
         if needs_session_context:
-            if resolution.scope == ScopeResolution.ALL_SESSIONS:
+            if is_any_session:
                 # Cross-session: use search tools
                 context_text = self._get_all_sessions_context(question)
             else:
@@ -304,19 +328,55 @@ class AssistantAnswerService:
             context_text = ""
 
         # Step 6: Build messages for OpenRouter
-        messages = self._build_messages(agent, context_text, question, conversation_id)
+        messages = self._build_messages(
+            agent, context_text, question, conversation_id, is_any_session
+        )
 
         # Step 6: Call OpenRouter API
         try:
             # Use selected model from settings (don't pass explicit model)
-            answer = await self._call_openrouter_async(messages)
+            answer = await self._call_openrouter_async(
+                messages,
+                temperature=ANY_SESSION_TEMPERATURE if is_any_session else None,
+            )
         except Exception as e:
             return AnswerResponse(
                 success=False,
                 error=f"OpenRouter API call failed: {str(e)}",
             )
 
-        # Step 7: Persist conversation
+        return self._finalize_answer(
+            answer, is_any_session, conversation_id, session_ids, question
+        )
+
+    def _finalize_answer(
+        self,
+        raw_answer: str,
+        is_any_session: bool,
+        conversation_id: Optional[int],
+        session_ids: List[int],
+        question: str,
+    ) -> AnswerResponse:
+        """Strip the answer contract trailer, persist, and build the response.
+
+        The metadata trailer is parsed and removed before persistence so the
+        sentinel never re-enters the prompt as conversation history (brief 3.2).
+        ``intent`` / ``evidence`` are internal - logged only, never rendered.
+        """
+        intent = evidence = None
+        candidate_sessions: List[Dict[str, Any]] = []
+        answer = raw_answer
+
+        if is_any_session:
+            parsed = parse_answer(raw_answer)
+            answer = parsed.answer_text
+            intent, evidence = parsed.intent, parsed.evidence
+            candidate_sessions = list(self._last_routed_sessions)
+            logger.info(
+                "Any Session answer contract: intent=%s evidence=%s sessions=%s",
+                intent, evidence, parsed.sessions,
+            )
+
         try:
             conv_id = self._persist_conversation(
                 conversation_id,
@@ -324,7 +384,7 @@ class AssistantAnswerService:
                 question,
                 answer,
             )
-        except Exception as e:
+        except Exception:
             # Don't fail the answer if persistence fails - just log
             conv_id = conversation_id
 
@@ -332,6 +392,11 @@ class AssistantAnswerService:
             success=True,
             answer=answer,
             conversation_id=conv_id,
+            routed_sessions=list(self._last_routed_sessions),
+            intent=intent,
+            evidence=evidence,
+            scope_used="any_session" if is_any_session else "current_session",
+            candidate_sessions=candidate_sessions,
         )
 
     def _get_agent_config(self, agent_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -387,8 +452,38 @@ class AssistantAnswerService:
             return f"Context retrieval failed: {str(e)}"
 
     def _get_all_sessions_context(self, question: str) -> str:
-        """Get cross-session context using unified search with legacy fallback."""
-        # First, try unified RAG search
+        """Route to the relevant sessions, then build context from those only.
+
+        Two-tier (BU089): Tier-1 picks the handful of sessions the question is
+        about; Tier-2 chunk search runs only inside them. Falls back to the
+        legacy unified/keyword search when routing yields nothing.
+        """
+        routed = []
+        try:
+            routed = route_sessions(self._db, question, k=5)
+        except Exception:
+            routed = []
+
+        self._last_routed_sessions = [
+            {
+                "session_id": r.session_id,
+                "session_name": r.name,
+                "start_time": r.start_time,
+                "score": r.score,
+                "reason": r.reason,
+            }
+            for r in routed
+        ]
+
+        if routed:
+            try:
+                context = build_routed_session_context(self._db, question, routed)
+                if context and not context.startswith("(No relevant context"):
+                    return context
+            except Exception:
+                pass
+
+        # Fall back: unified RAG search, then legacy keyword search.
         try:
             results = self._tools.search_everything(question, limit=30)
             if results and "error" not in results[0]:
@@ -396,7 +491,6 @@ class AssistantAnswerService:
         except Exception:
             pass
 
-        # Fall back to legacy context retrieval
         return self._get_all_sessions_context_legacy(question)
 
     def _get_all_sessions_context_legacy(self, question: str) -> str:
@@ -500,12 +594,17 @@ class AssistantAnswerService:
         context: str,
         question: str,
         conversation_id: Optional[int],
+        is_any_session: bool = False,
     ) -> List[Dict[str, str]]:
         """Build OpenRouter messages with system prompt, context, and history."""
         messages = []
 
         # System message with context
         system_content = f"{agent['system_instruction']}\n\nContext:\n{context}"
+        # Any Session mode only: ask the model to self-classify its answer via
+        # the metadata trailer. Specific Session prompts are left untouched.
+        if is_any_session:
+            system_content = f"{system_content}\n\n{RESPONSE_CONTRACT}"
         messages.append({"role": "system", "content": system_content})
 
         # Add conversation history if continuing
@@ -526,27 +625,46 @@ class AssistantAnswerService:
 
         return messages
 
-    def _call_openrouter(self, messages: List[Dict[str, str]], model: str = None) -> str:
-        """Call OpenRouter API and return the answer."""
+    def _call_openrouter(
+        self,
+        messages: List[Dict[str, str]],
+        model: str = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Call OpenRouter API and return the answer.
+
+        ``temperature=None`` leaves the client at its default (0.7); the Any
+        Session path passes ``ANY_SESSION_TEMPERATURE`` for reliable contract
+        compliance. Other call paths are unchanged.
+        """
         # Always use fresh selected model - don't cache the client with a fixed model
         # This ensures model changes in settings are immediately applied
         selected_model = get_selected_model()
         effective_model = model or selected_model
-        
+
         # Create new client each time to ensure fresh model selection
-        openrouter_client = OpenRouterClient(model=effective_model)
+        openrouter_client = OpenRouterClient(
+            model=effective_model, temperature=temperature
+        )
 
         return openrouter_client.chat(messages)
 
-    async def _call_openrouter_async(self, messages: List[Dict[str, str]], model: str = None) -> str:
-        """Call OpenRouter API and return the answer."""
+    async def _call_openrouter_async(
+        self,
+        messages: List[Dict[str, str]],
+        model: str = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Call OpenRouter API and return the answer (see _call_openrouter)."""
         # Always use fresh selected model - don't cache the client with a fixed model
         # This ensures model changes in settings are immediately applied
         selected_model = get_selected_model()
         effective_model = model or selected_model
-        
+
         # Create new client each time to ensure fresh model selection
-        openrouter_client = OpenRouterClient(model=effective_model)
+        openrouter_client = OpenRouterClient(
+            model=effective_model, temperature=temperature
+        )
 
         return await openrouter_client.chat_async(messages)
 

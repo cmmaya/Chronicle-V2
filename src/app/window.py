@@ -18,6 +18,18 @@ from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
 from ..assistant.service import AssistantAnswerService
+from ..assistant.response_contract import should_hand_off
+
+# Labels for the candidate picker. Default is the ambiguity flow; the handoff
+# variant (BU090) points an Any Session user at Specific Session for detail.
+_CANDIDATE_TITLE_DEFAULT = "SELECT A SESSION"
+_CANDIDATE_BTN_DEFAULT = "Use Selected Session"
+_CANDIDATE_TITLE_HANDOFF = "FOR EXACT WORDING, ASK IN SPECIFIC SESSION"
+_CANDIDATE_BTN_HANDOFF = "Ask in Specific Session"
+_HANDOFF_NOTE = (
+    "\n\n_I only have session-level notes here. For exact wording, pick a "
+    "session below and I'll re-ask it in Specific Session._"
+)
 from ..screenshots.context_generator import ScreenshotContextGenerator
 
 logger = logging.getLogger(__name__)
@@ -159,6 +171,35 @@ class AssistantQueryThread(QThread):
             self.error_signal.emit(str(e))
 
 
+class RagBackfillThread(QThread):
+    """Background thread for the BU091 corpus backfill / reindex.
+
+    Never touches the UI directly - it only emits signals. The backfill itself
+    is idempotent and resumable, so a killed thread leaves a repairable state.
+    """
+
+    progress_signal = Signal(int, int)   # (done, total)
+    finished_signal = Signal(object)     # summary dict
+    error_signal = Signal(str)
+
+    def __init__(self, db, force: bool = False):
+        super().__init__()
+        self._db = db
+        self._force = force
+
+    def run(self):
+        try:
+            from ..rag.migration import backfill_corpus
+            summary = backfill_corpus(
+                self._db,
+                progress_callback=lambda done, total: self.progress_signal.emit(done, total),
+                force=self._force,
+            )
+            self.finished_signal.emit(summary)
+        except Exception as e:  # noqa: BLE001
+            self.error_signal.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     """Main application window with session controls."""
     
@@ -258,35 +299,37 @@ class MainWindow(QMainWindow):
             active_session = self.session_manager.get_active_session()
             has_active_session = active_session is not None
         
-        if has_active_session:
-            # Case 1: There's an active session - set scope to "Current Session"
-            active_session = self.session_manager.get_active_session()
-            self._selected_session_id = active_session.id
-            self.scope_combo.setCurrentIndex(0)  # "Current Session"
-            # Clear transcriptions view first, then load fresh
-            self._clear_transcription_view()
-            self._load_transcripts_for_session(active_session.id, allow_live=True)
-        else:
-            # Case 2: No active session - clear selection and set scope to "Any Session"
-            # Clear selected session
-            self._selected_session_id = None
-            
-            # Clear transcriptions view
-            self._clear_transcription_view()
-            
-            # Close detached window if exists
-            if hasattr(self, '_detached_window') and self._detached_window:
-                self._on_close_detached_window()
-            
-            # Reset scope combo to "Any Session" (index 1)
-            self.scope_combo.setCurrentIndex(1)
-            
-            # Clear the session search input
-            self.session_search_input.clear()
-        
+        # Suppress the redundant transcript clear/reload that setCurrentIndex
+        # would trigger via _on_scope_changed; this method reloads explicitly.
+        self._clearing_scope = True
+        try:
+            if has_active_session:
+                # Case 1: There's an active session - set scope to "Specific Session"
+                active_session = self.session_manager.get_active_session()
+                self._selected_session_id = active_session.id
+                self.scope_combo.setCurrentIndex(0)  # "Specific Session"
+                self._clear_transcription_view()
+                self._load_transcripts_for_session(active_session.id, allow_live=True)
+            else:
+                # Case 2: No active session - clear selection and set scope to "Any Session"
+                self._selected_session_id = None
+                self._clear_transcription_view()
+
+                # Close detached window if exists
+                if hasattr(self, '_detached_window') and self._detached_window:
+                    self._on_close_detached_window()
+
+                # Reset scope combo to "Any Session" (index 1)
+                self.scope_combo.setCurrentIndex(1)
+
+                # Clear the session search input
+                self.session_search_input.clear()
+        finally:
+            self._clearing_scope = False
+
         # Update the scope label
         self._update_scope_label()
-        
+
         logger.info("Scope cleared via ESC key")
 
     def _edit_screenshot_description(self, label, filepath, session_id):
@@ -2136,7 +2179,14 @@ Keywords: {keywords_str}"""
         model_action = QAction('Model Settings...', self)
         model_action.triggered.connect(self._show_model_settings)
         settings_menu.addAction(model_action)
-        
+
+        settings_menu.addSeparator()
+
+        # Reindex all RAG content (BU091) - recovery for a stale/corrupt index
+        self._reindex_action = QAction('Reindex All (RAG)...', self)
+        self._reindex_action.triggered.connect(self._on_reindex_all_clicked)
+        settings_menu.addAction(self._reindex_action)
+
         help_menu = menu_bar.addMenu('Help')
         
         # About action
@@ -2449,7 +2499,7 @@ Keywords: {keywords_str}"""
 
         self.scope_combo = QComboBox()
         self.scope_combo.setObjectName("ScopeCombo")
-        self.scope_combo.addItem("Current Session", "current")
+        self.scope_combo.addItem("Specific Session", "current")
         self.scope_combo.addItem("Any Session", "any")
         self.scope_combo.setCurrentIndex(1)
         self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
@@ -2504,10 +2554,11 @@ Keywords: {keywords_str}"""
         # Tab buttons removed - keeping UI cleaner
         # Original tabs: ANSWERS and CHAT
 
-        self._scope_label = QLabel("Scope: (none)")
+        self._scope_label = QLabel("Scope: Any Session — all meetings")
         self._scope_label.setObjectName("ScopeLabel")
         self._scope_label.setAlignment(Qt.AlignCenter)
-        self._scope_label.setVisible(False)
+        self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+        self._scope_label.setVisible(True)
         layout.addWidget(self._scope_label)
 
         self.session_name_label = QLabel("Session Name:")
@@ -2590,7 +2641,8 @@ Keywords: {keywords_str}"""
         self.candidate_group = PixelPanel(inner=True)
         candidate_layout = QVBoxLayout(self.candidate_group)
         candidate_layout.setContentsMargins(10, 10, 10, 10)
-        candidate_layout.addWidget(PixelSectionTitle("SELECT A SESSION"))
+        self._candidate_title = PixelSectionTitle("SELECT A SESSION")
+        candidate_layout.addWidget(self._candidate_title)
         self._candidate_list_widget = QListWidget()
         self._candidate_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
         self._candidate_list_widget.setMaximumHeight(112)
@@ -2981,6 +3033,18 @@ Keywords: {keywords_str}"""
                     else:
                         bubble_frame.hide()
 
+    def _on_detached_scope_changed(self, index: int):
+        """Propagate a detached-window scope change to the main combo."""
+        if getattr(self, '_scope_sync_guard', False):
+            return
+        self._scope_sync_guard = True
+        try:
+            # Fires _on_scope_changed, which performs the transcript reload;
+            # the guard only suppresses the echo back to the detached combo.
+            self.scope_combo.setCurrentIndex(index)
+        finally:
+            self._scope_sync_guard = False
+
     def _on_scope_changed(self, index: int):
         """Handle scope selection change to load session transcripts.
         
@@ -2989,14 +3053,24 @@ Keywords: {keywords_str}"""
         """
         scope_value = self.scope_combo.currentData()
         logger.info(f"Scope changed to: {scope_value}, selected_session_id: {self._selected_session_id}")
-        
+
+        # Keep the detached scope combo in sync (guarded against signal recursion)
+        if not getattr(self, '_scope_sync_guard', False):
+            if hasattr(self, '_detached_scope_combo') and self._detached_scope_combo:
+                self._scope_sync_guard = True
+                try:
+                    self._detached_scope_combo.setCurrentIndex(index)
+                finally:
+                    self._scope_sync_guard = False
+
+        # Skip transcript reload when triggered from _clear_scope (it handles that itself)
+        if getattr(self, '_clearing_scope', False):
+            self._update_scope_label()
+            return
+
         # Clear current transcriptions when scope changes
         self._clear_transcription_view()
-        
-        # Also clear the detached window if it exists
-        if hasattr(self, '_detached_window') and self._detached_window:
-            self._on_close_detached_window()
-        
+
         if scope_value == 'current':
             # Load transcripts from the current/active session
             # Allow live transcriptions to be shown (use allow_live=True)
@@ -3596,11 +3670,11 @@ Keywords: {keywords_str}"""
             self._update_ui_state()
             self._on_status_update('Session recording started')
             
-            # Update scope to "Current Session" with the newly started session
+            # Update scope to "Specific Session" with the newly started session
             active_session = self.session_manager.get_active_session()
             if active_session:
                 self._selected_session_id = active_session.id
-                self.scope_combo.setCurrentIndex(0)  # "Current Session"
+                self.scope_combo.setCurrentIndex(0)  # "Specific Session"
                 self.session_search_input.setText(active_session.name)
                 self._update_scope_label()
                 self._load_session_transcripts_for_current_session(allow_live=True)
@@ -4195,6 +4269,11 @@ Keywords: {keywords_str}"""
         else:
             explicit_scope = "any_session"
         
+        # Record which scope produced the upcoming answer (for the bubble marker)
+        self._last_scope_marker = self._scope_marker_text(
+            explicit_scope, selected_session_id or active_session_id
+        )
+
         # Disable the Ask button while processing
         self.ask_button.setEnabled(False)
         self._add_message_to_conversation('assistant', "Thinking...")
@@ -4249,10 +4328,25 @@ Keywords: {keywords_str}"""
         
         # Handle the response
         if response.success:
-            # Clear candidates on successful answer
+            # Clear candidates on successful answer (preserve the question so a
+            # BU090 handoff pick can re-ask it).
+            pending_question = self._current_question
             self._clear_candidates()
+            self._current_question = pending_question
+            answer_text = response.answer or ""
+            # BU090: Any Session could not reach transcript detail -> append a
+            # short handoff note and seed the picker with the routed sessions.
+            hand_off = (
+                response.scope_used == "any_session"
+                and should_hand_off(response.intent, response.evidence)
+                and bool(response.candidate_sessions)
+            )
+            if hand_off:
+                answer_text += _HANDOFF_NOTE
             # Replace "Thinking..." with the actual response
-            self._replace_thinking_message(response.answer or "")
+            self._replace_thinking_message(answer_text + self._scope_suffix())
+            if hand_off:
+                self._display_candidates(response.candidate_sessions, handoff=True)
             # Save conversation_id for follow-up questions
             if response.conversation_id:
                 self._current_conversation_id = response.conversation_id
@@ -4298,6 +4392,54 @@ Keywords: {keywords_str}"""
         # Clear candidates on exception
         self._clear_candidates()
     
+    def _on_reindex_all_clicked(self):
+        """Run the BU091 corpus backfill on a background thread (force rebuild)."""
+        if getattr(self, "_rag_backfill_thread", None) is not None and self._rag_backfill_thread.isRunning():
+            self._on_status_update("Reindex already running", is_error=True)
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Reindex All",
+            "Rebuild the RAG index (chunks, embeddings and session profiles) "
+            "for every session?\n\nThis runs in the background and may take a "
+            "while on a large history.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._reindex_action.setEnabled(False)
+        self._on_status_update("Reindex started...")
+
+        self._rag_backfill_thread = RagBackfillThread(self.session_manager.db, force=True)
+        self._rag_backfill_thread.progress_signal.connect(
+            lambda done, total: self._on_status_update(f"Reindexing sessions {done}/{total}")
+        )
+        self._rag_backfill_thread.finished_signal.connect(self._on_reindex_finished)
+        self._rag_backfill_thread.error_signal.connect(self._on_reindex_error)
+        self._rag_backfill_thread.start()
+
+    def _on_reindex_finished(self, summary: dict):
+        self._rag_backfill_thread = None
+        self._reindex_action.setEnabled(True)
+        note = "" if summary.get("embeddings") else " (lexical only - embedding model unavailable)"
+        self._on_status_update(
+            f"Reindex complete: {summary.get('processed', 0)}/{summary.get('sessions', 0)} "
+            f"sessions, {summary.get('failed', 0)} failed{note}"
+        )
+        try:
+            from ..rag.router import invalidate_profile_cache
+            invalidate_profile_cache()
+        except Exception:
+            pass
+
+    def _on_reindex_error(self, message: str):
+        self._rag_backfill_thread = None
+        self._reindex_action.setEnabled(True)
+        self._on_status_update(f"Reindex failed: {message}", is_error=True)
+
     def _get_selected_session_id(self) -> Optional[int]:
         """Get the currently selected session ID from the sessions table.
         
@@ -4375,36 +4517,54 @@ Keywords: {keywords_str}"""
         except Exception as e:
             logger.error(f"Failed to refresh session completer: {e}")
     
+    def _session_name_for_id(self, session_id) -> Optional[str]:
+        """Return the display name for a session id, or None."""
+        if session_id is None:
+            return None
+        try:
+            for session in self.session_manager.db.list_sessions():
+                if session.get('id') == session_id:
+                    return session.get('name', 'Unnamed')
+        except Exception as e:
+            logger.error(f"Failed to look up session name: {e}")
+        return None
+
+    def _scope_marker_text(self, explicit_scope: str, session_id) -> str:
+        """Short human label of the scope that produced an answer."""
+        if explicit_scope == "current_session":
+            name = self._session_name_for_id(session_id)
+            return f"Specific Session — {name}" if name else "Specific Session"
+        return "Any Session"
+
+    def _scope_suffix(self) -> str:
+        """Marker appended to an assistant answer bubble to show its scope."""
+        marker = getattr(self, '_last_scope_marker', None)
+        return f"\n\n— via {marker}" if marker else ""
+
     def _update_scope_label(self):
-        """Update the scope label to show the currently selected session name."""
+        """Update the scope mode indicator to reflect the active scope mode."""
         if not hasattr(self, '_scope_label'):
             return
-            
-        if self._selected_session_id is None:
-            self._scope_label.setText("Scope: (none)")
-            self._scope_label.setStyleSheet("color: gray; font-style: italic;")
-            return
-        
+
         try:
-            # Get session name from database
-            sessions = self.session_manager.db.list_sessions()
-            session_name = None
-            for session in sessions:
-                if session.get('id') == self._selected_session_id:
-                    session_name = session.get('name', 'Unnamed')
-                    break
-            
-            if session_name:
-                self._scope_label.setText(f"Scope: {session_name}")
-                self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+            scope_value = self.scope_combo.currentData() if hasattr(self, 'scope_combo') else 'any'
+            if scope_value == 'current':
+                session_id = self._selected_session_id
+                if session_id is None and self.session_manager:
+                    active_session = self.session_manager.get_active_session()
+                    session_id = active_session.id if active_session else None
+                name = self._session_name_for_id(session_id)
+                detail = name if name else "(no session selected)"
+                self._scope_label.setText(f"Scope: Specific Session — {detail}")
             else:
-                self._scope_label.setText("Scope: (not found)")
-                self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+                self._scope_label.setText("Scope: Any Session — all meetings")
+            self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+            self._scope_label.setVisible(True)
         except Exception as e:
             logger.error(f"Failed to update scope label: {e}")
             self._scope_label.setText("Scope: (error)")
             self._scope_label.setStyleSheet("color: gray; font-style: italic;")
-        
+
         # Also update summary icon state
         self._update_summary_icon_state()
     
@@ -4845,15 +5005,24 @@ Keywords: {keywords_str}"""
             logger.error(f"Failed to get filtered sessions: {e}")
             return []
     
-    def _display_candidates(self, candidates: list):
+    def _display_candidates(self, candidates: list, handoff: bool = False):
         """Display candidate sessions for user selection.
-        
+
         Args:
             candidates: List of candidate session dictionaries with session_id,
                        session_name, and start_time keys.
+            handoff: When True, relabel the picker toward asking in Specific
+                     Session (BU090 Any Session -> detail handoff).
         """
         from datetime import datetime
-        
+
+        self._candidate_title.setText(
+            _CANDIDATE_TITLE_HANDOFF if handoff else _CANDIDATE_TITLE_DEFAULT
+        )
+        self.use_candidate_button.setText(
+            _CANDIDATE_BTN_HANDOFF if handoff else _CANDIDATE_BTN_DEFAULT
+        )
+
         self._current_candidates = candidates
         self._candidate_list_widget.clear()
         
@@ -4886,6 +5055,8 @@ Keywords: {keywords_str}"""
         self._candidate_list_widget.clear()
         self.candidate_group.setVisible(False)
         self.use_candidate_button.setEnabled(False)
+        self._candidate_title.setText(_CANDIDATE_TITLE_DEFAULT)
+        self.use_candidate_button.setText(_CANDIDATE_BTN_DEFAULT)
     
     def _on_candidate_selected(self, item: QListWidgetItem):
         """Handle candidate selection - enable the use button.
@@ -5140,9 +5311,9 @@ Keywords: {keywords_str}"""
             )
         # Preserve the current selection from main window
         self._detached_scope_combo.setCurrentIndex(self.scope_combo.currentIndex())
-        # Sync scope changes back to main window
+        # Sync scope changes back to main window (guarded against signal recursion)
         self._detached_scope_combo.currentIndexChanged.connect(
-            lambda idx: self.scope_combo.setCurrentIndex(idx)
+            self._on_detached_scope_changed
         )
         agent_layout.addWidget(self._detached_scope_combo)
         
@@ -5306,6 +5477,11 @@ Keywords: {keywords_str}"""
         else:
             explicit_scope = "any_session"
         
+        # Record which scope produced the upcoming answer (for the bubble marker)
+        self._last_scope_marker = self._scope_marker_text(
+            explicit_scope, selected_session_id or active_session_id
+        )
+
         # Disable the Ask button while processing
         self._detached_ask_button.setEnabled(False)
         self._add_message_to_conversation('assistant', "Thinking...")
@@ -5345,8 +5521,18 @@ Keywords: {keywords_str}"""
             if response.success:
                 # Clear candidates on successful answer
                 self._detached_candidate_group.setVisible(False)
+                answer_text = response.answer or ""
+                hand_off = (
+                    response.scope_used == "any_session"
+                    and should_hand_off(response.intent, response.evidence)
+                    and bool(response.candidate_sessions)
+                )
+                if hand_off:
+                    answer_text += _HANDOFF_NOTE
                 # Add assistant's response to conversation view
-                self._add_message_to_conversation('assistant', response.answer or "")
+                self._add_message_to_conversation('assistant', answer_text + self._scope_suffix())
+                if hand_off:
+                    self._display_detached_candidates(response.candidate_sessions, handoff=True)
                 # Save conversation_id for follow-up questions
                 if response.conversation_id:
                     self._current_conversation_id = response.conversation_id
@@ -5386,8 +5572,14 @@ Keywords: {keywords_str}"""
             # Re-enable the Ask button
             self._detached_ask_button.setEnabled(True)
     
-    def _display_detached_candidates(self, candidates: list):
+    def _display_detached_candidates(self, candidates: list, handoff: bool = False):
         """Display candidate sessions in the detached window for selection."""
+        self._detached_candidate_group.setTitle(
+            _CANDIDATE_TITLE_HANDOFF.title() + ":" if handoff else "Select a Session:"
+        )
+        self._detached_use_candidate_button.setText(
+            _CANDIDATE_BTN_HANDOFF if handoff else _CANDIDATE_BTN_DEFAULT
+        )
         self._detached_candidate_list.clear()
         
         for candidate in candidates:
@@ -5422,15 +5614,17 @@ Keywords: {keywords_str}"""
                 self._add_message_to_conversation('assistant', "Thinking...")
                 
                 agent_id = self._detached_agent_combo.currentData()
-                scope_value = self._detached_scope_combo.currentData()
-                explicit_scope = "current_session" if scope_value == "current" else "any_session"
-                
+
+                # The picker always re-asks in Specific Session against the
+                # chosen session - both for the ambiguity flow and the BU090
+                # Any Session -> detail handoff.
                 QTimer.singleShot(50, lambda: self._run_detached_assistant_query(
                     question=self._current_question,
                     agent_id=agent_id,
-                    explicit_scope=explicit_scope,
+                    explicit_scope="current_session",
                     active_session_id=None,  # Explicit session selected
-                    selected_session_id=selected_session_id
+                    selected_session_id=selected_session_id,
+                    conversation_id=self._current_conversation_id
                 ))
     
     def closeEvent(self, event):
@@ -5438,7 +5632,12 @@ Keywords: {keywords_str}"""
         # Wait for any active assistant thread to finish
         if self._assistant_thread is not None and self._assistant_thread.isRunning():
             self._assistant_thread.wait()
-        
+
+        # Wait for a running RAG backfill (BU091); it is resumable regardless.
+        _backfill = getattr(self, "_rag_backfill_thread", None)
+        if _backfill is not None and _backfill.isRunning():
+            _backfill.wait()
+
         # Check if there's an active session
         if self.session_manager and self.session_manager.get_active_session():
             reply = QMessageBox.question(

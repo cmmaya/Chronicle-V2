@@ -95,6 +95,8 @@ BU082 - Tighten Chronicle Assistant Prompt
 BU083 - Add Retrieval Tests
 BU084 - Add Local Embedding Schema Placeholder
 BU085 - Implement RAG Content Indexing
+BU086 - Fix RAG FTS MATCH Clause
+BU087 - Timestamp-Preserving Transcript Chunking
 
 ## In Progress BUs
 None
@@ -105,6 +107,9 @@ None
 ## Known Issues
 - The UI does not yet exist for most features. The backend functionality is largely in place, but there is no way for a user to interact with it.
 - Fixed: Live transcription session ending did not update transcription_status to 'transcribed' in database
+- Fixed (BU086): `search_rag_fts` never applied a `WHERE rag_fts MATCH ?` clause, so every RAG search returned the first N chunks by rowid with `bm25()` = -0.0. Both Any Session and Specific Session retrieval ignored the user's question. Now sanitised, parameterised and BM25-ranked.
+- Fixed (BU087): transcripts were concatenated into one string per session and split into 1000-char chunks, so no chunk had a usable timestamp (836 transcripts collapsed into 76 chunks). Chunks are now time-windowed (~60s / ~800 chars) and carry their own `start_timestamp`, `end_timestamp` and `source`; re-indexing the live database produced 577 chunks. `HH:MM:SS` citation and screenshot correlation now have real per-chunk time anchors.
+- Existing databases pick up the new chunking via `reindex_all_sessions(db)` in `src/rag/indexer.py`; it is not yet wired to any UI trigger (BU091).
 
 ## Working Memory
 - Fresh repository
@@ -204,7 +209,22 @@ None
 - Added ALLOWED_MODELS list and DEFAULT_MODEL constant to config.py
 - Added get_selected_model() and set_selected_model() functions for model selection
 - Added session search with autocomplete completer in main window
-- Added scope label that shows "Scope: <session_name>" when a session is selected
+- Assistant scope modes are "Specific Session" / "Any Session" (BU088). Internal keys unchanged (`current` / `current_session`).
+- `_scope_label` is a live mode indicator: `Scope: Specific Session - <name>` or `Scope: Any Session - all meetings`, updated on scope change, session selection and ESC
+- Main and detached scope combos sync bidirectionally with a recursion guard; the detached window is no longer closed on a scope change
+- Each assistant answer bubble is tagged with the scope that produced it ("via Specific Session - <name>" / "via Any Session"), display-only
+- Two-tier Any Session retrieval (BU089): `src/rag/router.py` `route_sessions()` picks the top ~5 sessions for a question (hybrid cosine + BM25 over one `session_profiles` row per session), then Tier-2 chunk search runs only inside them via `build_routed_session_context`
+- `src/rag/embeddings.py`: local multilingual ONNX embedder (`intfloat/multilingual-e5-small`, pinned by revision), loaded on the existing `onnxruntime`; only `tokenizers` added. Degrades to lexical-only routing when unavailable; never crashes
+- `AnswerResponse.routed_sessions` carries the routed candidates for Any Session answers (empty for other scopes); consumed by BU090
+- Answer contract (BU090): in Any Session mode only, the system prompt gets `RESPONSE_CONTRACT` (`src/assistant/response_contract.py`); the model appends a `@@CHRONICLE_META@@` JSON trailer with `intent`/`evidence`/`sessions`. `parse_answer()` strips it before display and before `_persist_conversation`, degrading to the full raw text with null metadata on any failure. `intent`/`evidence` are logged only, never rendered
+- Any Session answer call uses `config.ANY_SESSION_TEMPERATURE` (0.2) for reliable trailer compliance; all other call paths keep the client default (0.7)
+- `AnswerResponse` gained optional `intent`, `evidence`, `scope_used`, `candidate_sessions` (all defaulted)
+- Scope handoff (BU090): when Any Session returns `intent == "detail"` or `evidence` in (`partial`, `none`) with routed candidates, the answer gets a short handoff note and the existing candidate picker is shown relabelled ("Ask in Specific Session"), seeded with the routed sessions. Selecting one re-asks the question in Specific Session scope. Wired in both the main and detached assistant windows
+- `session_profiles` refreshed on `index_session_content`; whole-corpus backfill is `reindex_all_session_profiles(db)`
+- Per-chunk embeddings (BU091): `index_session_content` now computes `embed_passages` vectors for every chunk and `replace_rag_chunks` persists `embedding`/`embedding_model`. Idempotent: a document whose `content_hash` is unchanged and whose chunks already carry current-model vectors is skipped (no writes); `db.count_chunks_missing_embedding` drives re-embed on a model/revision change; `index_session_content(db, sid, force=True)` bypasses the skip. FTS rebuild is gated on an actual chunk change
+- `src/rag/migration.py` `backfill_corpus(db, progress_callback, force)`: idempotent, resumable one-time backfill over all sessions; returns `{sessions, processed, failed, embeddings}`. Degrades to lexical-only (NULL vectors) when the embedder is unavailable; a later run repairs the vectors
+- Settings menu > "Reindex All (RAG)..." runs `backfill_corpus(force=True)` on `RagBackfillThread` (background QThread) with `sessions done/total` progress on the status bar; invalidates the router profile cache on completion. `closeEvent` waits for a running backfill
+- The three `session_manager` index hooks (session stop, transcription complete, summary regenerate) and `window.py` summary path all go through `index_session_content`, so they refresh chunks + chunk embeddings + profile + FTS together
 - Agent dropdown now shows actual agent names ("Chronicle Assistant", "Concise Helper", "Research Helper") instead of generic "Agent" label
 - Added dropdown arrow indicator (v) to all QComboBox widgets
 - Expanded session bar and ask bar width by 1.8x (from 900px to 1620px)

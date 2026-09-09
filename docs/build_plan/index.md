@@ -53,3 +53,22 @@
 | BU082 | Tighten Chronicle Assistant Prompt      | Pending   | BU080               |
 | BU083 | Add Retrieval Tests                     | Pending   | BU080               |
 | BU084 | Add Local Embedding Schema Placeholder  | Pending   | BU083               |
+| BU085 | Implement RAG Content Indexing          | Pending   | BU084               | BU086 |
+
+Any Session Refactor — see docs/build_plan/ANY_SESSION_REFACTOR.md
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU086 | Fix RAG FTS MATCH Clause                | Completed | BU085               | BU087 |
+| BU087 | Timestamp-Preserving Transcript Chunking| Completed | BU085, BU086        | BU088 |
+| BU088 | Scope Mode Indicator And Rename         | Completed | none                | BU089 |
+| BU089 | Session Router For Any Session          | Completed | BU086, BU087        | BU090 |
+| BU090 | Assistant Answer Contract And Handoff   | Completed | BU088, BU089        | BU091 |
+| BU091 | Embedding Backfill And Incremental Reindex | Completed | BU087, BU089    | none  |
+
+Scope Switch Prompt — follow-on to BU090
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU092 | Scope Switch Offer Decision And Payload | Pending   | BU089, BU090        | BU093 |
+| BU093 | In-Chat Scope Switch Prompt             | Pending   | BU092               | none  |

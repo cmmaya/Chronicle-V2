@@ -311,5 +311,37 @@ class TestAssistantContextRetriever(unittest.TestCase):
         self.assertLessEqual(len(context.transcripts[0].text), MAX_TRANSCRIPT_LENGTH + 3)
 
 
+    def test_rag_uses_per_chunk_timestamp_and_source(self):
+        """Test that chunk timestamp and source are carried into excerpts."""
+        db = MockDatabase(
+            rag_fts_results={
+                1: [
+                    {
+                        "chunk_id": 7,
+                        "document_id": 1,
+                        "source_type": "transcript",
+                        "source_id": 1,
+                        "session_id": 1,
+                        "timestamp": 1705312860,
+                        "start_timestamp": 1705312860,
+                        "end_timestamp": 1705312900,
+                        "source": "system",
+                        "title": "Session 1 Transcript",
+                        "content": "Second window of the meeting",
+                        "rank": 1.0,
+                    },
+                ]
+            }
+        )
+        retriever = AssistantContextRetriever(db)
+
+        context = retriever.build_session_context(1, "meeting")
+
+        self.assertEqual(len(context.transcripts), 1)
+        # Source comes from the chunk, not from the document title.
+        self.assertEqual(context.transcripts[0].source, "system")
+        self.assertEqual(context.transcripts[0].timestamp, 1705312860)
+
+
 if __name__ == "__main__":
     unittest.main()

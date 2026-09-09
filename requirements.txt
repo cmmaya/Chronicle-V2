@@ -42,3 +42,10 @@ onnx-asr[cpu,hub]
 #
 
 # Optional: set HF_TOKEN for faster/higher-limit Hugging Face downloads.
+
+# RAG session router (BU089): local multilingual sentence embeddings.
+# The ONNX encoder (intfloat/multilingual-e5-small) is loaded directly with the
+# onnxruntime pinned above. Only a tokenizer is added here; huggingface-hub
+# already comes via onnx-asr[cpu,hub]. Nothing here may relax the onnxruntime
+# pin -- see src/rag/embeddings.py for why the direct-load approach is used.
+tokenizers>=0.15,<1.0
