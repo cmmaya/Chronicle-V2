@@ -23,7 +23,6 @@ from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_mod
 from ..assistant.service import AssistantAnswerService
 from ..assistant.scope_offer import (
     format_scope_offer_prompt,
-    accept_scope_offer,
     decline_scope_offer as apply_scope_offer_decline,
 )
 
@@ -4564,29 +4563,22 @@ Keywords: {keywords_str}"""
             self._update_scope_label()
             return
         if self.scope_combo.currentIndex() == index:
-            # Already Specific Session; re-run so the panel reloads for the
-            # newly selected session.
             self._on_scope_changed(index)
         else:
             self.scope_combo.setCurrentIndex(index)
 
-    def _reask_after_scope_offer(self, **query_kwargs):
-        """Run a re-ask on the background thread (BU093 YES)."""
-        self._add_message_to_conversation('assistant', "Thinking...")
-        QTimer.singleShot(50, lambda: self._run_assistant_query(**query_kwargs))
-
     def _on_scope_offer_accepted(self, offer):
-        """YES: switch scope to Specific Session for the offered session and
-        re-ask the stored question against it.
+        """YES: open a blank new chat scoped to the offered session.
+
+        Nothing is re-asked - the Any Session question stays in its own
+        conversation. The new chat starts empty, with the scope combo moved
+        to Specific Session for `offer.session_id` (transcript panel and scope
+        label follow), so the user types their next question there already
+        scoped to that meeting.
         """
-        self._retire_pending_scope_prompt("> Scope switched to Specific Session.")
+        self._retire_pending_scope_prompt("> Switched to that session.")
+        self._on_new_chat_clicked()
         self._switch_scope_to_specific(offer.session_id)
-        question = self._current_question
-        if not question:
-            return
-        agent_id = self.agent_combo.currentData()
-        self._last_scope_marker = self._scope_marker_text("current_session", offer.session_id)
-        accept_scope_offer(offer, question, agent_id, self._reask_after_scope_offer)
 
     def _on_scope_offer_declined(self, offer):
         """NO: record the decline so this session is not offered again in the

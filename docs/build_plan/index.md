@@ -84,3 +84,9 @@ System Audio Capture Resilience — independent bug fix, diagnosed from a real s
 | BU    | Name                                    | Status    | Depends On          | Next  |
 | ---   | ---                                     | ---       | ---                 | ---   |
 | BU095 | System Audio Capture Supervisor And Watchdog | Completed | none           | none  |
+
+Conversation Management — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU096 | Delete Past Conversation From Sidebar (Right-Click) | Pending | none         | none  |

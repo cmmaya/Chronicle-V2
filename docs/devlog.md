@@ -1156,3 +1156,34 @@ Tests:
   suite (`test_database_rag`, `test_rag_indexer`, `test_rag_migration`,
   `test_context_retriever`, `test_assistant_tools`, `test_scope_offer`,
   `test_session_resolver`) -> 182 passed.
+
+### BU093 follow-up 3 - YES on the scope switch prompt opens a blank chat scoped to the session
+
+Summary:
+Accepting the in-chat scope switch offer ("Would you like to change the scope
+to Specific for session ...?") used to re-ask the question inside the same Any
+Session conversation *and* move the persistent scope combo to Specific Session.
+Two problems surfaced in use: (1) landing in Specific Session meant every
+following question was answered scoped, so the offer never appeared again
+("it never asks me"); (2) the new chat opened pre-filled with the Any Session
+question re-asked. Final behaviour: YES opens a *blank* new chat with the scope
+combo moved to Specific Session for the offered meeting; nothing is re-asked.
+The Any Session Q&A stays in its own conversation. The user then types their
+next question already scoped to that session. (To get switch offers again they
+set the scope combo back to Any Session, same as any other Specific session.)
+
+Changes:
+- `src/app/window.py`:
+  - `_on_scope_offer_accepted` now just: retire the live prompt ->
+    `_on_new_chat_clicked()` (clears both views, resets
+    `_current_conversation_id`) -> `_switch_scope_to_specific(offer.session_id)`.
+    No re-ask, no `accept_scope_offer`, no question echo.
+  - `_switch_scope_to_specific` restored (selects the session and moves the
+    scope combo to Specific Session via the normal `_on_scope_changed` path,
+    so detached combo / transcript panel / scope label follow).
+  - `_reask_after_scope_offer` deleted; `accept_scope_offer` import dropped.
+    `accept_scope_offer` itself stays in `scope_offer.py` (still unit-tested).
+  - NO (`_on_scope_offer_declined`) unchanged.
+
+Tests:
+- None (UI-only; no Qt window harness). `python -m py_compile src/app/window.py` -> OK.
