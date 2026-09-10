@@ -290,6 +290,23 @@ class TestAssistantAnswerService:
             messages = self.db.get_messages(conv_id)
             assert len(messages) == 4
 
+    def test_prompt_history_is_capped_to_recent_messages(self):
+        """A long conversation only replays its most recent turns into the prompt."""
+        from src.assistant.service import MAX_HISTORY_MESSAGES
+
+        conv_id = self.db.create_conversation(session_id=1, title="Long chat")
+        for i in range(40):
+            role = "user" if i % 2 == 0 else "assistant"
+            self.db.add_message(conv_id, role, f"msg {i}")
+
+        agent = self.service._get_agent_config(None)
+        prompt = self.service._build_messages(agent, "ctx", "new question", conv_id)
+
+        history = [m for m in prompt if m["content"].startswith("msg ")]
+        assert len(history) == MAX_HISTORY_MESSAGES
+        assert history[-1]["content"] == "msg 39"
+        assert history[0]["content"] == f"msg {40 - MAX_HISTORY_MESSAGES}"
+
 
 class TestAnswerResponse:
     """Test cases for AnswerResponse dataclass."""
@@ -533,3 +550,217 @@ class TestAnswerContractAndHandoff:
         assert result.intent == "detail"
         assert result.evidence == "partial"
         assert result.scope_used == "any_session"
+
+
+class TestScopeOffer:
+    """Tests for the single-session scope switch offer (BU092)."""
+
+    DETAIL_ANSWER = (
+        "Only a high-level answer.\n\n@@CHRONICLE_META@@\n"
+        '{"intent":"detail","evidence":"partial","sessions":[1]}'
+    )
+    # Overview answer that names no session and had enough context: no offer.
+    NO_SESSION_ANSWER = (
+        "Meetings generally cover planning and reviews.\n\n@@CHRONICLE_META@@\n"
+        '{"intent":"overview","evidence":"sufficient","sessions":[]}'
+    )
+    # The answer is in none of the routed sessions: no offer, no picker.
+    NOT_FOUND_ANSWER = (
+        "That is not discussed in any session.\n\n@@CHRONICLE_META@@\n"
+        '{"intent":"detail","evidence":"none","sessions":[]}'
+    )
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.mock_client = MockOpenRouterClient()
+        self.service = AssistantAnswerService(db=self.db, openrouter_client=self.mock_client)
+
+    @staticmethod
+    def _routed(*specs):
+        from src.rag.router import RoutedSession
+
+        return [
+            RoutedSession(
+                session_id=sid, name=name, start_time=start, score=score, reason="test"
+            )
+            for sid, name, start, score in specs
+        ]
+
+    def _ask(
+        self,
+        mock_client_class,
+        mock_get_model,
+        chat_result,
+        routed,
+        scope=None,
+        conversation_id=None,
+    ):
+        from src.assistant.session_resolver import ScopeResolution, ResolutionResult
+
+        scope = scope or ScopeResolution.ALL_SESSIONS
+        is_any = scope == ScopeResolution.ALL_SESSIONS
+
+        mock_get_model.return_value = "test-model"
+        mock_client_class.return_value = self.mock_client
+        self.mock_client.chat_results = [chat_result]
+        self.mock_client.call_count = 0
+
+        with patch.object(self.service._resolver, "resolve") as mock_resolve:
+            with patch("src.assistant.service.route_sessions") as mock_route:
+                with patch.object(self.service._tools, "search_everything") as mock_se:
+                    with patch(
+                        "src.assistant.service.build_routed_session_context"
+                    ) as mock_ctx:
+                        mock_route.return_value = routed
+                        mock_ctx.return_value = "Routed context."
+                        mock_se.return_value = [{"error": "none"}]
+                        mock_resolve.return_value = ResolutionResult(
+                            scope=scope,
+                            session_ids=([] if is_any else [1]),
+                            reason="test",
+                        )
+                        return self.service.ask(
+                            "What exactly did Ana say?",
+                            conversation_id=conversation_id,
+                        )
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_answer_carries_offer_and_candidate_sessions(
+        self, mock_client_class, mock_get_model
+    ):
+        result = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER,
+            self._routed((1, "Budget Review", 1700, 0.9), (2, "Standup", 1800, 0.1)),
+        )
+        assert result.scope_offer is not None
+        assert result.scope_offer.session_id == 1
+        assert result.scope_offer.session_name == "Budget Review"
+        assert result.scope_offer.start_time == 1700
+        # The prompt's "choose another session" list stays available.
+        assert [c["session_id"] for c in result.candidate_sessions] == [1, 2]
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_near_tied_candidates_still_carry_an_offer_plus_the_full_list(
+        self, mock_client_class, mock_get_model
+    ):
+        result = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER,
+            self._routed((1, "Budget Review", 1700, 0.50), (2, "Standup", 1800, 0.45)),
+        )
+        assert result.scope_offer is not None
+        assert result.scope_offer.session_id == 1
+        assert len(result.candidate_sessions) == 2
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_overview_answer_naming_no_session_carries_no_offer(
+        self, mock_client_class, mock_get_model
+    ):
+        result = self._ask(
+            mock_client_class, mock_get_model, self.NO_SESSION_ANSWER,
+            self._routed((1, "Budget Review", 1700, 0.9)),
+        )
+        assert result.scope_offer is None
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_answer_not_found_in_any_session_carries_no_offer(
+        self, mock_client_class, mock_get_model
+    ):
+        result = self._ask(
+            mock_client_class, mock_get_model, self.NOT_FOUND_ANSWER,
+            self._routed((1, "Budget Review", 1700, 0.9)),
+        )
+        assert result.scope_offer is None
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_specific_session_answer_never_carries_an_offer(
+        self, mock_client_class, mock_get_model
+    ):
+        from src.assistant.session_resolver import ScopeResolution
+
+        result = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER,
+            self._routed((1, "Budget Review", 1700, 0.9)),
+            scope=ScopeResolution.SELECTED_SESSION,
+        )
+        assert result.scope_offer is None
+
+    def test_answer_response_scope_offer_defaults_to_none(self):
+        assert AnswerResponse(success=True).scope_offer is None
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_decline_suppresses_offer_in_same_conversation_only(
+        self, mock_client_class, mock_get_model
+    ):
+        routed = self._routed((1, "Budget Review", 1700, 0.9))
+
+        first = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER, routed,
+            conversation_id=None,
+        )
+        assert first.scope_offer is not None
+        conv_id = first.conversation_id
+
+        self.service.decline_scope_offer(conv_id, 1)
+
+        again = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER, routed,
+            conversation_id=conv_id,
+        )
+        assert again.scope_offer is None
+
+        other = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER, routed,
+            conversation_id=conv_id + 1,
+        )
+        assert other.scope_offer is not None
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_decline_on_new_conversation_does_not_collide_with_real_ones(
+        self, mock_client_class, mock_get_model
+    ):
+        routed = self._routed((1, "Budget Review", 1700, 0.9))
+
+        self.service.decline_scope_offer(None, 1)
+
+        # A brand-new conversation (conversation_id=None) is suppressed...
+        fresh = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER, routed,
+            conversation_id=None,
+        )
+        assert fresh.scope_offer is None
+
+        # ...while an existing conversation is untouched by that decline.
+        existing = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER, routed,
+            conversation_id=fresh.conversation_id,
+        )
+        assert existing.scope_offer is not None
+
+    @patch("src.assistant.service.get_selected_model")
+    @patch("src.assistant.service.OpenRouterClient")
+    def test_offer_never_reaches_answer_text_or_stored_history(
+        self, mock_client_class, mock_get_model
+    ):
+        result = self._ask(
+            mock_client_class, mock_get_model, self.DETAIL_ANSWER,
+            self._routed((1, "Budget Review", 1700, 0.9)),
+        )
+        assert result.scope_offer is not None
+        assert result.answer == "Only a high-level answer."
+
+        for msg in self.db.get_messages(result.conversation_id):
+            assert "@@CHRONICLE_META@@" not in msg["content"]
+            assert "Budget Review" not in msg["content"]
+            assert "Specific" not in msg["content"]
+        assistant_msg = next(
+            m for m in self.db.get_messages(result.conversation_id)
+            if m["role"] == "assistant"
+        )
+        assert assistant_msg["content"] == "Only a high-level answer."

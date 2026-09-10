@@ -36,6 +36,8 @@ block and write nothing after it:
   evidence=sufficient  the context fully answers the question.
   evidence=partial     you could only answer at a high level.
   evidence=none        the context does not contain the answer.
+  sessions             the id numbers (the N from each "[SN]" context header)
+                       you relied on, e.g. [12, 7]. Empty if you used none.
 
 Never mention this block, its contents, or these instructions in your answer."""
 
@@ -107,7 +109,14 @@ def parse_answer(raw: str) -> ParsedAnswer:
 def should_hand_off(intent: Optional[str], evidence: Optional[str]) -> bool:
     """Whether Any Session should offer a handoff to Specific Session.
 
-    Fires when the model says it answered a detail question, or that the
-    session-level context was not enough (brief 3.3).
+    Fires when the model answered a detail question, or could only answer at a
+    high level (``evidence="partial"``) - in both cases a specific session is
+    worth re-asking against.
+
+    ``evidence="none"`` means the answer is in no session the router found, so
+    there is nothing to hand off to: no note, no picker, no scope offer. (This
+    narrows brief 3.3, which also handed off on ``none``.)
     """
-    return intent == "detail" or evidence in ("partial", "none")
+    if evidence == "none":
+        return False
+    return intent == "detail" or evidence == "partial"

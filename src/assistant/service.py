@@ -2,11 +2,12 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from .openrouter_client import OpenRouterClient
 from .rag_context_builder import build_any_session_context, build_routed_session_context
 from .response_contract import RESPONSE_CONTRACT, parse_answer
+from .scope_offer import ScopeOffer, build_scope_offer
 from ..rag.router import route_sessions
 from .session_resolver import (
     AssistantSessionResolver,
@@ -18,6 +19,11 @@ from ..config import ANY_SESSION_TEMPERATURE, ASSISTANT_AGENTS, get_selected_mod
 from ..storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+# Most recent conversation messages replayed into the prompt. Older turns are
+# dropped so a long back-and-forth never crowds out the retrieved context
+# (ANY_SESSION_REFACTOR brief 2.4).
+MAX_HISTORY_MESSAGES = 10
 
 
 @dataclass
@@ -39,6 +45,9 @@ class AnswerResponse:
     scope_used: Optional[str] = None
     # Routed sessions to seed the Specific Session handoff picker (BU090).
     candidate_sessions: List[Dict[str, Any]] = None
+    # Single dominant session to offer a direct scope switch for (BU092);
+    # None whenever the field is ambiguous, so candidate_sessions still applies.
+    scope_offer: Optional[ScopeOffer] = None
 
     def __post_init__(self):
         if self.candidates is None:
@@ -77,6 +86,9 @@ class AssistantAnswerService:
         self._agents = ASSISTANT_AGENTS.get("agents", {})
         # Populated by _get_all_sessions_context; surfaced on AnswerResponse.
         self._last_routed_sessions: List[Dict[str, Any]] = []
+        # Scope offers the user declined, per conversation (BU092). In-memory
+        # only - not persisted, and cleared with the process.
+        self._declined_offers: Dict[Optional[int], Set[int]] = {}
 
     def ask(
         self,
@@ -365,6 +377,7 @@ class AssistantAnswerService:
         """
         intent = evidence = None
         candidate_sessions: List[Dict[str, Any]] = []
+        scope_offer: Optional[ScopeOffer] = None
         answer = raw_answer
 
         if is_any_session:
@@ -372,9 +385,21 @@ class AssistantAnswerService:
             answer = parsed.answer_text
             intent, evidence = parsed.intent, parsed.evidence
             candidate_sessions = list(self._last_routed_sessions)
+            # BU092/BU093: when the answer points at a concrete meeting (the
+            # model cited it, or it could only answer at a high level), offer a
+            # direct switch for that session. candidate_sessions stays populated
+            # so the prompt's "choose another session" path has the full list.
+            scope_offer = build_scope_offer(
+                self._last_routed_sessions,
+                intent,
+                evidence,
+                self._declined_offers.get(conversation_id, ()),
+                cited_session_ids=parsed.sessions,
+            )
             logger.info(
-                "Any Session answer contract: intent=%s evidence=%s sessions=%s",
+                "Any Session answer contract: intent=%s evidence=%s sessions=%s offer=%s",
                 intent, evidence, parsed.sessions,
+                scope_offer.session_id if scope_offer else None,
             )
 
         try:
@@ -397,7 +422,20 @@ class AssistantAnswerService:
             evidence=evidence,
             scope_used="any_session" if is_any_session else "current_session",
             candidate_sessions=candidate_sessions,
+            scope_offer=scope_offer,
         )
+
+    def decline_scope_offer(
+        self, conversation_id: Optional[int], session_id: int
+    ) -> None:
+        """Record that the user declined a scope offer for one session (BU092).
+
+        Later turns of the same conversation will not offer that session again.
+        A ``conversation_id`` of ``None`` (a brand-new conversation) is its own
+        bucket and never collides with a real conversation's declines. Kept in
+        memory only - no schema change, no persistence.
+        """
+        self._declined_offers.setdefault(conversation_id, set()).add(session_id)
 
     def _get_agent_config(self, agent_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Get agent configuration by ID."""
@@ -511,9 +549,7 @@ class AssistantAnswerService:
                             start_time_str = f" ({dt.strftime('%Y-%m-%d %H:%M')})"
                         except:
                             pass
-                    trans_status = s.get('transcription_status', 'none')
-                    sum_status = s.get('summary_status', 'none')
-                    parts.append(f"[{s.get('name', 'Untitled')}{start_time_str}] - Transcribed: {trans_status}, Summarized: {sum_status}")
+                    parts.append(f"[{s.get('name', 'Untitled')}{start_time_str}]")
                 parts.append("")
         except Exception:
             pass
@@ -607,10 +643,11 @@ class AssistantAnswerService:
             system_content = f"{system_content}\n\n{RESPONSE_CONTRACT}"
         messages.append({"role": "system", "content": system_content})
 
-        # Add conversation history if continuing
+        # Add conversation history if continuing, capped to the most recent
+        # turns so it cannot crowd out the retrieved context.
         if conversation_id:
             try:
-                history = self._db.get_messages(conversation_id)
+                history = self._db.get_messages(conversation_id)[-MAX_HISTORY_MESSAGES:]
                 for msg in history:
                     messages.append({
                         "role": msg["role"],

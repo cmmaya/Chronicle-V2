@@ -13,6 +13,33 @@ MAX_CONTEXT_CHARS = 12000
 MAX_CHUNKS_PER_SESSION = 4
 
 
+def _format_session_date(value: Any) -> str:
+    """``YYYY-MM-DD HH:MM`` for a unix timestamp; ``""`` when missing/unparseable."""
+    if not value:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(value)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _session_header(
+    session_id: Any, session_name: Optional[str], session_date: str
+) -> str:
+    """Uniform per-session header for both Any Session builders:
+
+        ## [S<id>] <name> (<YYYY-MM-DD HH:MM>)
+
+    The ``[S<id>]`` prefix is what the answer contract's ``sessions`` field
+    refers back to. The date is dropped, with its parentheses, when unknown.
+    """
+    name = session_name or f"Session {session_id}"
+    header = f"\n## [S{session_id}] {name}"
+    if session_date:
+        header += f" ({session_date})"
+    return header + "\n"
+
+
 def build_any_session_context(
     query: str,
     results: List[Dict[str, Any]],
@@ -21,15 +48,16 @@ def build_any_session_context(
     """
     Build a compact context string from any-session search results.
 
-    Groups results by session and includes source type, session name, timestamp,
-    and truncated content for each result. Respects max_chars to avoid
-    exceeding context limits.
+    Groups results by session under a ``## [S<id>] <name> (<date>)`` header
+    (date taken from the session's earliest result), then lists each result as
+    ``[<source> @ <YYYY-MM-DD HH:MM:SS>]: <content>``. Respects max_chars to
+    avoid exceeding context limits.
 
     Args:
         query: The original search query.
         results: List of result dictionaries from RAG search.
-               Expected keys: chunk_id, document_id, source_type, source_id,
-               session_id, timestamp, title, content, rank.
+               Expected keys: source_type, session_id, session_name (optional),
+               timestamp, content.
         max_chars: Maximum character length for the context (default 12000).
 
     Returns:
@@ -66,11 +94,17 @@ def build_any_session_context(
     for session_id in sorted(sessions.keys()):
         session_results = sessions[session_id]
 
-        # Get session name from first result
-        session_name = session_results[0].get("session_name", f"Session {session_id}")
+        # Session name + date (earliest chunk in the group) for the header.
+        session_name = session_results[0].get("session_name")
+        session_date = _format_session_date(
+            min(
+                (r.get("timestamp") for r in session_results if r.get("timestamp")),
+                default=None,
+            )
+        )
 
         # Check if adding session header would exceed limit
-        header = f"\n## {session_name}\n"
+        header = _session_header(session_id, session_name, session_date)
         if current_length + len(header) > max_chars:
             break
 
@@ -108,10 +142,11 @@ def build_routed_session_context(
 ) -> str:
     """Build Any Session context from router-selected sessions (BU089).
 
-    For each routed session: a header with the match reason, the session
-    summary (truncated), and a bounded number of the session's top chunks for
-    ``query`` (Tier-2 search scoped to that session only). Honours the
-    per-excerpt and total character budgets.
+    For each routed session: a ``## [S<id>] <name> (<date>)`` header, the
+    session summary (truncated), and a bounded number of the session's top
+    chunks for ``query`` (Tier-2 search scoped to that session only). Honours
+    the per-excerpt and total character budgets. The router's match reason is
+    internal and is not rendered here (it stays on ``RoutedSession.reason``).
 
     Args:
         db: Database with ``get_summaries`` and ``search_rag_fts``.
@@ -140,12 +175,9 @@ def build_routed_session_context(
         session_id = getattr(candidate, "session_id", None)
         if session_id is None:
             continue
-        name = getattr(candidate, "name", f"Session {session_id}")
-        reason = getattr(candidate, "reason", "") or ""
-        header = f"\n## {name}"
-        if reason:
-            header += f"  ({reason})"
-        header += "\n"
+        name = getattr(candidate, "name", None)
+        session_date = _format_session_date(getattr(candidate, "start_time", None))
+        header = _session_header(session_id, name, session_date)
         if not add(header):
             break
 
@@ -184,31 +216,27 @@ def _truncate(text: str, limit: int = MAX_EXCERPT_CHARS) -> str:
 
 
 def _format_result(result: Dict[str, Any]) -> str:
-    """Format a single RAG result as a context line."""
-    # Get source type
+    """Format a single RAG result as ``[<source> @ <YYYY-MM-DD HH:MM:SS>]: <content>``.
+
+    The chunk timestamp carries the full date, not just the time of day, so
+    multi-day sessions and cross-session "when" questions are answerable. The
+    document title is intentionally not rendered - it is redundant with the
+    ``[S<id>] <name> (<date>)`` session header.
+    """
     source_type = result.get("source_type", "unknown")
 
-    # Get timestamp if available
     timestamp = result.get("timestamp")
+    timestamp_str = ""
     if timestamp:
         try:
-            dt = datetime.fromtimestamp(timestamp)
-            time_str = dt.strftime("%H:%M:%S")
-            timestamp_str = f" @ {time_str}"
+            timestamp_str = " @ " + datetime.fromtimestamp(timestamp).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
         except (ValueError, OSError):
             timestamp_str = ""
-    else:
-        timestamp_str = ""
 
-    # Get title if available
-    title = result.get("title")
-    title_str = f" [{title}]" if title else ""
-
-    # Get content and truncate if needed
     content = result.get("content", "")
-    max_content_len = 500
-    if len(content) > max_content_len:
-        content = content[:max_content_len].rstrip() + "..."
+    if len(content) > MAX_EXCERPT_CHARS:
+        content = content[:MAX_EXCERPT_CHARS].rstrip() + "..."
 
-    # Format: [source_type@timestamp] [title]: content
-    return f"[{source_type}{timestamp_str}]{title_str}: {content}\n"
+    return f"[{source_type}{timestamp_str}]: {content}\n"

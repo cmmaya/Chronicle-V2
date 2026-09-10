@@ -13,23 +13,27 @@ import logging
 
 from .session_manager import SessionManager
 from .pixel_theme import app_qss, asset_path
-from .pixel_widgets import PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, aligned_bubble, NAVY_INNER
+from .pixel_widgets import (
+    PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, PixelScopePrompt,
+    aligned_bubble, NAVY_INNER,
+)
 from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
 from ..assistant.service import AssistantAnswerService
-from ..assistant.response_contract import should_hand_off
+from ..assistant.scope_offer import (
+    format_scope_offer_prompt,
+    accept_scope_offer,
+    decline_scope_offer as apply_scope_offer_decline,
+)
 
-# Labels for the candidate picker. Default is the ambiguity flow; the handoff
-# variant (BU090) points an Any Session user at Specific Session for detail.
+# Labels for the candidate picker. Default is the original ambiguity-clarification
+# flow; the "handoff" variant is reached from the in-chat scope prompt's
+# "Choose another session" link (BU093).
 _CANDIDATE_TITLE_DEFAULT = "SELECT A SESSION"
 _CANDIDATE_BTN_DEFAULT = "Use Selected Session"
-_CANDIDATE_TITLE_HANDOFF = "FOR EXACT WORDING, ASK IN SPECIFIC SESSION"
+_CANDIDATE_TITLE_HANDOFF = "ASK IN SPECIFIC SESSION"
 _CANDIDATE_BTN_HANDOFF = "Ask in Specific Session"
-_HANDOFF_NOTE = (
-    "\n\n_I only have session-level notes here. For exact wording, pick a "
-    "session below and I'll re-ask it in Specific Session._"
-)
 from ..screenshots.context_generator import ScreenshotContextGenerator
 
 logger = logging.getLogger(__name__)
@@ -250,6 +254,8 @@ class MainWindow(QMainWindow):
         self._current_conversation_id = None  # Store conversation ID for follow-up questions
         self._thinking_message_widget = None  # Track "Thinking..." message for replacement
         self._assistant_thread = None  # Track active assistant query thread
+        self._pending_scope_prompt = None  # Live BU093 in-chat scope offer (main view)
+        self._pending_detached_scope_prompt = None  # (frame, yes_btn, no_btn) in detached view
         
         # Session search components
         self._recent_sessions = []  # Store sessions for dropdown
@@ -533,6 +539,8 @@ class MainWindow(QMainWindow):
             self._answer_layout.setSpacing(24)
             self._answer_layout.setContentsMargins(42, 18, 42, 18)
             self._answer_layout.addStretch()
+            # A reloaded conversation never re-creates the transient scope prompt (BU093)
+            self._pending_scope_prompt = None
             
             # Display messages in the conversation view using the same method as new messages
             for msg in messages:
@@ -2891,7 +2899,9 @@ Keywords: {keywords_str}"""
                     item.widget().deleteLater()
         # Reset thinking message tracker
         self._thinking_message_widget = None
-    
+        # A rebuilt view holds no live scope prompt (BU093)
+        self._pending_scope_prompt = None
+
     def _replace_thinking_message(self, new_text: str):
         """Replace the pixel 'Thinking...' bubble with the assistant response."""
         if not hasattr(self, '_answer_layout') or not self._answer_layout:
@@ -4206,7 +4216,9 @@ Keywords: {keywords_str}"""
                 item = self._detached_answer_layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
-        
+
+        self._pending_detached_scope_prompt = None
+
         # Refresh the conversations list
         self._load_past_conversations()
         
@@ -4226,10 +4238,12 @@ Keywords: {keywords_str}"""
         
         # Add user's question to conversation view
         self._add_message_to_conversation('user', question)
-        
+
         # Clear previous candidates when asking a new question
         self._clear_candidates()
-        
+        # Retire any live BU093 scope offer - at most one may be open (BU093)
+        self._retire_pending_scope_prompt()
+
         # Store the original question for potential retry
         self._current_question = question
         
@@ -4334,19 +4348,15 @@ Keywords: {keywords_str}"""
             self._clear_candidates()
             self._current_question = pending_question
             answer_text = response.answer or ""
-            # BU090: Any Session could not reach transcript detail -> append a
-            # short handoff note and seed the picker with the routed sessions.
-            hand_off = (
-                response.scope_used == "any_session"
-                and should_hand_off(response.intent, response.evidence)
-                and bool(response.candidate_sessions)
-            )
-            if hand_off:
-                answer_text += _HANDOFF_NOTE
             # Replace "Thinking..." with the actual response
             self._replace_thinking_message(answer_text + self._scope_suffix())
-            if hand_off:
-                self._display_candidates(response.candidate_sessions, handoff=True)
+            # BU092/BU093: the answer points at a concrete meeting -> in-chat
+            # prompt offering a scope switch (with a "choose another" path to
+            # the full candidate list). No standalone auto-picker any more.
+            if response.scope_offer is not None:
+                self._add_scope_offer_to_conversation(
+                    response.scope_offer, response.candidate_sessions
+                )
             # Save conversation_id for follow-up questions
             if response.conversation_id:
                 self._current_conversation_id = response.conversation_id
@@ -4391,7 +4401,190 @@ Keywords: {keywords_str}"""
         self._on_status_update(f"Assistant error: {error_message}", is_error=True)
         # Clear candidates on exception
         self._clear_candidates()
-    
+
+    # ---- BU093: in-chat scope switch prompt ---------------------------------
+
+    def _add_scope_offer_to_conversation(self, offer, candidates=None):
+        """Insert the pixel-themed scope switch prompt right after the answer
+        bubble, then mirror it into the detached window. Transient UI only -
+        never persisted, never rebuilt on conversation reload.
+
+        `candidates` are the routed sessions; the prompt's "Choose another
+        session" link opens the picker seeded with them.
+        """
+        self._retire_pending_scope_prompt()
+        candidates = list(candidates or [])
+
+        if hasattr(self, '_answer_layout') and self._answer_layout:
+            prompt = PixelScopePrompt(
+                format_scope_offer_prompt(offer.session_name, offer.start_time),
+                max_width=400,
+                allow_choose_another=bool(candidates),
+            )
+            prompt.accepted.connect(lambda o=offer: self._on_scope_offer_accepted(o))
+            prompt.declined.connect(lambda o=offer: self._on_scope_offer_declined(o))
+            prompt.choose_another.connect(
+                lambda c=candidates: self._display_candidates(c, handoff=True)
+                if c else None
+            )
+
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(0)
+            row_layout.addWidget(prompt, 0, Qt.AlignLeft)
+            row_layout.addStretch(1)
+
+            self._answer_layout.insertWidget(self._answer_layout.count() - 1, row)
+            self._pending_scope_prompt = prompt
+            self._answer_scroll_area.verticalScrollBar().setValue(
+                self._answer_scroll_area.verticalScrollBar().maximum()
+            )
+
+        if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
+            self._add_scope_offer_to_detached_conversation(offer, candidates)
+
+    def _add_scope_offer_to_detached_conversation(self, offer, candidates=None):
+        """Mirror the scope switch prompt in the detached window using its own
+        plainer QFrame bubble style and plain QPushButtons (BU093).
+        """
+        prompt_text = format_scope_offer_prompt(offer.session_name, offer.start_time)
+        candidates = list(candidates or [])
+
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet(
+            "QFrame { background-color: #E3F2FD; border-radius: 10px; border: 1px solid #90CAF9; }"
+        )
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+
+        label = QLabel(prompt_text)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(label)
+
+        yes_btn = QPushButton("YES")
+        no_btn = QPushButton("NO")
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.addWidget(yes_btn)
+        btn_row.addWidget(no_btn)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
+
+        other_btn = QPushButton("Choose another session")
+        other_btn.setFlat(True)
+        other_btn.setStyleSheet(
+            "QPushButton { color: #1565C0; background: transparent; border: none;"
+            " text-align: left; padding: 0; text-decoration: underline; }"
+        )
+        other_btn.setVisible(bool(candidates))
+        v.addWidget(other_btn)
+
+        def settle(record: str):
+            for b in (yes_btn, no_btn, other_btn):
+                b.setEnabled(False)
+                b.hide()
+            label.setText(f"{prompt_text}\n\n{record}")
+
+        def on_yes(_=False):
+            if not yes_btn.isEnabled():
+                return
+            settle("> Scope switched to Specific Session.")
+            self._on_scope_offer_accepted(offer)
+
+        def on_no(_=False):
+            if not no_btn.isEnabled():
+                return
+            settle("> Kept Any Session.")
+            self._on_scope_offer_declined(offer)
+
+        def on_other(_=False):
+            if other_btn.isEnabled() and candidates:
+                self._display_detached_candidates(candidates, handoff=True)
+
+        yes_btn.clicked.connect(on_yes)
+        no_btn.clicked.connect(on_no)
+        other_btn.clicked.connect(on_other)
+
+        self._detached_answer_layout.insertWidget(
+            self._detached_answer_layout.count() - 1, frame
+        )
+        self._pending_detached_scope_prompt = (frame, yes_btn, no_btn, settle)
+        self._detached_answer_scroll.verticalScrollBar().setValue(
+            self._detached_answer_scroll.verticalScrollBar().maximum()
+        )
+
+    def _retire_pending_scope_prompt(self, record: str = "> No longer offered."):
+        """Collapse any live, unanswered scope prompt (both views) so at most
+        one offer is ever live. `record` is the static line it collapses to.
+        """
+        prompt = self._pending_scope_prompt
+        if prompt is not None:
+            try:
+                prompt.retire(record)
+            except RuntimeError:
+                pass  # widget already deleted with the conversation view
+            self._pending_scope_prompt = None
+
+        detached = self._pending_detached_scope_prompt
+        if detached is not None:
+            _frame, yes_btn, _no_btn, settle = detached
+            try:
+                if yes_btn.isEnabled():
+                    settle(record)
+            except RuntimeError:
+                pass
+            self._pending_detached_scope_prompt = None
+
+    def _switch_scope_to_specific(self, session_id: int):
+        """Select `session_id` and move the scope combo to Specific Session
+        through the normal signal path, so the detached combo, the transcript
+        panel and the scope label all follow (`_on_scope_changed` guards the
+        recursion via `_scope_sync_guard`).
+        """
+        self._selected_session_id = session_id
+        index = self.scope_combo.findData("current")
+        if index < 0:
+            self._update_scope_label()
+            return
+        if self.scope_combo.currentIndex() == index:
+            # Already Specific Session; re-run so the panel reloads for the
+            # newly selected session.
+            self._on_scope_changed(index)
+        else:
+            self.scope_combo.setCurrentIndex(index)
+
+    def _reask_after_scope_offer(self, **query_kwargs):
+        """Run a re-ask on the background thread (BU093 YES)."""
+        self._add_message_to_conversation('assistant', "Thinking...")
+        QTimer.singleShot(50, lambda: self._run_assistant_query(**query_kwargs))
+
+    def _on_scope_offer_accepted(self, offer):
+        """YES: switch scope to Specific Session for the offered session and
+        re-ask the stored question against it.
+        """
+        self._retire_pending_scope_prompt("> Scope switched to Specific Session.")
+        self._switch_scope_to_specific(offer.session_id)
+        question = self._current_question
+        if not question:
+            return
+        agent_id = self.agent_combo.currentData()
+        self._last_scope_marker = self._scope_marker_text("current_session", offer.session_id)
+        accept_scope_offer(offer, question, agent_id, self._reask_after_scope_offer)
+
+    def _on_scope_offer_declined(self, offer):
+        """NO: record the decline so this session is not offered again in the
+        conversation.
+        """
+        self._retire_pending_scope_prompt("> Kept Any Session.")
+        apply_scope_offer_decline(
+            offer, self._current_conversation_id, self.assistant_service.decline_scope_offer
+        )
+        self._on_status_update("Kept Any Session scope")
+
     def _on_reindex_all_clicked(self):
         """Run the BU091 corpus backfill on a background thread (force rebuild)."""
         if getattr(self, "_rag_backfill_thread", None) is not None and self._rag_backfill_thread.isRunning():
@@ -5433,10 +5626,12 @@ Keywords: {keywords_str}"""
         
         # Add user's question to conversation view
         self._add_message_to_conversation('user', question)
-        
+
         # Clear previous candidates when asking a new question
         self._detached_candidate_group.setVisible(False)
-        
+        # Retire any live BU093 scope offer - at most one may be open (BU093)
+        self._retire_pending_scope_prompt()
+
         # Store the original question for potential retry
         self._current_question = question
         
@@ -5522,17 +5717,12 @@ Keywords: {keywords_str}"""
                 # Clear candidates on successful answer
                 self._detached_candidate_group.setVisible(False)
                 answer_text = response.answer or ""
-                hand_off = (
-                    response.scope_used == "any_session"
-                    and should_hand_off(response.intent, response.evidence)
-                    and bool(response.candidate_sessions)
-                )
-                if hand_off:
-                    answer_text += _HANDOFF_NOTE
                 # Add assistant's response to conversation view
                 self._add_message_to_conversation('assistant', answer_text + self._scope_suffix())
-                if hand_off:
-                    self._display_detached_candidates(response.candidate_sessions, handoff=True)
+                if response.scope_offer is not None:
+                    self._add_scope_offer_to_conversation(
+                        response.scope_offer, response.candidate_sessions
+                    )
                 # Save conversation_id for follow-up questions
                 if response.conversation_id:
                     self._current_conversation_id = response.conversation_id

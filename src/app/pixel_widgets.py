@@ -4,11 +4,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QToolButton,
     QHBoxLayout,
+    QVBoxLayout,
     QSizePolicy,
     QStyleOptionButton,
     QStyle,
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import (
     QColor,
     QPainter,
@@ -344,6 +345,158 @@ class PixelBubble(QWidget):
         painter.setPen(QPen(border, 2))
         painter.drawPath(path)
 
+        super().paintEvent(event)
+
+
+class PixelScopePrompt(QWidget):
+    """In-chat prompt (BU093) offering a one-click switch to Specific Session
+    for a single dominant meeting.
+
+    Same pixel language as PixelBubble: pixel-cut corners, a left tail, blue
+    variant colours, Courier New bold label. Two PixelButtons (YES / NO) sit
+    below the text, with a "Choose another session" link beneath them. The
+    widget holds no application logic - it only emits ``accepted`` /
+    ``declined`` / ``choose_another`` and can collapse itself to a static
+    record of the choice so the conversation still reads on scroll-back.
+    """
+
+    accepted = Signal()
+    declined = Signal()
+    choose_another = Signal()
+
+    def __init__(self, text: str, max_width: int = 400, allow_choose_another: bool = True, parent=None):
+        super().__init__(parent)
+        self.cut = 7
+        self.tail_size = 13
+        self._answered = False
+
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Minimum)
+
+        self.label = QLabel(text)
+        self.label.setWordWrap(True)
+        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.label.setMaximumWidth(max_width)
+
+        font = QFont("Courier New")
+        font.setPointSize(12)
+        font.setBold(True)
+        self.label.setFont(font)
+        self.label.setStyleSheet(
+            """
+            QLabel {
+                color: #FFF0BF;
+                background: transparent;
+                border: none;
+            }
+            """
+        )
+
+        self._yes = PixelButton("YES")
+        self._no = PixelButton("NO")
+        for btn in (self._yes, self._no):
+            btn.setMinimumHeight(34)
+            btn.setMaximumWidth(120)
+        self._yes.clicked.connect(self._on_yes)
+        self._no.clicked.connect(self._on_no)
+
+        self._other = QPushButton("Choose another session")
+        self._other.setCursor(Qt.PointingHandCursor)
+        self._other.setFlat(True)
+        self._other.setStyleSheet(
+            """
+            QPushButton {
+                color: #BFD2FF;
+                background: transparent;
+                border: none;
+                text-align: left;
+                padding: 0;
+                text-decoration: underline;
+                font-family: 'Courier New';
+                font-weight: bold;
+            }
+            QPushButton:hover { color: #FFF0BF; }
+            QPushButton:disabled { color: #6E7CA8; }
+            """
+        )
+        self._other.clicked.connect(self._on_other)
+        self._other.setVisible(allow_choose_another)
+
+        self._buttons = QWidget()
+        button_row = QHBoxLayout(self._buttons)
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        button_row.addWidget(self._yes)
+        button_row.addWidget(self._no)
+        button_row.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14 + self.tail_size, 14, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(self.label)
+        layout.addWidget(self._buttons)
+        layout.addWidget(self._other)
+
+    # --- choice ----------------------------------------------------------
+
+    def _on_yes(self):
+        if self._answered:
+            return
+        self._settle("> Scope switched to Specific Session.")
+        self.accepted.emit()
+
+    def _on_no(self):
+        if self._answered:
+            return
+        self._settle("> Kept Any Session.")
+        self.declined.emit()
+
+    def _on_other(self):
+        if self._answered:
+            return
+        self.choose_another.emit()
+
+    def _settle(self, record: str):
+        """Disable the controls and collapse to a short static record so the
+        prompt cannot be triggered twice.
+        """
+        self._answered = True
+        self._yes.setEnabled(False)
+        self._no.setEnabled(False)
+        self._other.setEnabled(False)
+        self._buttons.hide()
+        self._other.hide()
+        self.label.setText(f"{self.label.text()}\n\n{record}")
+        self.updateGeometry()
+
+    def retire(self, record: str = "> No longer offered."):
+        """Collapse an unanswered prompt when a newer question supersedes it."""
+        if not self._answered:
+            self._settle(record)
+
+    # --- painting (PixelBubble blue + left tail) -------------------------
+
+    def _bubble_path(self) -> QPainterPath:
+        rect = self.rect().adjusted(1, 1, -3, -3)
+        body = rect.adjusted(self.tail_size, 0, 0, 0)
+        path = pixel_round_rect_path(
+            body.x(), body.y(), body.width(), body.height(), self.cut
+        )
+        tail_y = body.bottom() - 14
+        path.moveTo(body.left(), tail_y)
+        path.lineTo(body.left() - self.tail_size, tail_y + 7)
+        path.lineTo(body.left(), tail_y + 11)
+        path.closeSubpath()
+        return path
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        path = self._bubble_path()
+        painter.setBrush(QBrush(BUBBLE_BLUE))
+        painter.setPen(QPen(BUBBLE_BLUE_BORDER, 2))
+        painter.drawPath(path)
         super().paintEvent(event)
 
 

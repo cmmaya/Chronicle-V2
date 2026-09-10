@@ -67,6 +67,34 @@ SESSION = {
 }
 
 
+# Audio Capture Resilience Settings
+# These govern how the system-audio (loopback) recorder recovers from a broken
+# capture stream - the classic failure being a default-output-device change when
+# a Zoom/Meet/Teams call ends, which silently kills the WASAPI loopback stream.
+AUDIO_CAPTURE = {
+    # Supervisor (fix 1): rebuild the loopback stream instead of dying.
+    # Consecutive failed record() calls before the stream is torn down and rebuilt.
+    "loopback_max_consecutive_errors": 5,
+    # Exponential backoff between rebuild attempts (seconds).
+    "loopback_backoff_initial": 1.0,
+    "loopback_backoff_max": 30.0,
+    # A record() call that returns no frames for this long means the stream is
+    # stale even though it never raised - force a rebuild.
+    "loopback_silent_stall_seconds": 20.0,
+
+    # Watchdog (fix 2): an external thread that restarts a wedged/dead recorder.
+    "watchdog_enabled": True,
+    "watchdog_interval_seconds": 15.0,
+    # System recorder is considered stalled if no raw frames have arrived for this
+    # long (loopback delivers zero-frames continuously even during silence, so any
+    # real gap is a fault).
+    "watchdog_system_stall_seconds": 40.0,
+    # Safety rails so a permanently broken device can't restart-loop forever.
+    "watchdog_max_restarts": 30,
+    "watchdog_restart_cooldown_seconds": 20.0,
+}
+
+
 # Model Selection Settings
 ALLOWED_MODELS = [
     # OpenAI
@@ -118,6 +146,12 @@ ALLOWED_MODELS = [
 # ALLOWED_MODELS degenerate into repetition). Drop to 0.1 if the trailer is
 # missing or malformed in more than ~5% of responses across the models in use.
 ANY_SESSION_TEMPERATURE = 0.2
+
+# (Unused since BU093.) Previously the minimum score gap between the top routed
+# session and the runner-up before an Any Session answer offered a direct scope
+# switch. BU093 always offers the best single guess and adds a "choose another
+# session" path, so there is no ambiguity threshold to tune. Kept for reference.
+SCOPE_OFFER_MARGIN = 0.15
 
 DEFAULT_MODEL = "deepseek/deepseek-v3.2"
 

@@ -166,6 +166,16 @@ class TestRouting(RouterTestBase):
         context = build_routed_session_context(self.db, "billing", routed, max_chars=1200)
         self.assertLessEqual(len(context), 1200)
 
+    def test_context_header_carries_session_id_and_date(self):
+        routed = route_sessions(self.db, "billing retries and dunning")
+        self.assertTrue(routed)
+        context = build_routed_session_context(self.db, "billing", routed)
+        self.assertIn(f"[S{routed[0].session_id}]", context)
+        self.assertIn("2024-03-01", context)  # _add_session default start_time
+        # The router's internal match reason must not leak into the model context.
+        if routed[0].reason:
+            self.assertNotIn(routed[0].reason, context)
+
 
 class TestRoutingScale(RouterTestBase):
     def test_thousand_profiles_route_fast_after_warmup(self):

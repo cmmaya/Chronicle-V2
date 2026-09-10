@@ -126,8 +126,8 @@ class TestBuildAnySessionContext:
         # Timestamp appears after @ symbol, e.g., "@ 17:13:20" (local time)
         assert "@ " in result and ":20]" in result
 
-    def test_title_included_when_available(self):
-        """Title is included when available."""
+    def test_document_title_is_not_rendered(self):
+        """The document title is redundant with the session header and dropped."""
         results = [
             {
                 "session_id": 1,
@@ -139,7 +139,36 @@ class TestBuildAnySessionContext:
             },
         ]
         result = build_any_session_context("test", results)
-        assert "[Important Topic]" in result
+        assert "Important Topic" not in result
+
+    def test_session_header_carries_id_and_date(self):
+        """Each session block header exposes [S<id>] and the session date."""
+        results = [
+            {
+                "session_id": 7,
+                "session_name": "Roadmap review",
+                "source_type": "summary",
+                "timestamp": 1700000000,  # 2023-11-14 local
+                "content": "Content",
+            },
+        ]
+        result = build_any_session_context("test", results)
+        assert "[S7] Roadmap review" in result
+        assert "2023-11-1" in result  # date present, tz-independent prefix
+
+    def test_chunk_line_timestamp_includes_the_date(self):
+        """Chunk lines carry the full date, not just the time of day."""
+        results = [
+            {
+                "session_id": 1,
+                "session_name": "Test",
+                "source_type": "transcript",
+                "timestamp": 1700000000,
+                "content": "Content",
+            },
+        ]
+        result = build_any_session_context("test", results)
+        assert "@ 2023-11-1" in result
 
     def test_no_timestamp_handled(self):
         """Missing timestamp is handled gracefully."""
@@ -167,8 +196,9 @@ class TestBuildAnySessionContext:
             },
         ]
         result = build_any_session_context("test", results)
-        # Handles None gracefully
-        assert "Test" in result or "None" in result
+        # Falls back to "Session <id>" rather than printing "None"
+        assert "[S1] Session 1" in result
+        assert "None" not in result
 
     def test_different_source_types(self):
         """Different source types are handled correctly."""

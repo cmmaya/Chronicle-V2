@@ -940,3 +940,175 @@ Recovery Notes:
 - If the embedding model / tokenizers / hub is missing, backfill and every live reindex still build the lexical (FTS + BM25) index; chunk and profile vectors are stored NULL and any later run with a working embedder fills them in (the hash skip is bypassed for documents with missing vectors).
 - "Reindex All (RAG)" in the Settings menu is the manual recovery path for a stale or corrupt index; it forces a full rewrite and FTS rebuild on a background thread.
 - No `sqlite-vec` / vector DB; cosine over chunk vectors is not yet consumed for ranking (kept out of scope - "no changes to routing scoring").
+
+## BU092 - Scope Switch Offer Decision And Payload
+
+Summary:
+BU090 detects that an Any Session answer could not reach transcript-level detail and hands the routed candidates to the UI, which shows an undirected multi-session list picker even when the router is confident about exactly one meeting. BU092 adds the missing service-side decision: when the top routed session clearly dominates, emit a single-session `ScopeOffer` on `AnswerResponse`; when it does not, return `None` and leave the BU090 picker path untouched. It also lets the app record a decline so the same session is not re-offered on every turn of a conversation. Logic and plumbing only - the in-chat prompt widget is BU093.
+
+Files Changed:
+
+- src/assistant/scope_offer.py (new)
+- src/assistant/service.py
+- src/config.py
+- tests/test_scope_offer.py (new)
+- tests/test_assistant_service.py
+- docs/current_state.md, docs/devlog.md
+
+Changes:
+
+- `src/assistant/scope_offer.py` (new): `ScopeOffer` dataclass (`session_id`, `session_name`, `start_time`) and the pure `build_scope_offer(routed_sessions, intent, evidence, declined_session_ids=None) -> Optional[ScopeOffer]`. It returns an offer only when all of: `should_hand_off(intent, evidence)` (imported from `response_contract`, not restated, so the two paths cannot drift), at least one routed session with a usable `session_id`, the top session not in `declined_session_ids`, and dominance. Dominance is "only candidate" or `top.score - max(rest.score) >= SCOPE_OFFER_MARGIN`. Totality is explicit: `_score_of` coerces a missing/`None`/unparseable `score` to 0.0 and non-dict entries to 0.0, a non-dict or id-less top entry yields `None`, and a missing `session_name` falls back to `Session <id>`. No DB access, no exceptions.
+- A declined top session returns `None` rather than falling through to the runner-up - offering second place after a "no" would read as the app arguing with the user.
+- `src/config.py`: added `SCOPE_OFFER_MARGIN = 0.15` next to `ANY_SESSION_TEMPERATURE`, with a comment on which direction to tune it (higher = offer less often, more list picking).
+- `src/assistant/service.py`: `AnswerResponse` gained `scope_offer: Optional[ScopeOffer] = None` (defaulted, so existing consumers and tests are unaffected). `_finalize_answer` calls `build_scope_offer` inside the existing `if is_any_session:` branch only, so every other scope keeps `scope_offer=None`, and still populates `candidate_sessions` exactly as BU090 did - BU093 picks which presentation to show and the list fallback stays available. The offer's session id joins the existing contract log line.
+- `AssistantAnswerService.decline_scope_offer(conversation_id, session_id)` records the decline in `self._declined_offers: Dict[Optional[int], Set[int]]`; `_finalize_answer` reads it with the *incoming* `conversation_id`. Keying on the raw `conversation_id` means `None` (a brand-new conversation) is its own bucket and never collides with a real conversation's declines. In-memory only - no schema change, no persistence beyond process lifetime.
+- The offer is never written into the answer text and never persisted; it travels on `AnswerResponse` and is logged only, exactly like `intent` and `evidence`.
+
+Validation:
+
+- `python -m pytest tests/test_scope_offer.py` -> 15 passed: single routed session yields a full-payload offer; a gap above the margin names the top session; a gap exactly at the margin still dominates; `partial` evidence alone triggers; near-tied candidates (0.50 vs 0.45) yield `None`; `intent="overview"` + `evidence="sufficient"` yields `None` even at score 0.99; empty and `None` routed lists yield `None`; a declined top session yields `None` and the runner-up is not offered; a decline of an unrelated id does not suppress; missing `score` (both at 0.0, no dominance), missing `session_name` (-> `Session 42`), unparseable score, non-dict entries, a missing `session_id` and a non-dict top entry all return `None` or a safely defaulted offer without raising; `declined_session_ids` may be omitted.
+- `python -m pytest tests/test_assistant_service.py::TestScopeOffer` -> 8 passed: a dominant candidate carries both `scope_offer` and the BU090 `candidate_sessions` (both routed sessions still listed); ambiguous candidates leave `scope_offer=None` with the picker still seeded; an overview/sufficient answer carries no offer; a Specific Session answer never carries one; `AnswerResponse(success=True).scope_offer is None`; `decline_scope_offer` suppresses the next `ask` in the same conversation but not in a different one; a decline recorded against `conversation_id=None` suppresses only the brand-new-conversation bucket and leaves an existing conversation offering; the persisted assistant message contains no sentinel, no session name and no offer text.
+- `python -m pytest tests/test_assistant_service.py tests/test_scope_offer.py tests/test_response_contract.py tests/test_rag_router.py -q` -> all pass except the 5 pre-existing `No module named 'dotenv'` failures in `TestAssistantAnswerService`, unchanged from before this BU.
+
+Recovery Notes:
+
+- If the offer fires on the wrong meeting too often, raise `SCOPE_OFFER_MARGIN` in `src/config.py`; the BU090 list picker absorbs everything that stops qualifying, so there is no behaviour cliff at any value.
+- Setting `SCOPE_OFFER_MARGIN` above 1.0 effectively disables the offer for every multi-candidate answer while leaving single-candidate offers intact; to disable it entirely, stop populating `scope_offer` in `_finalize_answer`.
+- Declines live only in `self._declined_offers` on the service instance. A new service instance (app restart) re-offers a previously declined session; this is deliberate - no schema change was in scope.
+- `route_sessions` returning nothing (embedder unavailable, empty corpus) suppresses the offer along with the BU090 picker, exactly as before.
+
+## BU093 - In-Chat Scope Switch Prompt
+
+Summary:
+BU092 supplies a single dominant `AnswerResponse.scope_offer` when an Any Session answer cannot reach transcript detail and the router is confident about one meeting. BU093 renders that offer as a themed in-chat prompt - "Would you like to change the scope to Specific for session: <name>, <date>?" with YES / NO buttons - so the user switches scope with one click in the conversation instead of reading the BU090 multi-session list, and declining is a recorded answer rather than an ignored panel. When an offer is present the BU090 handoff note and picker are both suppressed; when it is absent BU090 is unchanged. Mirrored in the detached assistant window.
+
+Files Changed:
+
+- src/assistant/scope_offer.py
+- src/app/pixel_widgets.py
+- src/app/window.py
+- tests/test_scope_offer.py
+- docs/build_plan/BU093.md, docs/current_state.md, docs/devlog.md
+
+Changes:
+
+- `src/assistant/scope_offer.py`: four additions, all pure and Qt-free.
+  - `format_scope_offer_prompt(session_name, start_time=None) -> str` produces exactly `Would you like to change the scope to Specific for session: <name>, <YYYY-MM-DD HH:MM>?`. `_format_offer_timestamp` reuses the `%Y-%m-%d %H:%M` format `_display_candidates` already renders and returns `None` for a falsy or unparseable value (TypeError/ValueError/OSError/OverflowError), so a missing date drops the `, <date>` segment and its comma rather than printing a placeholder. Session names are interpolated verbatim - no escaping, no mangling of embedded commas or punctuation.
+  - `should_show_handoff_picker(scope_used, intent, evidence, candidate_sessions, scope_offer) -> bool`: the single either/or decision - returns False whenever `scope_offer is not None`, otherwise the exact BU090 condition (`scope_used == "any_session" and should_hand_off(intent, evidence) and bool(candidate_sessions)`). Both the main and detached answer paths call it, so the handoff note and the picker can never disagree about whether an offer replaces them.
+  - `accept_scope_offer(offer, question, agent_id, run_query)`: calls `run_query(question=, agent_id=, explicit_scope="current_session", active_session_id=None, selected_session_id=offer.session_id)` - the `_on_use_candidate_clicked` call shape, defined once.
+  - `decline_scope_offer(offer, conversation_id, record_decline)`: calls `record_decline(conversation_id, offer.session_id)`. Module-level; distinct from `AssistantAnswerService.decline_scope_offer`, which is the `record_decline` it is given.
+- `src/app/pixel_widgets.py`: new `PixelScopePrompt(QWidget)` reusing the PixelBubble language - `pixel_round_rect_path` cut corners, a left tail, `BUBBLE_BLUE` / `BUBBLE_BLUE_BORDER`, Courier New 12 bold `#FFF0BF` label - with a `QVBoxLayout` holding the label and a row of two `PixelButton`s (YES / NO). Exposes `accepted` / `declined` signals and no application logic. `_settle(record)` (on click) and `retire(record)` (on supersede) disable both buttons, hide the button row and append a one-line static record, guarded by `_answered` so a second click is inert. Added `QVBoxLayout` and `Signal` to the imports.
+- `src/app/window.py`:
+  - `_on_assistant_query_finished` and `_run_detached_assistant_query` now compute `hand_off` via `self._should_hand_off_to_picker(response)` (thin wrapper over `should_show_handoff_picker`); when `response.scope_offer` is set they call `_add_scope_offer_to_conversation(offer)` and skip both `_HANDOFF_NOTE` and the picker. The now-unused `should_hand_off` import was removed from window.py.
+  - `_add_scope_offer_to_conversation(offer)`: retires any open prompt, builds a `PixelScopePrompt` from `format_scope_offer_prompt`, wraps it left-aligned in a row, inserts it before the `_answer_layout` stretch and scrolls to bottom (same pattern as `_add_message_to_conversation`), stores it as `_pending_scope_prompt`, then mirrors into the detached view.
+  - `_add_scope_offer_to_detached_conversation(offer)`: the same prompt as a plain `QFrame` bubble (`#E3F2FD`) with two `QPushButton`s, wired to the same `_on_scope_offer_accepted` / `_on_scope_offer_declined`; kept as `_pending_detached_scope_prompt = (frame, yes, no, settle)`.
+  - `_on_scope_offer_accepted(offer)`: retire prompts -> `_switch_scope_to_specific(offer.session_id)` (sets `_selected_session_id`, moves `scope_combo` to the `"current"` index through `setCurrentIndex` / `_on_scope_changed` so the detached combo, transcript panel and scope label all follow via the existing `_scope_sync_guard` path; re-runs `_on_scope_changed` directly if already on that index) -> set the scope marker -> `accept_scope_offer(...)` with `_reask_after_scope_offer` (adds a "Thinking..." bubble and runs `_run_assistant_query` on the background thread).
+  - `_on_scope_offer_declined(offer)`: retire prompts -> `decline_scope_offer(offer, self._current_conversation_id, self.assistant_service.decline_scope_offer)` -> status line.
+  - `_retire_pending_scope_prompt(record=...)`: collapses the live prompt in both views (RuntimeError-safe against a view already torn down); called from `_on_ask_clicked` and `_on_detached_ask_clicked` so a new question leaves at most one live offer, and from the accept/decline handlers with a matching record line.
+  - `_pending_scope_prompt` / `_pending_detached_scope_prompt` initialised in `__init__` and reset wherever the answer view is rebuilt (`_clear_conversation_view`, `_on_conversation_selected`, `_on_new_chat_clicked`), so a reloaded past conversation never carries or recreates a prompt.
+- The offer prompt is never passed to `_add_message_to_conversation` / `_persist_conversation`; it is UI-only and BU092 already keeps `scope_offer` out of `assistant_messages`.
+
+Validation:
+
+- `python -m pytest tests/test_scope_offer.py` -> 30 passed (15 pre-existing BU092 + 15 new): exact prompt sentence for a normal name + timestamp; None / 0 / "" / "not-a-timestamp" / nan / 10**20 all yield the date-less sentence with no trailing comma and no "None"; call with no `start_time`; a name containing `: , &` is present verbatim and unescaped; `accept_scope_offer` invokes the runner exactly once with `explicit_scope="current_session"` and the offered id and `active_session_id=None`; `decline_scope_offer` passes `(conversation_id, session_id)` and `(None, session_id)` for a brand-new conversation; `should_show_handoff_picker` returns False with an offer present and True without it on a detail intent, and False for non-Any-Session or empty candidates.
+- `python -m pytest tests/test_scope_offer.py tests/test_assistant_service.py tests/test_response_contract.py tests/test_rag_router.py -q` -> 72 passed, 5 failed. The 5 failures are the pre-existing `No module named 'dotenv'` cases in `TestAssistantAnswerService` - identical set before and after this BU (verified with `git stash`).
+- `python -m py_compile src/app/window.py src/app/pixel_widgets.py src/assistant/scope_offer.py` -> ok. `ast.parse` on all four changed files -> ok.
+- PySide6 is not installed in this environment, so the widget itself was not instantiated here. Manual GUI checklist (to run where PySide6 is available) - NOT YET EXECUTED:
+  1. Any Session, ask a detail question that routes to one dominant meeting -> a blue pixel prompt with a left tail appears under the answer, naming that session and its `YYYY-MM-DD HH:MM`, with YES / NO buttons; no handoff note text, no multi-session picker.
+  2. Click YES -> scope combo switches to "Specific Session", the session becomes selected, the transcript panel and `Scope:` label follow, the question is re-answered against that session, and the prompt collapses to "> Scope switched to Specific Session." with disabled buttons.
+  3. New offer, click NO -> prompt collapses to "> Kept Any Session."; ask another detail question about the same meeting in the same conversation -> no prompt for that session.
+  4. New offer, then ask a different question without answering -> the stale prompt collapses to "> No longer offered." and only the new flow is live.
+  5. Detach the assistant; repeat 1-3 in the detached window (plain light-blue bubble, plain YES/NO buttons) -> same behaviour; a prompt raised in one view is mirrored in the other and both collapse together.
+  6. Reload a past conversation that had shown a prompt -> only the stored user/assistant messages render; no prompt.
+  7. Ambiguous Any Session detail question (two near-tied sessions) -> the BU090 relabelled multi-session picker still appears, unchanged.
+
+Recovery Notes:
+
+- The either/or between the in-chat prompt and the BU090 picker is decided in one place: `should_show_handoff_picker` in `src/assistant/scope_offer.py`. If both ever show at once, that function (or a caller that stopped routing `scope_offer` into it) is the bug.
+- Whether an offer is emitted at all is still BU092 (`build_scope_offer` + `SCOPE_OFFER_MARGIN` in `src/config.py`); BU093 only presents it. Raising the margin sends more cases back to the picker with no behaviour cliff.
+- Declines are in-memory on the service instance (BU092); an app restart re-offers a previously declined session. Unchanged by this BU.
+- The detached prompt keeps a 4-tuple `(frame, yes, no, settle)` in `_pending_detached_scope_prompt`; if the detached window is closed with a prompt open, `_retire_pending_scope_prompt` swallows the resulting `RuntimeError`.
+- If PySide6 / webrtcvad / dotenv get installed, `python -m pytest tests/` should be re-run to pick up the GUI-adjacent paths; today only the pure `scope_offer` logic is under test.
+
+### BU093 follow-up - suppress handoff when nothing was found
+
+Feedback: an Any Session answer of the form "this is in none of the sessions" still showed the BU090 handoff note and the multi-session picker ("pick a session below"), which is pointless - there is no session to re-ask against.
+
+Change: `should_hand_off(intent, evidence)` in `src/assistant/response_contract.py` now returns `False` whenever `evidence == "none"`, regardless of `intent`. It still fires on `intent == "detail"` or `evidence == "partial"`. This narrows brief 3.3 (which also handed off on `none`). One line, and it flows to every consumer: the BU090 note + picker, `should_show_handoff_picker` (BU093), and `build_scope_offer` (BU092) all go quiet on a `none` answer.
+
+Files: `src/assistant/response_contract.py`, `tests/test_response_contract.py` (updated the `none` cases), `tests/test_scope_offer.py` (retargeted two BU092 tests off `none`, added `evidence="none"` suppression cases for `build_scope_offer` and `should_show_handoff_picker`), `docs/current_state.md`, `docs/devlog.md`.
+
+Validation: `python -m pytest tests/test_response_contract.py tests/test_scope_offer.py tests/test_assistant_service.py -q` -> 66 passed, 5 failed (the pre-existing `dotenv` cases, unchanged).
+
+### BU093 follow-up 2 - broaden the prompt and fold in the picker
+
+Feedback: (a) when the answer identifies a session ("The discussion ... is found in Session 41" - an overview/sufficient answer), the app should still offer to switch scope, and (b) the prompt should let the user pick a different session.
+
+Design (confirmed with the user): keep the single-session YES / NO prompt, add a "Choose another session" link that opens the existing candidate picker; the standalone auto-picker for Any Session is removed (folded into the prompt's link).
+
+Changes:
+
+- `src/assistant/scope_offer.py`: `build_scope_offer` reworked. New optional `cited_session_ids` param (the contract trailer's `sessions`). An offer is returned when `evidence != "none"` and there is a routed session and (`should_hand_off(intent, evidence)` OR the answer cited a session). The offered session is the first cited session that was routed, else the top routed session (`_pick_target`). Dropped the dominance / `SCOPE_OFFER_MARGIN` gate entirely - the "choose another" path covers ambiguity. Removed the now-unused `should_show_handoff_picker` and `_score_of`. Still pure/total.
+- `src/assistant/service.py`: `_finalize_answer` passes `cited_session_ids=parsed.sessions` to `build_scope_offer`.
+- `src/config.py`: `SCOPE_OFFER_MARGIN` marked unused (kept for reference).
+- `src/app/pixel_widgets.py`: `PixelScopePrompt` gains a `choose_another` signal and a "Choose another session" link button (`allow_choose_another` hides it when there are no candidates); `_settle` also disables/hides the link.
+- `src/app/window.py`: removed `_HANDOFF_NOTE`, `_should_hand_off_to_picker`, the `should_show_handoff_picker` import, and both `hand_off` branches. `_on_assistant_query_finished` / `_run_detached_assistant_query` now just: show the answer, and if `response.scope_offer` insert the prompt via `_add_scope_offer_to_conversation(offer, response.candidate_sessions)`. The prompt's `choose_another` -> `_display_candidates(candidates, handoff=True)` (main) / `_display_detached_candidates(...)` (detached). `_CANDIDATE_TITLE_HANDOFF` shortened to "ASK IN SPECIFIC SESSION".
+- Consequence: the in-chat prompt now appears on most Any Session answers that name or lean on a session; it never appears when the answer is "in no session" (`evidence="none"`) or when the router returned nothing. The decline mechanism and "at most one live prompt" keep it from stacking up.
+
+Tests:
+
+- `tests/test_scope_offer.py` rewritten: cited-session preference, overview/sufficient-with-a-citation now offers, overview/sufficient-without-a-citation does not, `evidence="none"` never offers, near-tied candidates still yield an offer for the top (ambiguity -> "choose another"), declined target is not replaced, malformed-input totality. `format_scope_offer_prompt` / `accept_scope_offer` / `decline_scope_offer` tests unchanged. Removed the `should_show_handoff_picker` tests.
+- `tests/test_response_contract.py`: `should_hand_off` `none` cases already updated in follow-up 1.
+- `tests/test_assistant_service.py::TestScopeOffer`: `test_answer_carries_offer_and_candidate_sessions`, `test_near_tied_candidates_still_carry_an_offer_plus_the_full_list`, `test_overview_answer_naming_no_session_carries_no_offer`, `test_answer_not_found_in_any_session_carries_no_offer` (added `NO_SESSION_ANSWER` / `NOT_FOUND_ANSWER` fixtures, dropped unused `OVERVIEW_ANSWER`).
+- `python -m pytest tests/test_scope_offer.py tests/test_response_contract.py tests/test_assistant_service.py tests/test_rag_router.py tests/test_rag_context_builder.py -q` -> 88 passed, 5 failed (the pre-existing `dotenv` cases, unchanged). `py_compile` on the four changed source files -> ok. PySide6 still not installed here; the manual GUI checklist in the first BU093 entry needs re-running with the added "Choose another session" step.
+
+## BU095 - System Audio Capture Supervisor And Watchdog
+
+Problem (diagnosed from Session 2026-09-09 20:59 / session_046): "transcription
+stopped after ~1h". It was not a transcription limit (Parakeet is local). The
+**system-audio loopback capture thread died ~42 min in** and never recovered -
+no system `.wav` chunks were written after 21:41, while mic capture ran the full
+2h8m. Same failure in session_044 (~46 min in). Root cause: the WASAPI loopback
+stream is bound to the default speaker resolved once at thread start; when the
+default output device changes (classic trigger: a Zoom/Meet call ending), the
+stream goes stale. The old code either retried a dead handle forever or let the
+daemon thread die silently, with `_is_recording` still True and nothing surfaced
+to the UI.
+
+Fix 1 - supervised loopback (`src/audio_capture/system_recorder.py`):
+`_recording_thread` is now a supervisor loop. `_capture_once` opens a stream and
+pumps frames; on a fault (N consecutive `record()` errors, or no frames for
+`loopback_silent_stall_seconds`) it returns cleanly and the supervisor rebuilds -
+re-resolving `default_speaker()` each time - with interruptible exponential
+backoff (`loopback_backoff_initial`..`loopback_backoff_max`), reset after any
+capture that ran healthily for >=30s. The thread never propagates an exception;
+it exits only on `stop()`. New health surface for the watchdog:
+`seconds_since_last_data()`, `is_stream_active`, `is_thread_alive`,
+`restart_count`, `last_error`. `_data_buffer` access is now lock-guarded.
+
+Fix 2 - watchdog (`src/audio_capture/core.py`):
+`ChunkedAudioRecorder` gained `is_thread_alive`, `check_health(stall_seconds)`
+(honours a post-start/restart grace window) and `restart()` (stops the loop,
+rebuilds a fresh `SystemAudioRecorder` so the device is re-resolved, restarts the
+loop in place, keeping `self.chunks` and callbacks; refuses if the old thread is
+wedged, to avoid double-writing). `_last_chunk_time` is stamped on every saved
+chunk. `DualSourceChunkedRecorder` takes `on_status(source, message, is_error)`
+and runs a watchdog thread (`watchdog_interval_seconds`) that restarts a dead or
+stalled recorder, rate-limited by `watchdog_restart_cooldown_seconds` and capped
+at `watchdog_max_restarts` (then it emits a "giving up" status and stops). New
+`is_healthy` / `restart_count` properties.
+
+Wiring: `SessionManager` passes `on_status=self._on_audio_status`, which routes
+capture-lost / capture-restored events through `_update_status` to the UI status
+bar. Tunables live in `src/config.py` `AUDIO_CAPTURE`.
+
+Tests: `tests/test_system_recorder_resilience.py` (8 tests, fakes `soundcard`):
+supervisor rebuilds on stream fault / device-resolution failure / silent stall,
+`stop()` is prompt, watchdog restarts an unhealthy recorder and emits status,
+leaves healthy recorders alone, and gives up after the cap.
+`python -m pytest tests/test_system_recorder_resilience.py -q` -> 8 passed.
+Full stable subset -> 116 passed. `soundcard`/`webrtcvad`/`sounddevice`/PySide6
+still not installed here, so the live path needs a manual run: start a session,
+change the default output device mid-session (or end a call), confirm the status
+bar shows "System audio: capture lost ... / capture restored" and system chunks
+resume.

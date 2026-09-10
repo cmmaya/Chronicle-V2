@@ -77,11 +77,17 @@ def test_none_input_does_not_raise():
 
 def test_handoff_condition_triggers_on_detail_intent():
     assert should_hand_off("detail", "sufficient") is True
+    assert should_hand_off("detail", "partial") is True
 
 
-def test_handoff_condition_triggers_on_partial_or_none_evidence():
+def test_handoff_condition_triggers_on_partial_evidence():
     assert should_hand_off("overview", "partial") is True
-    assert should_hand_off("overview", "none") is True
+
+
+def test_handoff_condition_false_when_evidence_is_none():
+    # The answer is in no routed session - nothing to hand off to.
+    assert should_hand_off("detail", "none") is False
+    assert should_hand_off("overview", "none") is False
 
 
 def test_handoff_condition_false_for_overview_with_sufficient_evidence():

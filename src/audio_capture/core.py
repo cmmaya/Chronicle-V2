@@ -4,7 +4,7 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Tuple
 import logging
 import numpy as np
 import wave
@@ -22,6 +22,11 @@ try:
     from src.audio_capture.system_recorder import SystemAudioRecorder
 except ImportError:
     SystemAudioRecorder = None
+
+try:
+    from src.config import AUDIO_CAPTURE as _AUDIO_CAPTURE
+except Exception:  # pragma: no cover - config should always import
+    _AUDIO_CAPTURE = {}
 
 
 logger = logging.getLogger(__name__)
@@ -113,6 +118,11 @@ class ChunkedAudioRecorder:
         self._is_running = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+
+        # Health tracking (read by the DualSourceChunkedRecorder watchdog)
+        self._started_at: float = 0.0
+        self._last_chunk_time: float = 0.0
+        self._restart_count: int = 0
 
         # Overlap configuration
         self._overlap_samples = int(self.overlap_duration * self.sample_rate)
@@ -236,7 +246,8 @@ class ChunkedAudioRecorder:
         
         # Save metadata file
         chunk.save_metadata()
-        
+        self._last_chunk_time = time.time()
+
         logger.info(f"Saved chunk: {chunk_id} ({chunk.duration:.2f}s)")
         
         # Call live transcription callback if provided
@@ -295,7 +306,8 @@ class ChunkedAudioRecorder:
         )
         
         chunk.save_metadata()
-        
+        self._last_chunk_time = time.time()
+
         logger.info(f"Saved chunk: {chunk_id} ({chunk.duration:.2f}s)")
         
         # Call live transcription callback if provided
@@ -479,43 +491,156 @@ class ChunkedAudioRecorder:
         if self._is_running:
             logger.warning("Recording already in progress")
             return
-        
+
         self.chunks = []
         self._stop_event.clear()
         self._is_running = True
-        
+        now = time.time()
+        self._started_at = now
+        self._last_chunk_time = now
+
         # Select the appropriate recording loop based on source
         if self.source == 'system' and self._system_recorder is not None:
             target = self._system_recording_loop
         else:
             target = self._recording_loop
-        
+
         # Start recording in background thread
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
-        
+
         logger.info(f"Started chunked recording ({self.chunk_duration}s chunks)")
-    
+
     def stop(self) -> List[AudioChunk]:
         """Stop recording and return all recorded chunks.
-        
+
         Returns:
             List of AudioChunk objects.
         """
         if not self._is_running:
             return self.chunks
-        
+
         self._is_running = False
         self._stop_event.set()
-        
+
         if self._thread:
             self._thread.join(timeout=self.chunk_duration + 1)
             self._thread = None
-        
+
         logger.info(f"Stopped chunked recording. Total chunks: {len(self.chunks)}")
-        
+
         return self.chunks
-    
+
+    @property
+    def is_thread_alive(self) -> bool:
+        """True while the recording-loop thread is running."""
+        return self._thread is not None and self._thread.is_alive()
+
+    def check_health(self, stall_seconds: Optional[float] = None) -> Tuple[bool, str]:
+        """Assess whether capture is still working.
+
+        Returns ``(healthy, reason)``. A recorder that isn't running is reported
+        healthy - there is nothing to recover. During a short grace window after
+        start/restart the recorder is always reported healthy so a slow device
+        open doesn't trip the watchdog.
+        """
+        if not self._is_running:
+            return True, "not running"
+
+        if stall_seconds is None:
+            stall_seconds = float(
+                _AUDIO_CAPTURE.get("watchdog_system_stall_seconds", 40.0)
+            )
+
+        grace = max(stall_seconds, 10.0)
+        if time.time() - self._started_at < grace:
+            return True, "starting up"
+
+        if not self.is_thread_alive:
+            return False, "recording thread is not alive"
+
+        if self.source == 'system' and self._system_recorder is not None:
+            if not getattr(self._system_recorder, "is_thread_alive", True):
+                return False, "system loopback supervisor is not alive"
+            idle = self._system_recorder.seconds_since_last_data()
+            if idle > stall_seconds:
+                return False, f"no system audio frames for {idle:.0f}s"
+
+        return True, "ok"
+
+    def restart(self) -> bool:
+        """Tear down and re-establish capture in place.
+
+        Keeps ``self.chunks`` and all callbacks. For the system source this
+        builds a fresh :class:`SystemAudioRecorder`, so the loopback device is
+        re-resolved from the *current* default speaker.
+
+        Returns:
+            True if a new recording thread was started.
+        """
+        if not self._is_running:
+            return False
+
+        self._restart_count += 1
+        logger.warning(
+            f"Restarting {self.source} chunked recorder (restart #{self._restart_count})"
+        )
+
+        # Signal the current loop to exit and wait for it. Its own teardown
+        # stops the underlying stream / system recorder.
+        self._stop_event.set()
+        old_thread = self._thread
+        if old_thread:
+            old_thread.join(timeout=self.chunk_duration + 5)
+            if old_thread.is_alive():
+                # A wedged loop still references self._stop_event; starting a
+                # second thread now would double-write chunks. Bail and let the
+                # watchdog retry after its cooldown.
+                logger.error(
+                    f"{self.source} recording thread will not stop; "
+                    "deferring restart"
+                )
+                return False
+
+        # Best-effort stop of the old underlying recorder in case the loop
+        # timed out before its finally-block ran.
+        if self._system_recorder is not None:
+            try:
+                self._system_recorder.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping stale system recorder: {e}")
+
+            # Fresh instance -> re-resolves default_speaker() on start.
+            try:
+                self._system_recorder = SystemAudioRecorder(
+                    session_path=str(self.session_path),
+                    source=self.source,
+                    channels=1,
+                )
+                self._recorder = self._system_recorder
+            except Exception as e:
+                logger.error(f"Failed to rebuild SystemAudioRecorder: {e}")
+                self._is_running = False
+                return False
+
+        # Restart the loop.
+        self._stop_event = threading.Event()
+        self._is_running = True
+        now = time.time()
+        self._started_at = now
+        self._last_chunk_time = now
+
+        if self.source == 'system' and self._system_recorder is not None:
+            target = self._system_recording_loop
+        else:
+            target = self._recording_loop
+
+        self._thread = threading.Thread(target=target, daemon=True)
+        self._thread.start()
+        logger.info(f"{self.source} chunked recorder restarted")
+        return True
+
+
     def get_chunks(self) -> List[AudioChunk]:
         """Get list of recorded chunks.
         
@@ -540,10 +665,11 @@ class DualSourceChunkedRecorder:
         callback: Optional[Callable[[str, AudioChunk], None]] = None,
         vad_aggressiveness: int = 2,
         vad_threshold: float = 0.30,
-        live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None
+        live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None,
+        on_status: Optional[Callable[[str, str, bool], None]] = None
     ):
         """Initialize the dual source recorder.
-        
+
         Args:
             session_path: Base path for the session.
             chunk_duration: Duration of each chunk in seconds.
@@ -554,10 +680,14 @@ class DualSourceChunkedRecorder:
             vad_threshold: Minimum ratio of speech frames to save chunk (0.0-1.0).
             live_transcription_callback: Optional callback for live transcription.
                                         Receives (source, chunk) as arguments.
+            on_status: Optional callback for capture-health events. Receives
+                       (source, message, is_error) - used to surface a lost /
+                       recovered audio stream to the UI.
         """
         self.session_path = Path(session_path)
         self.chunk_duration = chunk_duration
         self.overlap_duration = overlap_duration
+        self.on_status = on_status
         
         # Create callbacks for each source
         def make_callback(source: str):
@@ -597,30 +727,140 @@ class DualSourceChunkedRecorder:
         )
         
         self._is_running = False
-    
+
+        # Watchdog state
+        self._watchdog_enabled = bool(_AUDIO_CAPTURE.get("watchdog_enabled", True))
+        self._watchdog_interval = float(
+            _AUDIO_CAPTURE.get("watchdog_interval_seconds", 15.0)
+        )
+        self._watchdog_stall_seconds = float(
+            _AUDIO_CAPTURE.get("watchdog_system_stall_seconds", 40.0)
+        )
+        self._watchdog_max_restarts = int(
+            _AUDIO_CAPTURE.get("watchdog_max_restarts", 30)
+        )
+        self._watchdog_restart_cooldown = float(
+            _AUDIO_CAPTURE.get("watchdog_restart_cooldown_seconds", 20.0)
+        )
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
+        self._restart_total = 0
+        self._last_restart_at: dict = {}
+        self._gave_up = False
+
+    def _emit(self, source: str, message: str, is_error: bool = False) -> None:
+        """Report a capture-health event via the on_status callback + log."""
+        if is_error:
+            logger.error(f"[{source} audio] {message}")
+        else:
+            logger.info(f"[{source} audio] {message}")
+        if self.on_status:
+            try:
+                self.on_status(source, message, is_error)
+            except Exception as e:  # never let a UI callback break the watchdog
+                logger.warning(f"on_status callback raised: {e}")
+
+    def _watchdog_loop(self) -> None:
+        """Periodically check both recorders and restart a broken one."""
+        recorders = (('system', self.system_recorder), ('mic', self.mic_recorder))
+
+        while not self._watchdog_stop.wait(self._watchdog_interval):
+            for name, rec in recorders:
+                try:
+                    healthy, reason = rec.check_health(self._watchdog_stall_seconds)
+                except Exception as e:
+                    healthy, reason = False, f"health probe error: {e}"
+
+                if healthy:
+                    continue
+
+                if self._gave_up:
+                    continue
+
+                now = time.time()
+                since_last = now - self._last_restart_at.get(name, 0.0)
+                if since_last < self._watchdog_restart_cooldown:
+                    continue
+
+                if self._restart_total >= self._watchdog_max_restarts:
+                    self._gave_up = True
+                    self._emit(
+                        name,
+                        "capture keeps failing - giving up automatic recovery; "
+                        "restart the session to try again",
+                        True,
+                    )
+                    continue
+
+                self._last_restart_at[name] = now
+                self._restart_total += 1
+                self._emit(name, f"capture lost ({reason}) - restarting", True)
+
+                try:
+                    ok = rec.restart()
+                except Exception as e:
+                    ok = False
+                    reason = str(e)
+
+                if ok:
+                    self._emit(name, "capture restored", False)
+                else:
+                    self._emit(name, f"restart deferred ({reason})", True)
+
+        logger.info("Audio watchdog exited")
+
     def start(self) -> None:
         """Start recording from both sources."""
         self.mic_recorder.start()
         self.system_recorder.start()
         self._is_running = True
+
+        if self._watchdog_enabled:
+            self._watchdog_stop = threading.Event()
+            self._restart_total = 0
+            self._last_restart_at = {}
+            self._gave_up = False
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, daemon=True
+            )
+            self._watchdog_thread.start()
+
         logger.info("Started dual-source chunked recording")
-    
+
     def stop(self) -> tuple[List[AudioChunk], List[AudioChunk]]:
         """Stop recording from both sources.
-        
+
         Returns:
             Tuple of (mic_chunks, system_chunks).
         """
+        self._watchdog_stop.set()
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=self._watchdog_interval + 2)
+            self._watchdog_thread = None
+
         mic_chunks = self.mic_recorder.stop()
         system_chunks = self.system_recorder.stop()
         self._is_running = False
         logger.info("Stopped dual-source chunked recording")
         return mic_chunks, system_chunks
-    
+
     @property
     def is_running(self) -> bool:
         """Check if recording is in progress."""
         return self._is_running
+
+    @property
+    def is_healthy(self) -> bool:
+        """True if both sources currently report healthy capture."""
+        return (
+            self.mic_recorder.check_health(self._watchdog_stall_seconds)[0]
+            and self.system_recorder.check_health(self._watchdog_stall_seconds)[0]
+        )
+
+    @property
+    def restart_count(self) -> int:
+        """Total automatic recorder restarts performed this session."""
+        return self._restart_total
 
 
 def create_chunked_recorder(
@@ -655,17 +895,19 @@ def create_dual_source_recorder(
     session_path: str,
     chunk_duration: int = 10,
     overlap_duration: int = 1,
-    live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None
+    live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None,
+    on_status: Optional[Callable[[str, str, bool], None]] = None
 ) -> DualSourceChunkedRecorder:
     """Factory function to create a dual-source chunked recorder.
-    
+
     Args:
         session_path: Base path for the session.
         chunk_duration: Duration of each chunk in seconds.
         overlap_duration: Overlap duration between chunks in seconds.
         live_transcription_callback: Optional callback for live transcription.
                                     Receives (source, chunk) as arguments.
-        
+        on_status: Optional capture-health callback (source, message, is_error).
+
     Returns:
         DualSourceChunkedRecorder instance.
     """
@@ -673,5 +915,6 @@ def create_dual_source_recorder(
         session_path=session_path,
         chunk_duration=chunk_duration,
         overlap_duration=overlap_duration,
-        live_transcription_callback=live_transcription_callback
+        live_transcription_callback=live_transcription_callback,
+        on_status=on_status
     )

@@ -72,3 +72,15 @@ Scope Switch Prompt — follow-on to BU090
 | ---   | ---                                     | ---       | ---                 | ---   |
 | BU092 | Scope Switch Offer Decision And Payload | Pending   | BU089, BU090        | BU093 |
 | BU093 | In-Chat Scope Switch Prompt             | Pending   | BU092               | none  |
+
+Router Retrieval Fix — independent bug fix, informed by a real repro against production data
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU094 | Session Router Coverage And Scoring Repair | Pending | BU089, BU091     | none  |
+
+System Audio Capture Resilience — independent bug fix, diagnosed from a real session (session_046) that stopped capturing system audio ~40 min in
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU095 | System Audio Capture Supervisor And Watchdog | Completed | none           | none  |

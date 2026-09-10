@@ -61,6 +61,11 @@ class SessionManager:
         self.vad_threshold = 0.30  # 30% of frames must have speech
         self.vad_aggressiveness = 2  # VAD mode (0-3)
 
+    def _on_audio_status(self, source: str, message: str, is_error: bool = False):
+        """Surface an audio capture-health event (stream lost / restored)."""
+        label = 'System audio' if source == 'system' else 'Microphone'
+        self._update_status(f'{label}: {message}', is_error=is_error)
+
     def _update_status(self, message: str, is_error: bool = False):
         """Update status via callback and log."""
         if is_error:
@@ -200,7 +205,8 @@ class SessionManager:
             str(session_path),
             vad_aggressiveness=self.vad_aggressiveness,
             vad_threshold=self.vad_threshold,
-            live_transcription_callback=live_callback
+            live_transcription_callback=live_callback,
+            on_status=self._on_audio_status
         )
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path), 
@@ -251,7 +257,8 @@ class SessionManager:
             str(session_path),
             vad_aggressiveness=self.vad_aggressiveness,
             vad_threshold=self.vad_threshold,
-            live_transcription_callback=self.handle_live_transcription
+            live_transcription_callback=self.handle_live_transcription,
+            on_status=self._on_audio_status
         )
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path),
