@@ -1112,3 +1112,47 @@ still not installed here, so the live path needs a manual run: start a session,
 change the default output device mid-session (or end a call), confirm the status
 bar shows "System audio: capture lost ... / capture restored" and system chunks
 resume.
+
+## Any Session context metadata tightening (follow-up to ANY_SESSION_METADATA_AUDIT.md)
+
+Summary:
+Audit (`docs/build_plan/ANY_SESSION_METADATA_AUDIT.md`) found the model never
+receives a session's date or id on the two Any Session context paths that
+normally fire, while the answer contract asks it to cite session ids. Directed
+change: add session date + id to the context, and drop the metadata that was
+adding noise rather than signal. No new retrieval behaviour.
+
+Changes:
+- `src/assistant/rag_context_builder.py`: new shared `_session_header()` ->
+  `## [S<id>] <name> (<YYYY-MM-DD HH:MM>)` used by both
+  `build_routed_session_context` (date from `RoutedSession.start_time`) and
+  `build_any_session_context` (date from the group's earliest result
+  timestamp; also now falls back to `Session <id>` instead of printing `None`).
+  `_format_result` chunk lines carry the full date
+  (`[<source> @ <YYYY-MM-DD HH:MM:SS>]: ...`) instead of time-of-day, and no
+  longer render the document `title`. The router match `reason` is no longer
+  concatenated into the routed header (it stays on `RoutedSession.reason` for
+  logs / the UI candidate list).
+- `src/assistant/response_contract.py`: `RESPONSE_CONTRACT` gains one line
+  telling the model the `sessions` field is the `N` from each `[SN]` header, so
+  `parse_answer().sessions` -> `build_scope_offer(cited_session_ids=...)` is
+  fed real ids.
+- `src/assistant/service.py`: `MAX_HISTORY_MESSAGES = 10`; `_build_messages`
+  replays only the last 10 conversation messages into the prompt (was: all of
+  them via `get_messages`). Legacy `_get_all_sessions_context_legacy` session
+  list drops the `- Transcribed: .. , Summarized: ..` status suffix.
+
+Tests:
+- `tests/test_rag_context_builder.py`: title no longer rendered; header carries
+  `[S<id>]` + date; chunk line timestamp carries the date; missing
+  `session_name` -> `Session <id>`, never `None`.
+- `tests/test_rag_router.py`: routed context header carries `[S<id>]` + the
+  session date and does not leak the router `reason`.
+- `tests/test_assistant_service.py`: a 40-message conversation replays exactly
+  the last `MAX_HISTORY_MESSAGES` into the prompt.
+- `python -m pytest tests/test_rag_context_builder.py tests/test_rag_retrieval.py tests/test_rag_router.py tests/test_response_contract.py` -> all pass.
+  `tests/test_assistant_service.py` -> same 5 pre-existing `dotenv` failures as
+  before, 85 pass (incl. the new history-cap test). Broader RAG/assistant
+  suite (`test_database_rag`, `test_rag_indexer`, `test_rag_migration`,
+  `test_context_retriever`, `test_assistant_tools`, `test_scope_offer`,
+  `test_session_resolver`) -> 182 passed.

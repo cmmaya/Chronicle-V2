@@ -306,6 +306,69 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Session deletion failed: {str(e)}')
 
+    def delete_screenshots(self, session_id: int) -> None:
+        """Delete all screenshot rows for a session (does not touch image files)."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM screenshots WHERE session_id = ?', (session_id,))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot deletion failed: {str(e)}')
+
+    def purge_session(self, session_id: int) -> None:
+        """Permanently delete a session and every DB row that belongs to it.
+
+        Removes, in a single transaction: transcripts, screenshot rows,
+        summaries, assistant conversations + their messages, the RAG
+        documents / chunks / FTS mirror, the session-router profile, and
+        finally the ``sessions`` row itself. Files on disk (audio,
+        screenshot images, the session folder) are the caller's
+        responsibility since this class does not own the filesystem layout.
+        """
+        try:
+            cursor = self.connection.cursor()
+
+            # RAG index. Grab document ids first so the denormalised FTS
+            # mirror can be cleared alongside the base tables.
+            doc_ids = [row[0] for row in cursor.execute(
+                'SELECT id FROM rag_documents WHERE session_id = ?', (session_id,)
+            ).fetchall()]
+            if doc_ids:
+                placeholders = ','.join('?' * len(doc_ids))
+                cursor.execute(
+                    f'DELETE FROM rag_fts WHERE document_id IN ({placeholders})', doc_ids
+                )
+            cursor.execute('DELETE FROM rag_fts WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM rag_chunks WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM rag_documents WHERE session_id = ?', (session_id,))
+
+            # Session-router profile (BU089).
+            cursor.execute('DELETE FROM session_profiles_fts WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM session_profiles WHERE session_id = ?', (session_id,))
+
+            # Assistant chat history scoped to this session.
+            conv_ids = [row[0] for row in cursor.execute(
+                'SELECT id FROM assistant_conversations WHERE session_id = ?', (session_id,)
+            ).fetchall()]
+            for conv_id in conv_ids:
+                cursor.execute(
+                    'DELETE FROM assistant_messages WHERE conversation_id = ?', (conv_id,)
+                )
+            cursor.execute(
+                'DELETE FROM assistant_conversations WHERE session_id = ?', (session_id,)
+            )
+
+            # Core session content.
+            cursor.execute('DELETE FROM summaries WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM transcripts WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM screenshots WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
+
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
+            raise DatabaseError(f'Session purge failed: {str(e)}')
+
     def list_sessions(self) -> List[Dict[str, Any]]:
         try:
             cursor = self.connection.cursor()

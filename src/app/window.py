@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
-                                QToolButton, QToolBar, QBoxLayout, QSizePolicy)
+                                QToolButton, QToolBar, QBoxLayout, QSizePolicy, QInputDialog)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint
 from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence, QFont
 from typing import Optional
@@ -770,25 +770,38 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.Yes:
-                # Delete related data first (summaries, transcripts)
-                self.session_manager.db.delete_summaries(session_id)
-                self.session_manager.db.delete_transcripts(session_id)
-                # Delete the session itself
-                self.session_manager.db.delete_session(session_id)
+                self._purge_session_data(session_id)
                 self.sessions_list.removeRow(row)
-                
+
                 logger.info(f"Deleted session {session_id} ('{session_name}')")
                 self._on_status_update(f"Session '{session_name}' deleted.")
-                
+
         except Exception as e:
             logger.error(f"Failed to delete session: {str(e)}")
             self._on_status_update(f"Error deleting session: {str(e)}", is_error=True)
-    
-    def _delete_session_by_id(self, session_id: int):
-        """Delete a session by its ID.
-        
-        Args:
-            session_id: The session ID to delete
+
+    def _purge_session_data(self, session_id: int) -> None:
+        """Permanently remove a session: every DB row plus its on-disk folder.
+
+        Covers transcripts, screenshots (rows + image files), summaries, the
+        RAG index, the session-router profile, assistant chat history, and the
+        audio recordings under ``sessions/session_XXX/``.
+        """
+        # Database rows (transactional).
+        self.session_manager.db.purge_session(session_id)
+
+        # On-disk assets: audio/, screenshots/, transcripts/ for this session.
+        import shutil
+        try:
+            session_dir = self.session_manager._get_session_path(session_id)
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"Could not remove session folder for {session_id}: {e}")
+
+    def _delete_session_by_id(self, session_id: int) -> bool:
+        """Delete a session by its ID, including all of its data on disk and in
+        the database. Returns True if the session was actually deleted.
         """
         try:
             # Get session name first
@@ -798,36 +811,36 @@ class MainWindow(QMainWindow):
                 if s['id'] == session_id:
                     session_name = s['name']
                     break
-            
+
             if session_name is None:
-                return
-            
+                return False
+
             reply = QMessageBox.question(
                 self,
                 'Delete Session',
-                f"Are you sure you want to permanently delete '{session_name}'?",
+                f"Permanently delete '{session_name}'?\n\n"
+                "This removes its transcripts, summary, screenshots, audio "
+                "recordings and search index. This cannot be undone.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
             )
-            
+
             if reply == QMessageBox.Yes:
-                # Delete related data first (summaries, transcripts)
-                self.session_manager.db.delete_summaries(session_id)
-                self.session_manager.db.delete_transcripts(session_id)
-                # Delete the session itself
-                self.session_manager.db.delete_session(session_id)
-                
+                self._purge_session_data(session_id)
+
                 logger.info(f"Deleted session {session_id} ('{session_name}')")
                 self._on_status_update(f"Session '{session_name}' deleted.")
-                
+
                 # Refresh completer
                 self._refresh_session_completer()
-                
+                return True
+            return False
+
         except Exception as e:
             logger.error(f"Failed to delete session: {str(e)}")
             self._on_status_update(f"Error deleting session: {str(e)}", is_error=True)
-            self._on_status_update(f"Error deleting session.", is_error=True)
             QMessageBox.critical(self, 'Error', 'Could not delete the session from the database.')
+            return False
     
     def _on_session_double_clicked(self, row, column):
         """Handle double-click on a session row to view summary."""
@@ -4805,274 +4818,255 @@ Keywords: {keywords_str}"""
             self._load_transcripts_for_session(session_id)
             logger.info(f"Selected session for assistant: {session_id}")
     
+    # ------------------------------------------------------------------
+    # "All Sessions" browser window
+    # ------------------------------------------------------------------
+    _ALL_SESSIONS_MENU_QSS = """
+        QMenu {
+            background-color: #071D52;
+            border: 2px solid #3E6B9B;
+            color: #FFF0BF;
+            padding: 4px;
+            font-family: "Courier New";
+            font-size: 12px;
+        }
+        QMenu::item { padding: 5px 22px 5px 14px; }
+        QMenu::item:selected { background-color: #3E6B9B; }
+        QMenu::separator { height: 1px; background: #3E6B9B; margin: 4px 6px; }
+    """
+
+    _ALL_SESSIONS_DIALOG_QSS = """
+        QDialog#AllSessionsDialog { background: #061946; }
+        QDialog#AllSessionsDialog QLabel#Hint {
+            color: #9FB6E4; font-size: 11px; padding: 0 2px 2px 2px;
+        }
+        QDialog#AllSessionsDialog QTableWidget {
+            background: #071D52;
+            color: #FFF0BF;
+            border: 2px solid #254D9C;
+            gridline-color: #17356F;
+            font-family: "Courier New";
+            font-size: 12px;
+        }
+        QDialog#AllSessionsDialog QTableWidget::item { padding: 3px 8px; border: 0; }
+        QDialog#AllSessionsDialog QTableWidget::item:selected {
+            background: #315DB1; color: #FFF0BF;
+        }
+        QDialog#AllSessionsDialog QHeaderView::section {
+            background: #274F9B;
+            color: #FFF0BF;
+            border: 0;
+            border-right: 1px solid #17356F;
+            padding: 6px 8px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        QDialog#AllSessionsDialog QTableCornerButton::section {
+            background: #274F9B; border: 0;
+        }
+        QDialog#AllSessionsDialog QToolButton#RowActions {
+            background: #F6E0A6;
+            color: #071846;
+            border: none;
+            border-radius: 5px;
+            padding: 4px 10px;
+            font-family: "Courier New";
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QDialog#AllSessionsDialog QToolButton#RowActions:hover { background: #FFE7B4; }
+        QDialog#AllSessionsDialog QToolButton#RowActions::menu-indicator { image: none; }
+    """
+
     def _show_all_sessions_window(self):
-        """Show all sessions in a detached window."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("All Sessions")
-        dialog.resize(700, 500)
-        
-        layout = QVBoxLayout(dialog)
-        
-        # Create table
-        table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Session Name", "Transcription", "Summary", "Date", "Actions"])
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        
-        # Load sessions
-        sessions = self.session_manager.db.list_sessions()
-        
-        # Verify and fix status
+        """Show all sessions in a detached, theme-matched browser window."""
         from datetime import datetime
+
+        dialog = QDialog(self)
+        dialog.setObjectName("AllSessionsDialog")
+        dialog.setWindowTitle("All Sessions")
+        dialog.resize(880, 560)
+        dialog.setStyleSheet(self._ALL_SESSIONS_DIALOG_QSS)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        hint = QLabel("Double-click a session to load it · use Actions for transcribe / summarize / delete")
+        hint.setObjectName("Hint")
+        layout.addWidget(hint)
+
+        # Load sessions and reconcile the stored status flags with reality.
+        sessions = self.session_manager.db.list_sessions()
         for session in sessions:
             session_id = session['id']
             trans_status = session.get('transcription_status', 'none')
             sum_status = session.get('summary_status', 'none')
-            
-            # Verify transcription status
-            if trans_status == 'none':
-                actual_transcripts = self.session_manager.db.get_transcripts(session_id)
-                if actual_transcripts:
-                    trans_status = 'transcribed'
-            
-            # Verify summary status
-            if sum_status == 'none':
-                actual_summaries = self.session_manager.db.get_summaries(session_id)
-                if actual_summaries:
-                    sum_status = 'summarized'
-            
+            if trans_status == 'none' and self.session_manager.db.get_transcripts(session_id):
+                trans_status = 'transcribed'
+            if sum_status == 'none' and self.session_manager.db.get_summaries(session_id):
+                sum_status = 'summarized'
             session['transcription_status'] = trans_status
             session['summary_status'] = sum_status
-        
+
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Session", "Transcript", "Summary", "Date", "Actions"])
         table.setRowCount(len(sessions))
-        
-        # Store sessions data for access in handlers
-        sessions_data = sessions
-        
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setContextMenuPolicy(Qt.NoContextMenu)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.verticalHeader().setDefaultSectionSize(32)
+        table.horizontalHeader().setHighlightSections(False)
+
+        hh = table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.Fixed)
+        table.setColumnWidth(4, 108)
+
+        ready_color = QColor("#8FE39B")
+        pending_color = QColor("#8EA7D8")
+
+        def _status_item(is_ready: bool) -> QTableWidgetItem:
+            item = QTableWidgetItem("Ready" if is_ready else "—")
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setForeground(ready_color if is_ready else pending_color)
+            return item
+
         for row, session in enumerate(sessions):
             session_id = session['id']
-            trans_status = session.get('transcription_status', 'none')
-            sum_status = session.get('summary_status', 'none')
-            
-            # Session name (editable)
+            trans_ready = session['transcription_status'] == 'transcribed'
+            sum_ready = session['summary_status'] == 'summarized'
+
             name_item = QTableWidgetItem(session['name'])
             name_item.setData(Qt.UserRole, session_id)
-            name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+            name_item.setToolTip(session['name'])
             table.setItem(row, 0, name_item)
-            
-            # Transcription status (read-only)
-            trans_item = QTableWidgetItem(trans_status)
-            trans_item.setFlags(trans_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 1, trans_item)
-            
-            # Summary status (read-only)
-            sum_item = QTableWidgetItem(sum_status)
-            sum_item.setFlags(sum_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 2, sum_item)
-            
-            # Date
+
+            table.setItem(row, 1, _status_item(trans_ready))
+            table.setItem(row, 2, _status_item(sum_ready))
+
             start_time = session.get('start_time', 0)
+            date_str = ''
             if start_time:
                 try:
-                    dt = datetime.fromtimestamp(start_time)
-                    date_str = dt.strftime('%Y-%m-%d %H:%M')
-                except:
+                    date_str = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M')
+                except (ValueError, OSError, OverflowError):
                     date_str = ''
-            else:
-                date_str = ''
             date_item = QTableWidgetItem(date_str)
-            date_item.setFlags(date_item.flags() & ~Qt.ItemIsEditable)
+            date_item.setTextAlignment(Qt.AlignCenter)
             table.setItem(row, 3, date_item)
-            
-            # Actions dropdown
-            action_combo = QComboBox()
-            # Placeholder to ensure selecting the same action twice emits a change
-            action_combo.addItem("Select Action", "none")
-            
-            # Determine available actions
-            if trans_status != 'transcribed':
-                action_combo.addItem("Transcribe", "transcribe")
-            
-            if trans_status == 'transcribed':
-                if sum_status != 'summarized':
-                    action_combo.addItem("Summarize", "summarize")
-                else:
-                    action_combo.addItem("View Summary", "view_summary")
-            
-            # Always add View Screenshots
-            action_combo.addItem("View Screenshots", "view_screenshots")
-            
-            # Add Delete option
-            action_combo.addItem("Delete", "delete")
-            
-            action_combo.currentIndexChanged.connect(
-                lambda idx, sid=session_id, sname=session['name'], tstat=trans_status, sstat=sum_status, c=action_combo, d=dialog: 
-                self._on_all_sessions_action_selected(sid, sname, tstat, sstat, idx, c, d)
-            )
-            
-            table.setCellWidget(row, 4, action_combo)
-        
-        # Connect cellChanged for name editing
-        table.cellChanged.connect(lambda row, col: self._on_all_sessions_cell_changed(row, col, table, sessions_data))
-        
-        # Connect double-click to select session (except for name column which is for renaming)
-        def on_cell_double_clicked(row, col):
-            # Skip if double-clicking on name column (reserved for renaming)
-            if col == 0:
+
+            table.setCellWidget(row, 4, self._build_session_actions_cell(session, dialog))
+
+        def on_row_activated(row, _col):
+            if row < 0 or row >= len(sessions):
                 return
-            
-            # Get session_id from the row
-            if row < len(sessions_data):
-                session = sessions_data[row]
-                session_id = session.get('id')
-                if session_id is not None:
-                    self._selected_session_id = session_id
-                    self._update_scope_label()
-                    # Clear previous transcripts and load new ones
-                    self._clear_transcription_view()
-                    if hasattr(self, '_detached_window') and self._detached_window:
-                        self._on_close_detached_window()
-                    self._load_transcripts_for_session(session_id)
-                    # Process events to ensure UI updates before closing dialog
-                    QApplication.processEvents()
-                    logger.info(f"Selected session from All Sessions window: {session_id}")
-                    dialog.close()
-        
-        table.cellDoubleClicked.connect(on_cell_double_clicked)
-        
+            session_id = sessions[row].get('id')
+            if session_id is None:
+                return
+            self._selected_session_id = session_id
+            self._update_scope_label()
+            self._clear_transcription_view()
+            if getattr(self, '_detached_window', None):
+                self._on_close_detached_window()
+            self._load_transcripts_for_session(session_id)
+            QApplication.processEvents()
+            logger.info(f"Selected session from All Sessions window: {session_id}")
+            dialog.close()
+
+        table.cellDoubleClicked.connect(on_row_activated)
         layout.addWidget(table)
-        
-        # Refresh button
-        refresh_btn = QPushButton("Refresh")
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        refresh_btn = PixelButton("Refresh")
         refresh_btn.clicked.connect(lambda: self._refresh_all_sessions_window(dialog))
-        layout.addWidget(refresh_btn)
-        
-        # Close button
-        close_btn = QPushButton("Close")
+        close_btn = PixelButton("Close")
         close_btn.clicked.connect(dialog.close)
-        layout.addWidget(close_btn)
-        
+        button_row.addWidget(refresh_btn)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
         dialog.exec()
-    
-    def _on_all_sessions_cell_changed(self, row, col, table, sessions_data):
-        """Handle cell changes in the all sessions table.
-        
-        Args:
-            row: The changed row
-            col: The changed column
-            table: The table widget
-            sessions_data: List of session dictionaries
-        """
-        if col != 0:  # Only handle name column
+
+    def _build_session_actions_cell(self, session: dict, dialog: QDialog) -> QWidget:
+        """Build the per-row 'Actions' menu button for the All Sessions table."""
+        session_id = session['id']
+        session_name = session['name']
+        trans_ready = session['transcription_status'] == 'transcribed'
+        sum_ready = session['summary_status'] == 'summarized'
+
+        menu = QMenu(dialog)
+        menu.setStyleSheet(self._ALL_SESSIONS_MENU_QSS)
+
+        if not trans_ready:
+            menu.addAction("Transcribe", lambda: self._on_transcribe_clicked(session_id, None))
+        elif not sum_ready:
+            menu.addAction("Summarize", lambda: self._on_summarize_clicked(session_id, None))
+        if sum_ready:
+            menu.addAction("View summary",
+                           lambda: self._show_summary_by_session_id(session_id, session_name))
+        menu.addAction("View screenshots",
+                       lambda: self._show_screenshots_by_session_id(session_id, session_name))
+        menu.addAction("Rename…",
+                       lambda: self._rename_session_from_dialog(session_id, session_name, dialog))
+        menu.addSeparator()
+        menu.addAction("Delete session",
+                       lambda: self._delete_from_all_sessions(session_id, dialog))
+
+        button = QToolButton()
+        button.setObjectName("RowActions")
+        button.setText("Actions ▾")
+        button.setPopupMode(QToolButton.InstantPopup)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setMenu(menu)
+
+        wrapper = QWidget()
+        wl = QHBoxLayout(wrapper)
+        wl.setContentsMargins(6, 3, 6, 3)
+        wl.addWidget(button)
+        return wrapper
+
+    def _rename_session_from_dialog(self, session_id: int, old_name: str, dialog: QDialog):
+        """Prompt for a new session name and persist it."""
+        new_name, ok = QInputDialog.getText(
+            dialog, "Rename Session", "Session name:", text=old_name
+        )
+        if not ok:
             return
-        
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
         try:
-            item = table.item(row, 0)
-            if not item:
-                return
-            
-            session_id = item.data(Qt.UserRole)
-            new_name = item.text()
-            
-            if not new_name:
-                return
-            
-            # Find the old name from sessions_data
-            old_name = None
-            for session in sessions_data:
-                if session['id'] == session_id:
-                    old_name = session['name']
-                    break
-            
-            if old_name is None or new_name == old_name:
-                return
-            
-            # Update in database
             self.session_manager.db.update_session(session_id, name=new_name)
             logger.info(f"Renamed session {session_id} to '{new_name}'")
-            
-            # Update the local data
-            for session in sessions_data:
-                if session['id'] == session_id:
-                    session['name'] = new_name
-                    break
-            
-            # Refresh completer
             self._refresh_session_completer()
-            
+            self._refresh_all_sessions_window(dialog)
         except Exception as e:
             logger.error(f"Failed to rename session: {e}")
             self._on_status_update(f"Error renaming session: {e}", is_error=True)
-    
+
+    def _delete_from_all_sessions(self, session_id: int, dialog: QDialog):
+        """Delete a session from the All Sessions window and refresh it."""
+        if self._delete_session_by_id(session_id):
+            self._refresh_all_sessions_window(dialog)
+
     def _refresh_all_sessions_window(self, dialog):
         """Refresh the all sessions window."""
         # Simply recreate the window
         dialog.close()
         self._show_all_sessions_window()
-    
-    def _on_all_sessions_action_selected(self, session_id, session_name, trans_status, sum_status, index, combo, dialog):
-        """Handle action selection from all sessions window."""
-        # Debug/logging to trace UI actions
-        try:
-            logger.debug(f"_on_all_sessions_action_selected called: session_id={session_id}, index={index}, text={combo.currentText()}, data={combo.currentData()}, trans_status={trans_status}, sum_status={sum_status}")
-        except Exception:
-            logger.debug(f"_on_all_sessions_action_selected called: session_id={session_id}, index={index}")
 
-        # Determine selected action; ignore placeholder/none
-        action = combo.currentData()
-        if not action or action == 'none':
-            return
-        # Show immediate status so user sees action was registered
-        try:
-            self._on_status_update(f"Action selected: {action} for session {session_id}")
-        except Exception:
-            pass
-        
-        if action == "transcribe":
-            combo.setEnabled(False)
-            self._on_transcribe_clicked(session_id, combo)
-            # Reset the combo so the same action can be chosen again
-            try:
-                combo.blockSignals(True)
-                combo.setCurrentIndex(0)
-                combo.blockSignals(False)
-            except Exception:
-                pass
-        elif action == "summarize":
-            combo.setEnabled(False)
-            self._on_summarize_clicked(session_id, combo)
-            # Reset the combo so the same action can be chosen again
-            try:
-                combo.blockSignals(True)
-                combo.setCurrentIndex(0)
-                combo.blockSignals(False)
-            except Exception:
-                pass
-        elif action == "view_summary":
-            # Show summary directly from database
-            self._show_summary_by_session_id(session_id, session_name)
-            # Reset the combo so the same action can be chosen again
-            try:
-                combo.blockSignals(True)
-                combo.setCurrentIndex(0)
-                combo.blockSignals(False)
-            except Exception:
-                pass
-        elif action == "view_screenshots":
-            self._show_screenshots_by_session_id(session_id, session_name)
-            # Reset the combo so the same action can be chosen again
-            try:
-                combo.blockSignals(True)
-                combo.setCurrentIndex(0)
-                combo.blockSignals(False)
-            except Exception:
-                pass
-        elif action == "delete":
-            self._delete_session_by_id(session_id)
-            # Refresh the dialog
-            self._refresh_all_sessions_window(dialog)
-    
     def _on_session_search_selected(self, index: int):
         """Handle session selection from the combobox.
         
