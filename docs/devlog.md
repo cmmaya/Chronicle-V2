@@ -1519,3 +1519,40 @@ click collapses only its own section and re-expands, Expand/Collapse all,
 zoom readout + clamping at both ends, no horizontal scrollbar at minimum width,
 and the empty-summary path still informing instead of opening a dialog - all
 green, with screenshots checked at 560x400, 780x660 and 1200x900.
+
+### BU100 follow-up - drop the lead-in section, render markdown bold
+
+Three formatting corrections after seeing the view against real summaries:
+
+- **The leading `Summary` section was noise.** Models prefix their output with
+  "Here's a comprehensive summary of the meeting:" before `1. Overview`, and
+  the parser was faithfully turning that chatter into its own collapsible
+  section. `parse_summary_sections` now drops everything before the first
+  recognized header. The legacy path is untouched and still matters: when *no*
+  header is recognized the whole text is kept as a single `Summary` section, so
+  off-template content is never silently discarded - only a lead-in that sits
+  in front of real sections is.
+- **`**bold**` rendered literally.** `format_summary_body_html` escaped its
+  text but never interpreted markdown, so the asterisks showed. Added
+  `escape_with_markdown_bold(text)`: `html_escape.escape` first, then
+  `\*\*(.+?)\*\*` -> `<b>\1</b>`. The order matters and is safe in that
+  direction only - `**` contains nothing HTML-special, so escaping can't
+  disturb the markers, while doing the regex first would let escaping mangle
+  the `<b>` tags it produced. Reflow runs before this, so a bold span the model
+  split across a hard wrap still closes correctly. The body font stays normal
+  weight (QSS sets `font-size` without `font-weight`), which is what makes the
+  bold read.
+- **Alignment now matches the chat bubbles.** `body_label` moved from
+  `AlignTop | AlignLeft` to `AlignLeft | AlignVCenter`, with
+  `body_layout.setAlignment(..., Qt.AlignVCenter)` centring the block in its
+  card - paragraphs still read left-aligned.
+
+`meta_label` (Type / Model / date) already followed the chat's secondary-text
+pattern - separated from the body, smaller, muted - so it was left alone.
+
+Validation: `python -m pytest tests/test_bu100.py -q` -> 16 passed (the
+preamble case flipped from "is kept" to "is dropped", plus three new bold
+cases: basic rendering, bold surviving escaping and reflow, and unpaired
+asterisks like "2**3" left alone). Qt harness re-run against a sample carrying
+both a lead-in line and markdown bold - all interaction checks still green, and
+the rendered view shows no stray `Summary` section and no visible asterisks.

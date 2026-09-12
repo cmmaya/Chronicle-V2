@@ -1734,26 +1734,28 @@ Keywords: {keywords_str}"""
             width = int(screen_geometry.width() * 0.5)
             height = int(screen_geometry.height() * 0.5)
             dialog.resize(width, height)
-            dialog.move(int((screen_geometry.width() - width) / 2), 
+            dialog.move(int((screen_geometry.width() - width) / 2),
                        int((screen_geometry.height() - height) / 2))
             # Scale image to fit in the window
-            image_label.setPixmap(pixmap.scaled(
-                screen_geometry.width(), 
-                screen_geometry.height(), 
-                Qt.KeepAspectRatio, 
-                Qt.SmoothTransformation
-            ))
+            if not pixmap.isNull():
+                image_label.setPixmap(pixmap.scaled(
+                    screen_geometry.width(),
+                    screen_geometry.height(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                ))
         else:
             # Save current geometry for restore
             dialog.showFullScreen()
             btn.setText("Exit Fullscreen")
             # Scale image to fill the fullscreen
-            image_label.setPixmap(pixmap.scaled(
-                screen_geometry.width(), 
-                screen_geometry.height(), 
-                Qt.KeepAspectRatio, 
-                Qt.SmoothTransformation
-            ))
+            if not pixmap.isNull():
+                image_label.setPixmap(pixmap.scaled(
+                    screen_geometry.width(),
+                    screen_geometry.height(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                ))
 
     def _show_full_image(self, filepath: str, timestamp):
         """Show a full-size image in a dialog for the given filepath and timestamp.

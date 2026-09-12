@@ -97,6 +97,27 @@ def highlight_terms_html(text: str, terms, bg: str, fg: str) -> str:
     return regex.sub(_wrap, escaped)
 
 
+# Chat answers only ever use light markdown emphasis (bold, occasional
+# italics) plus plain line breaks - not full markdown (tables, headers,
+# nested lists). Qt.MarkdownText's QLabel sizeHint is unreliable for
+# word-wrapped, list-shaped text (the measured height can wildly overshoot
+# the rendered height, leaving a huge blank gap above/below the text once
+# vertically centered) so bubbles convert the light subset to HTML by hand
+# and render it as ordinary Qt.RichText, whose word-wrap/sizeHint path is
+# the same well-tested one PixelCollapsibleSection already relies on.
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", re.DOTALL)
+
+
+def simple_markdown_to_html(text: str) -> str:
+    """Escape ``text`` and convert ``**bold**`` / ``*italic*`` and newlines
+    to HTML, without pulling in a full markdown parser."""
+    escaped = html_escape.escape(text)
+    bolded = _BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", escaped)
+    emphasized = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", bolded)
+    return emphasized.replace("\n", "<br>")
+
+
 # =========================
 # Panels
 # =========================
@@ -325,17 +346,17 @@ class PixelBubble(QWidget):
         self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Minimum)
 
         footer_match = _SCOPE_FOOTER_RE.search(text)
-        body_text = text[: footer_match.start()] if footer_match else text
+        body_text = (text[: footer_match.start()] if footer_match else text).strip()
         footer_text = footer_match.group(1) if footer_match else None
         self._body_text = body_text
 
         text_color = "#071846" if variant == "cream" else "#FFF0BF"
 
-        self.label = QLabel(body_text)
+        self.label = QLabel(simple_markdown_to_html(body_text))
         self.label.setWordWrap(True)
         self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.label.setMaximumWidth(max_width)
-        self.label.setTextFormat(Qt.MarkdownText)
+        self.label.setTextFormat(Qt.RichText)
 
         font = QFont("Courier New")
         font.setPointSize(12)
@@ -380,18 +401,19 @@ class PixelBubble(QWidget):
                 """
             )
 
-        content = QVBoxLayout()
-        content.setContentsMargins(0, 0, 0, 0)
-        content.setSpacing(6)
-        content.addWidget(self.label)
-        if self.footer_label:
-            content.addWidget(self.footer_label)
-
-        layout = QHBoxLayout(self)
+        # A single top-level layout directly on the widget - no layout nested
+        # inside another - is the one case Qt's word-wrap heightForWidth
+        # propagation reliably supports. Nesting a QVBoxLayout inside this
+        # widget's own QHBoxLayout (an earlier version of this footer split)
+        # broke that propagation: the reported height stopped tracking the
+        # label's actual assigned width, so the box grew or clipped text
+        # depending on how far off the guess was.
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(0)
-        layout.addLayout(content)
-        layout.setAlignment(content, Qt.AlignVCenter)
+        layout.setSpacing(6)
+        layout.addWidget(self.label)
+        if self.footer_label:
+            layout.addWidget(self.footer_label)
 
     def set_highlighted(self, value: bool):
         value = bool(value)
@@ -415,8 +437,8 @@ class PixelBubble(QWidget):
             self.label.setTextFormat(Qt.RichText)
             self.label.setText(highlight_terms_html(self._body_text, terms, bg, fg))
         else:
-            self.label.setTextFormat(Qt.MarkdownText)
-            self.label.setText(self._body_text)
+            self.label.setTextFormat(Qt.RichText)
+            self.label.setText(simple_markdown_to_html(self._body_text))
 
     def _bubble_path(self) -> QPainterPath:
         rect = self.rect().adjusted(1, 1, -3, -3)
@@ -883,6 +905,17 @@ _FIELD_LINE_RE = re.compile(
 )
 
 
+# Markdown emphasis the model leaves in its output. Applied after HTML escaping
+# - "**" carries no HTML-special characters, so escaping first stays safe.
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+
+
+def escape_with_markdown_bold(text: str) -> str:
+    """Escape ``text`` for rich-text display, rendering ``**bold**`` as ``<b>``
+    instead of leaving the asterisks visible."""
+    return _MD_BOLD_RE.sub(r"<b>\1</b>", html_escape.escape(text))
+
+
 def _section_title_for(line: str):
     """Return the display title if ``line`` is a known summary section header."""
     if len(line) > 80:
@@ -898,8 +931,10 @@ def parse_summary_sections(text: str):
     """Split raw summary text into ``[(title, body), ...]`` using the numbered
     section headers the summarization templates produce.
 
-    Falls back to a single ``("Summary", text)`` section when no known header is
-    found, so legacy or off-template content is still shown in full.
+    Text before the first recognized header is the model's lead-in ("Here's a
+    comprehensive summary of the meeting:") and is dropped. Falls back to a
+    single ``("Summary", text)`` section when no known header is found at all,
+    so legacy or off-template content is still shown in full.
     """
     text = (text or "").strip()
     if not text:
@@ -910,12 +945,9 @@ def parse_summary_sections(text: str):
     buffer = []
 
     def flush():
-        body = "\n".join(buffer).strip()
         if current_title is None:
-            if body:
-                sections.append(("Summary", body))
-        else:
-            sections.append((current_title, body))
+            return
+        sections.append((current_title, "\n".join(buffer).strip()))
 
     for line in text.splitlines():
         title = _section_title_for(line)
@@ -970,7 +1002,7 @@ def format_summary_body_html(body: str) -> str:
         pending = None
         text = " ".join(part.strip() for part in lines).strip()
         if text:
-            parts.append(template.format(html_escape.escape(text)))
+            parts.append(template.format(escape_with_markdown_bold(text)))
 
     for raw in body.splitlines():
         line = raw.strip()
@@ -1144,7 +1176,9 @@ class PixelCollapsibleSection(QWidget):
         self.body_label = QLabel(format_summary_body_html(body))
         self.body_label.setTextFormat(Qt.RichText)
         self.body_label.setWordWrap(True)
-        self.body_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # Paragraphs read left-aligned; the block as a whole sits centred in the
+        # body card, matching how PixelBubble centres its text.
+        self.body_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.body_label.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse
         )
@@ -1153,6 +1187,7 @@ class PixelCollapsibleSection(QWidget):
         body_layout.setContentsMargins(16, 12, 16, 12)
         body_layout.setSpacing(0)
         body_layout.addWidget(self.body_label)
+        body_layout.setAlignment(self.body_label, Qt.AlignVCenter)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

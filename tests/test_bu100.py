@@ -21,8 +21,10 @@ _CONSTANTS = {
     "_NUMBERED_LINE_RE",
     "_BULLET_LINE_RE",
     "_FIELD_LINE_RE",
+    "_MD_BOLD_RE",
 }
 _FUNCTIONS = {
+    "escape_with_markdown_bold",
     "_section_title_for",
     "parse_summary_sections",
     "count_summary_items",
@@ -127,11 +129,12 @@ def test_unknown_content_falls_back_to_one_section_losing_nothing():
     assert parse_summary_sections(text) == [("Summary", text)]
 
 
-def test_leading_text_before_the_first_header_is_kept():
-    text = "Preamble line.\n\n2. Key Points\n1. A point."
+def test_model_lead_in_before_the_first_header_is_dropped():
+    # "Here's a comprehensive summary of the meeting:" is chatter, not content.
+    text = "Here's a comprehensive summary of the meeting:\n\n2. Key Points\n1. A point."
     sections = parse_summary_sections(text)
-    assert sections[0] == ("Summary", "Preamble line.")
-    assert sections[1][0] == "Key Points"
+    assert [t for t, _ in sections] == ["Key Points"]
+    assert "comprehensive summary" not in sections[0][1]
 
 
 def test_empty_summary_yields_no_sections():
@@ -177,3 +180,22 @@ def test_format_separates_action_item_cards():
 
 def test_format_blank_body_reads_as_not_specified():
     assert "Not specified" in format_summary_body_html("")
+
+
+def test_format_renders_markdown_bold():
+    out = format_summary_body_html("The **budget** was approved.")
+    assert "<b>budget</b>" in out
+    assert "**" not in out
+
+
+def test_format_bold_survives_escaping_and_reflow():
+    # Escaping runs first, so a bold span carrying HTML-special characters is
+    # still escaped; and a span split across the model's hard wrap still closes.
+    out = format_summary_body_html("Owner is **A & B**.\nThe **second\nline** counts.")
+    assert "<b>A &amp; B</b>" in out
+    assert "<b>second line</b>" in out
+
+
+def test_format_leaves_unpaired_asterisks_alone():
+    out = format_summary_body_html("A 2**3 calculation.")
+    assert "<b>" not in out
