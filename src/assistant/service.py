@@ -437,6 +437,14 @@ class AssistantAnswerService:
         """
         self._declined_offers.setdefault(conversation_id, set()).add(session_id)
 
+    def forget_conversation(self, conversation_id: Optional[int]) -> None:
+        """Drop every in-memory reference to a deleted conversation (BU096).
+
+        Called after ``db.delete_conversation`` so a recycled conversation id
+        cannot inherit stale state. No DB access; a no-op for an unknown id.
+        """
+        self._declined_offers.pop(conversation_id, None)
+
     def _get_agent_config(self, agent_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Get agent configuration by ID."""
         if agent_id is None:

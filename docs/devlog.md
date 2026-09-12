@@ -1187,3 +1187,335 @@ Changes:
 
 Tests:
 - None (UI-only; no Qt window harness). `python -m py_compile src/app/window.py` -> OK.
+
+### BU096 - Delete past conversation from the sidebar (right-click)
+
+Summary:
+Added a way to permanently delete an assistant chat thread from the UI. The
+"PAST CONVERSATIONS" sidebar list had no context menu and no delete path at all;
+now right-click -> "Delete" -> confirm removes the conversation and every trace
+of it. Scope is the assistant `assistant_conversations` / `assistant_messages`
+threads, not meeting sessions (those already had `_delete_session`).
+
+Changes:
+- `src/app/window.py`: `conversations_list` gains `Qt.CustomContextMenu` +
+  `customContextMenuRequested` -> `_show_conversation_context_menu` (one "Delete"
+  action). `_delete_conversation(item)`: `QMessageBox.question` confirm (default
+  No) -> `db.delete_conversation(conv_id)` -> `assistant_service.forget_conversation`
+  (hasattr + try guarded) -> if the deleted id is `_current_conversation_id`,
+  `_on_new_chat_clicked()` blanks the main + detached views and resets the id ->
+  `_load_past_conversations()` + "Conversation deleted." status. DB failure ->
+  `logger.error` + `QMessageBox.warning`, no partial state.
+- `src/assistant/service.py`: new `forget_conversation(conversation_id)` ->
+  `self._declined_offers.pop(conversation_id, None)`. No DB access; no-op for an
+  unknown / None id. Single hook for any future per-conversation in-memory cache.
+- `src/storage/database.py`: `delete_conversation` docstring now documents the
+  messages->conversation transaction order and the unknown-id no-op. No
+  behaviour change.
+- Conversations are not RAG-indexed (no conversation `source_type` in
+  `rag_documents`), so "any trace" is just the two tables + the service's
+  in-memory declines. Past Conversations modal and Search Chats re-query
+  `list_conversations()` on open, so they needed no change.
+
+Tests (`tests/test_bu096.py`, 4 tests, DB-level - no Qt harness):
+- delete cascades to `assistant_messages` (direct COUNT query) and the row is
+  gone from `list_conversations()`;
+- second delete of the same id, and delete of an unknown id, are silent no-ops;
+- deleting one conversation leaves a sibling's rows and message order intact;
+- `forget_conversation` drops the `_declined_offers` entry and is a no-op for an
+  unknown / None id.
+
+Validation:
+- `python -m pytest tests/test_bu096.py -q` -> 4 passed.
+- `tests/test_scope_offer.py` -> 12 passed; `tests/test_assistant_service.py` ->
+  55 passed, same 5 pre-existing `dotenv` failures as BU092/BU095.
+- `python -m py_compile src/app/window.py src/assistant/service.py
+  src/storage/database.py` -> ok.
+- PySide6 not installed here; the menu/dialog path needs a manual run.
+
+### BU096 follow-up - right-click "Delete" menu respects the pixel theme
+
+`_show_conversation_context_menu` created a bare `QMenu()` that rendered with the
+OS default look. It now parents the menu to `conversations_list` and applies the
+existing `_ALL_SESSIONS_MENU_QSS` (dark-blue ground, gold `#FFF0BF` text,
+`#3E6B9B` border/selection, Courier New) - the same QSS the "All Sessions"
+context menu already uses. `py_compile src/app/window.py` -> OK.
+
+## BU097 - Keyword search for transcripts and conversations
+
+The sidebar **Search Chats** button now opens a real "Search" dialog instead of
+jumping focus to the session-name autocomplete.
+
+DB layer (`src/storage/database.py`):
+- `Database._like_terms(query)` - splits a query on whitespace and turns each
+  term into a literal `LIKE` pattern, escaping `\ % _` (used with
+  `ESCAPE '\'`). Empty / whitespace-only query -> `[]`.
+- `search_transcripts` rewritten to AND-match every term against `t.text`
+  (`LIKE ? ESCAPE '\'` chain), keeping the optional `session_id` filter, the
+  `session_name` join, `ORDER BY t.timestamp DESC LIMIT ?` and the `dict(row)`
+  shape. A single-word query collapses to one `LIKE`, so `assistant/tools.py`
+  and `assistant/service.py` callers are unaffected. Empty query is a no-op.
+- New `search_conversations(query, limit=20)` - a conversation matches when
+  every term appears in the union of its `title` and its messages' `content`
+  (`title LIKE ? OR EXISTS(assistant_messages ...)` per term, AND-ed). Returns
+  each conversation once as its row dict plus `match_count` (messages matching
+  any term) and `snippet` (first matching message trimmed to ~160 chars, else
+  title, else `""`). `ORDER BY c.updated_at DESC LIMIT ?`, parameterized.
+
+UI (`src/app/window.py`):
+- `_open_search_dialog()` - `QDialog` (~640x520) with a keyword `QLineEdit`, a
+  `QTabWidget` (Transcripts / Conversations), a Search button and a per-tab
+  results `QListWidget`. Search runs on Return / button / tab-change (when a
+  query is present); no live search. Empty query -> "Type keywords and press
+  Enter"; no rows -> "No matches." (both non-selectable). Every DB call is
+  wrapped -> `logger.error` + `QMessageBox.warning`, dialog stays open.
+- `itemActivated`: transcript row closes the dialog, calls the extracted
+  `_select_session_by_id(session_id)` and sets the scope combo to Specific
+  Session; conversation row closes the dialog, calls the extracted
+  `_load_conversation(conv_id)` and selects the matching `conversations_list`
+  row if present.
+- `_on_conversation_selected` is now a thin wrapper over `_load_conversation`;
+  `_on_session_completer_selected` is a thin wrapper over
+  `_select_session_by_id`. `session_search_input` / `_session_completer` /
+  `_refresh_session_completer` behaviour is otherwise untouched.
+
+Validation:
+- `python -m pytest tests/test_bu097.py -q` -> 11 passed (multi-keyword AND,
+  term-order independence, empty/whitespace no-op, `session_id` scoping,
+  `timestamp DESC`, `limit`, wildcard/quote/injection literal-match; conversation
+  message + title match, dedupe with `match_count == 3`, two-term union AND,
+  unknown keyword -> `[]`, `updated_at DESC`, limit, injection).
+- `tests/test_database_search.py` + `tests/test_assistant_tools.py` -> pass;
+  `tests/test_assistant_service.py` -> same pre-existing `dotenv` failures only.
+- PySide6 not installed here; the dialog path needs a manual run.
+
+## BU098 - Active Pane Focus Model
+
+The three top-level shells (left sidebar / center workspace / right transcripts)
+are now one mutually-exclusive set of "focusable panes". The active pane draws a
+brighter pixel-cut border; focus follows both the mouse and the keyboard.
+
+- `src/app/pixel_widgets.py`: `PixelPanel` gains `_active` (default `False`),
+  `set_active(value)` (repaints only on a real change), a `clicked = Signal()`
+  class attribute, and a `mousePressEvent` that emits `clicked` on
+  `Qt.LeftButton` then calls `super()` (never accepts the event - children still
+  get their clicks, and a click that reaches the panel is a background click).
+  `paintEvent` swaps the pen to new palette constant
+  `BORDER_BLUE_ACTIVE = #4A78D8` at `pen_width = 3` when `_active and not inner`;
+  fill and cut geometry unchanged, inactive/inner path byte-for-byte as before.
+  No timers, no animation.
+- `src/app/window.py`: `PaneFocusController` - pure, no Qt. Holds `active:
+  str | None` and `PANES = ("left","center","right")`; `set_active(name)`
+  returns the set of pane names whose active-ness changed (`{new}` from empty,
+  `{old,new}` on a switch, `set()` when invalid or already active). This is the
+  unit-tested core. `resolve_pane_for_widget(widget, shells)` walks
+  `widget.parent()` upward to the first shell in `shells` (name -> widget),
+  returning the pane name or `None`.
+- `MainWindow._wire_pane_focus()` (called at the end of `_create_central_widget`)
+  builds `self._panes`, one `PaneFocusController`, connects each shell's
+  `clicked` -> `_set_active_pane(name)`, connects
+  `QApplication.instance().focusChanged` -> `_on_global_focus_changed`, and sets
+  the startup active pane to `"center"`. `_set_active_pane(name)` asks the
+  controller and pushes `set_active(...)` into each changed `PixelPanel`.
+  `_active_pane` is a read-through `@property` over `_pane_focus.active`.
+  `_on_global_focus_changed(old, now)` guards `now is None`, resolves the pane
+  for `now`, and activates it - so tabbing into a child keeps the visual active
+  pane in sync for BU099's `Ctrl+F`.
+- Inner `PixelPanel`s (history panel, transcript viewport, candidate box) are
+  never in `_panes` and their paint path is unchanged. Detached windows are out
+  of scope.
+
+Validation:
+- `python -m pytest tests/test_bu098.py -q` -> 6 passed. PySide6 is not
+  importable in this env, so the tests extract `PaneFocusController` /
+  `resolve_pane_for_widget` from `window.py` via `ast` and exec them in
+  isolation (the real definitions, no Qt). Cases: set-from-empty, switch returns
+  `{old,new}`, re-select -> `set()`, invalid name -> `set()` + unchanged
+  `active`, parent-chain resolves to the right shell, unparented -> `None`.
+- `python -m py_compile src/app/window.py src/app/pixel_widgets.py` -> OK.
+- The click / `focusChanged` wiring and the brighter border need a manual run
+  (no Qt here).
+
+## BU099 - In-Pane Find Bar (Ctrl+F) With Match Navigation
+
+`Ctrl+F` opens a small pixel-styled find bar at the top-right of the active pane
+(BU098). Keyword field + `current / total` counter + ▲/▼; `Esc` closes. The
+corpus depends on the active pane: left = the PAST CONVERSATIONS list
+(title+message search via `db.search_conversations`, BU097; ▲/▼ step matching
+conversations in the sidebar, `Return` loads the current one via
+`_load_conversation`), center = the loaded assistant conversation bubbles,
+right = the transcript stream bubbles (both find-in-view, no DB). Keywords are
+whitespace-split, AND-matched, case-insensitive - identical to BU097.
+
+- `src/app/pixel_widgets.py`:
+  - `PixelBubble` gains `_highlighted` + `set_highlighted(value)`; when set,
+    `paintEvent` draws the border with `CREAM_BORDER` at 3px regardless of
+    variant (fill unchanged). `bubble_of_row(row)` returns the `PixelBubble`
+    inside an `aligned_bubble` row (via `findChild`).
+  - `PixelFindBar(QWidget)` - dumb UI, ~330x46, pixel-cut `NAVY` background,
+    Courier New. Cream `QLineEdit` ("Find…"), a `0 / 0` `QLabel`, two
+    `QToolButton` ▲/▼. Signals: `query_changed(str)` (debounced ~150 ms via a
+    single-shot `QTimer` on `textChanged`), `next_match()`, `prev_match()`,
+    `return_pressed()`, `closed()`. An event filter on the field maps `Esc` ->
+    `closed`, `Return` -> `return_pressed`, `Shift+Return` -> `prev_match`.
+    `set_match_count(cur, total)` updates the label (`0 / 0` when total 0) and
+    enables/disables ▲/▼. `focus_field()` focuses + selects all.
+- `src/app/window.py`:
+  - `FindController` - Qt-free / DB-free match engine. Takes three injected
+    callables (`search_conversations(terms) -> list[int]`, `list_center_texts`,
+    `list_right_texts`). `parse_terms` (split/lower/drop-empty); `set_mode` /
+    `set_query` recompute `self.matches` (row indices for center/right, conv ids
+    for left) and reset `self.cursor` to 0 / -1; `next`/`prev` wrap;
+    `match_label()` -> `(cursor+1, len)` or `(0, 0)`. Shared rule: a row matches
+    when every term is a case-insensitive substring of its text. This is the
+    unit-tested core.
+  - `MainWindow._wire_find_bar()` (end of `_create_central_widget`, after
+    `_wire_pane_focus`): one hidden `PixelFindBar`, one `FindController` with the
+    three adapters. `_find_search_conversations` wraps
+    `db.search_conversations(" ".join(terms), limit=200)` in try/except ->
+    `logger.error` + `[]`. `_find_center_texts` reads each `_answer_layout`
+    row's `message_text` property; `_find_right_texts` reads a new `find_text`
+    property set in `add_transcription_to_view` (falls back to the bubble label).
+  - `QShortcut(QKeySequence.Find, self)` -> `_open_find_bar()`: reparents the bar
+    onto `self._panes[active]`, `set_mode(active)`, positions top-right (8 px
+    inset), shows/raises/focuses, re-runs the current query. A second `Ctrl+F`
+    over the same pane just re-focuses the field.
+  - `query_changed` -> clear old highlight, `set_query`, apply highlight/select
+    for the new current match, push `set_match_count`. `next_match`/`prev_match`
+    -> step + re-apply. `return_pressed` -> left mode: `_load_conversation` +
+    close; center/right: same as next. Center/right apply =
+    `bubble_of_row(row).set_highlighted(True)` + `ensureWidgetVisible(row, 0,
+    40)`. Left apply = select the `conversations_list` item with matching
+    `Qt.UserRole` and `scrollToItem`.
+  - `closed` / Esc / active-pane-change-under-the-bar -> `_close_find_bar()`:
+    clears the highlight, hides, returns focus to the pane. `_set_active_pane`
+    closes the bar when the new active pane differs from `_find_bar_pane`;
+    `resizeEvent` repositions it while visible; `MainWindow.keyPressEvent`
+    consumes `Esc` for the bar before the scope-clear path.
+  - BU097's Search Chats dialog, `session_search_input` and the detached windows
+    are untouched.
+
+Validation:
+- `python -m pytest tests/test_bu099.py -q` -> 10 passed (term parsing, center
+  single/multi AND + order independence, empty -> `(0,0)`, next/prev wrap +
+  label sequence, right corpus, mode-switch recompute/reset, left conv-id list
+  in order, empty left result, invalid mode ignored, DB-adapter swallows a
+  raising `search_conversations`). The test extracts `FindController` from
+  `window.py` via `ast` and execs it in isolation (no Qt in this env).
+- `python -m py_compile src/app/window.py src/app/pixel_widgets.py` -> OK;
+  BU096/097/098 tests still green.
+- The bar UI, highlight/scroll and focus-driven auto-close need a manual run.
+
+### BU099 follow-up - find bar fit
+
+The 330 px bar overflowed the left sidebar (250-278 px) and the transcripts
+panel (300-340 px). `PixelFindBar` no longer fixes its width (only height 46,
+`preferred_width = 330`); `MainWindow._position_find_bar` clamps it to
+`max(150, min(330, host.width() - 20))` and re-applies on every open / resize,
+so the bar always sits fully inside the active pane with a 10 px inset that
+clears the panel's pixel-cut border and corner.
+
+Second pass: the bar was still shown at its unclamped 330 px because
+`_open_find_bar` called `_position_find_bar()` *before* `show()`, and that
+method early-returns while the bar is not visible - so the clamp never ran on
+open. Fixed by positioning after `show()` / `raise_()`.
+
+### BU099 follow-up - in-text word highlight
+
+The border highlight alone didn't show *which* word matched, so the current
+match's bubble now also highlights the term(s) inside its own text.
+
+- `src/app/pixel_widgets.py`: `highlight_terms_html(text, terms)` - HTML-escapes
+  `text`, then wraps every case-insensitive occurrence of any `terms` substring
+  in a `<span style="background:#F6E0A6; color:#071846;">` chip (new constants
+  `FIND_TERM_BG` / `FIND_TERM_FG`); terms are matched longest-first so a short
+  term (`"cat"`) can't shadow a longer one it's a substring of (`"category"`).
+  `PixelBubble` keeps its original `_text`, gains `_match_terms` and
+  `set_match_terms(terms)`: switches the label to `Qt.RichText` with the
+  highlighted HTML, or back to `Qt.PlainText` with the original string when
+  `terms` is empty.
+- `src/app/window.py`: `_apply_find_current` calls
+  `bubble.set_match_terms(FindController.parse_terms(self._find.query))`
+  alongside `set_highlighted(True)`; `_clear_find_highlight` clears both
+  (`set_highlighted(False)` + `set_match_terms([])`) before the highlight moves
+  to the next match or the bar closes. Left mode (sidebar list) is unaffected -
+  no bubble text to highlight there.
+
+Validation: `python -m pytest tests/test_bu099.py -q` -> 15 passed (5 new cases
+for `highlight_terms_html`: case-insensitive wrap, multiple terms, HTML
+escaping of untrusted bubble text, no-terms passthrough, longest-term-first
+shadowing). Extracted via the same `ast` isolation as `FindController` (no
+PySide6 in this env). `py_compile` on both files -> OK.
+
+### BU099 follow-up - transcripts highlight invisible (cream-on-cream)
+
+Reported: word highlight worked in chat but not in the transcripts panel.
+Root cause: the highlight chip used a single hardcoded color pair
+(`background:#F6E0A6`) which is the *exact same* color as `CREAM`, the fill of
+"cream"-variant bubbles (System transcript lines, and user chat bubbles). The
+chip was rendering correctly - it was just invisible against a same-colored
+bubble. Blue-variant bubbles (assistant replies, Mic lines) never showed the
+bug because their fill (`BUBBLE_BLUE`) differs from the chip color, so chat
+looked "working" while it was really only the assistant-bubble half of it.
+
+Fix: `highlight_terms_html(text, terms, bg, fg)` now takes the chip colors as
+parameters instead of hardcoding them. `PixelBubble.set_match_terms` picks the
+pair that contrasts with its *own* `variant` - `FIND_TERM_ON_CREAM` (dark blue
+chip, light text) for cream-fill bubbles, `FIND_TERM_ON_BLUE` (bright cream
+chip, dark text) for blue-fill bubbles - so the chip is always visible
+regardless of which bubble (chat or transcript, either role/source) it lands
+on. Also dropped an unused `self._text` left over from the initial pass; the
+bubble's real body is `self._body_text` (post the scope-footer split).
+
+Validation: `python -m pytest tests/test_bu099.py -q` -> 16 passed (added a
+case asserting the two contrast pairs are honored and don't bleed into each
+other). `py_compile` on both files -> OK.
+
+### BU100 - Collapsible sectioned summary view
+
+The summary window was three near-identical `QDialog` bodies in `window.py`
+(`_show_session_summary`, `_show_summary_by_session_id`,
+`_on_view_summary_icon_clicked`), each doing
+`QTextBrowser.setPlainText(summary_content)` - an unstyled wall of text, no
+structure, and a gray `color: gray` info label that ignored the app theme.
+Meanwhile the stored content already *has* structure: `templates.py` (FULL and
+GENERAL_TRANSCRIPT) asks the model for numbered sections - Overview, Key
+Points, Action Items, Decisions, Next Steps / Open Questions.
+
+So the split is free; it just was never parsed. `parse_summary_sections` keys
+off a table of known section names (with aliases and markdown decoration
+stripped) rather than "any numbered line", because summaries are *full of*
+numbered lines - a key point reading "1. Decisions were deferred." would
+otherwise tear the section in half. Unknown content degrades to a single
+`Summary` section instead of disappearing. `format_summary_body_html` renders
+each body into Qt's rich-text subset, and reflows the model's hard line wraps:
+a plain line continues the open entry, a blank line closes it. Without that,
+every wrapped sentence rendered as its own paragraph with a gap in the middle.
+
+`PixelCollapsibleSection` is the widget - a clickable pixel header (chevron,
+title, cream count chip) over a `PixelPanel(inner=True)` body card. It sizes to
+its content so the sections scroll as one page; nesting a `QTextBrowser` per
+section would have given every section its own scrollbar.
+
+Two things worth remembering:
+
+- **Stylesheet font-size beats `setFont`.** The first cut of the zoom control
+  scaled `QFont` objects and appeared to do nothing - only widget *heights*
+  changed. `app_qss()` declares `font-family`/`font-size` on `QWidget`, and a
+  stylesheet font property always overrides a programmatic `setFont`. Sizes now
+  go through each widget's own stylesheet (`font-size: Npt`); letter spacing,
+  which QSS can't express, still rides on the `QFont`.
+- **Fixed-size chrome sets the window floor.** The bottom row (Expand all /
+  Collapse all / Close) doesn't scale with the text, so the dialog minimum is
+  560x400 - below that the three buttons overlapped.
+
+Validation: `python -m pytest tests/test_bu100.py -q` -> 13 passed (section
+order, per-section bodies, markdown headers, the numbered-line-is-not-a-header
+regression, legacy fallback, preamble, empty input, item counts, HTML escaping,
+prose/entry reflow, action-item rules). Extracted via the same `ast` isolation
+as BU099 (no PySide6 in the test env). Plus a Qt harness run against the real
+`_open_summary_window` body (also `ast`-extracted, driven with `QTest`): header
+click collapses only its own section and re-expands, Expand/Collapse all,
+zoom readout + clamping at both ends, no horizontal scrollbar at minimum width,
+and the empty-summary path still informing instead of opening a dialog - all
+green, with screenshots checked at 560x400, 780x660 and 1200x900.

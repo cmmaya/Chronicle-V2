@@ -89,4 +89,18 @@ Conversation Management — user-requested UI feature
 
 | BU    | Name                                    | Status    | Depends On          | Next  |
 | ---   | ---                                     | ---       | ---                 | ---   |
-| BU096 | Delete Past Conversation From Sidebar (Right-Click) | Pending | none         | none  |
+| BU096 | Delete Past Conversation From Sidebar (Right-Click) | Completed | none       | none  |
+
+Keyword Search — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU097 | Keyword Search For Transcripts And Conversations | Completed | none          | BU098 |
+| BU098 | Active Pane Focus Model                 | Completed | none                | BU099 |
+| BU099 | In-Pane Find Bar (Ctrl+F) With Match Navigation | Completed | BU097, BU098 | none  |
+
+Summary Window Enhancement — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU100 | Collapsible Sectioned Summary View      | Completed | none                | none  |

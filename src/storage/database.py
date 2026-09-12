@@ -848,6 +848,10 @@ class Database:
     def delete_conversation(self, conversation_id: int) -> None:
         """Delete a conversation and all its messages.
 
+        Removes the ``assistant_messages`` rows then the
+        ``assistant_conversations`` row in one transaction. A silent no-op if
+        ``conversation_id`` does not exist (0 rows deleted, no error).
+
         Args:
             conversation_id: ID of the conversation to delete
 
@@ -1053,44 +1057,130 @@ class Database:
 
     # Search Methods (read-only, parameterized queries)
 
+    @staticmethod
+    def _like_terms(query: str) -> List[str]:
+        """Split a search query into whitespace-separated terms and turn each into
+        a literal ``LIKE`` pattern.
+
+        Backslash, ``%`` and ``_`` inside a term are escaped with ``\\`` so the
+        term matches literally instead of as a wildcard; use each pattern with
+        ``LIKE ? ESCAPE '\\'``. Returns ``[]`` for an empty / whitespace-only
+        query so callers can skip the database entirely.
+        """
+        patterns = []
+        for term in query.split():
+            escaped = term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            patterns.append(f'%{escaped}%')
+        return patterns
+
     def search_transcripts(self, query: str, limit: int = 10, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Search transcripts by text content using parameterized LIKE queries.
 
+        The query is split on whitespace into terms which are AND-matched: a
+        transcript is returned only if its ``text`` contains every term
+        (case-insensitive). ``%``, ``_`` and ``\\`` in a term are escaped so they
+        match literally. An empty / whitespace-only query returns ``[]`` without
+        touching the database. A single-word query collapses to one ``LIKE``.
+
         Args:
-            query: Search term to match against transcript text
+            query: One or more space-separated keywords to match against transcript text
             limit: Maximum number of results to return
             session_id: Optional session ID to limit search to a specific session
 
         Returns:
-            List of transcript dictionaries with session metadata, sorted by timestamp
+            List of transcript dictionaries with session metadata, sorted by timestamp DESC
 
         Raises:
             DatabaseError: If search fails
         """
+        patterns = self._like_terms(query)
+        if not patterns:
+            return []
         try:
             cursor = self.connection.cursor()
-            search_pattern = f'%{query}%'
+            text_conditions = ' AND '.join("t.text LIKE ? ESCAPE '\\'" for _ in patterns)
             if session_id is not None:
-                cursor.execute('''
-                    SELECT t.*, s.name as session_name
-                    FROM transcripts t
-                    JOIN sessions s ON t.session_id = s.id
-                    WHERE t.session_id = ? AND t.text LIKE ?
-                    ORDER BY t.timestamp DESC
-                    LIMIT ?
-                ''', (session_id, search_pattern, limit))
+                where = f't.session_id = ? AND {text_conditions}'
+                params = [session_id, *patterns, limit]
             else:
-                cursor.execute('''
-                    SELECT t.*, s.name as session_name
-                    FROM transcripts t
-                    JOIN sessions s ON t.session_id = s.id
-                    WHERE t.text LIKE ?
-                    ORDER BY t.timestamp DESC
-                    LIMIT ?
-                ''', (search_pattern, limit))
+                where = text_conditions
+                params = [*patterns, limit]
+            cursor.execute(f'''
+                SELECT t.*, s.name as session_name
+                FROM transcripts t
+                JOIN sessions s ON t.session_id = s.id
+                WHERE {where}
+                ORDER BY t.timestamp DESC
+                LIMIT ?
+            ''', params)
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'Transcript search failed: {str(e)}')
+
+    def search_conversations(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Search assistant conversations by keyword across title and message content.
+
+        The query is split on whitespace into terms which are AND-matched: a
+        conversation is returned only when every term appears somewhere in the
+        union of its ``title`` and its messages' ``content`` (case-insensitive;
+        ``%``, ``_`` and ``\\`` escaped to match literally). Each conversation
+        appears exactly once regardless of how many of its messages match. An
+        empty / whitespace-only query returns ``[]`` without touching the database.
+
+        Args:
+            query: One or more space-separated keywords
+            limit: Maximum number of conversations to return
+
+        Returns:
+            List of ``assistant_conversations`` row dicts, each with two extra
+            keys: ``match_count`` (number of the conversation's messages matching
+            any term) and ``snippet`` (first matching message content trimmed to
+            ~160 chars, falling back to the title or ``""``). Sorted by
+            ``updated_at`` DESC.
+
+        Raises:
+            DatabaseError: If search fails
+        """
+        patterns = self._like_terms(query)
+        if not patterns:
+            return []
+        try:
+            cursor = self.connection.cursor()
+            term_clause = ' AND '.join(
+                "(c.title LIKE ? ESCAPE '\\' OR EXISTS ("
+                "SELECT 1 FROM assistant_messages m "
+                "WHERE m.conversation_id = c.id AND m.content LIKE ? ESCAPE '\\'))"
+                for _ in patterns
+            )
+            match_params = []
+            for pattern in patterns:
+                match_params.extend((pattern, pattern))
+            cursor.execute(f'''
+                SELECT c.* FROM assistant_conversations c
+                WHERE {term_clause}
+                ORDER BY c.updated_at DESC
+                LIMIT ?
+            ''', (*match_params, limit))
+            conversations = [dict(row) for row in cursor.fetchall()]
+
+            any_term = ' OR '.join("content LIKE ? ESCAPE '\\'" for _ in patterns)
+            results = []
+            for conv in conversations:
+                cursor.execute(f'''
+                    SELECT content FROM assistant_messages
+                    WHERE conversation_id = ? AND ({any_term})
+                    ORDER BY timestamp ASC, id ASC
+                ''', (conv['id'], *patterns))
+                matches = [row['content'] for row in cursor.fetchall()]
+                conv['match_count'] = len(matches)
+                snippet = (matches[0] if matches else (conv.get('title') or '')).strip()
+                if len(snippet) > 160:
+                    snippet = snippet[:160].rstrip() + '…'
+                conv['snippet'] = snippet
+                results.append(conv)
+            return results
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Conversation search failed: {str(e)}')
 
     def search_summaries(self, query: str, limit: int = 10, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Search summaries by content using parameterized LIKE queries.

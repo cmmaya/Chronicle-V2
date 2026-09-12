@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QHeaderView, QComboBox, QDialog, QTextBrowser, QScrollArea, 
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
-                                QToolButton, QToolBar, QBoxLayout, QSizePolicy, QInputDialog)
+                                QToolButton, QToolBar, QBoxLayout, QSizePolicy, QInputDialog,
+                                QTabWidget)
 from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint
 from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence, QFont
 from typing import Optional
@@ -15,7 +16,8 @@ from .session_manager import SessionManager
 from .pixel_theme import app_qss, asset_path
 from .pixel_widgets import (
     PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, PixelScopePrompt,
-    aligned_bubble, NAVY_INNER,
+    PixelFindBar, PixelCollapsibleSection, aligned_bubble, bubble_of_row, NAVY_INNER,
+    parse_summary_sections, pixel_mini_button,
 )
 from .session import Session
 from ..summarization import SummaryGenerator
@@ -203,9 +205,131 @@ class RagBackfillThread(QThread):
             self.error_signal.emit(str(e))
 
 
+class PaneFocusController:
+    """Pure focus-state core for the three top-level panes.
+
+    Tracks which of ``("left", "center", "right")`` is the active pane. No Qt,
+    no widget access - ``MainWindow`` owns one and translates the returned
+    change-set into ``PixelPanel.set_active`` calls.
+    """
+
+    PANES = ("left", "center", "right")
+
+    def __init__(self):
+        self.active: Optional[str] = None
+
+    def set_active(self, name: str) -> set:
+        """Make ``name`` the active pane.
+
+        Returns the set of pane names whose active-ness changed: ``{old, new}``
+        on a real switch, ``{new}`` from empty, or an empty set when the name is
+        invalid or already active.
+        """
+        if name not in self.PANES or name == self.active:
+            return set()
+        changed = {name}
+        if self.active is not None:
+            changed.add(self.active)
+        self.active = name
+        return changed
+
+
+def resolve_pane_for_widget(widget, shells: dict) -> Optional[str]:
+    """Walk ``widget``'s parent chain until it reaches one of ``shells``' values.
+
+    ``shells`` maps pane name -> shell widget. Returns the matching pane name or
+    ``None`` if the widget is unparented / outside all shells.
+    """
+    node = widget
+    while node is not None:
+        for name, shell in shells.items():
+            if node is shell:
+                return name
+        node = node.parent()
+    return None
+
+
+class FindController:
+    """Qt-free / DB-free match engine for the in-pane find bar (BU099).
+
+    ``MainWindow`` injects three callables that surface the searchable corpus:
+    ``search_conversations(terms) -> list[int]`` (left mode), and
+    ``list_center_texts()`` / ``list_right_texts()`` returning the per-row text
+    in display order (center / right modes). Matching rule, shared by every
+    mode: a row matches when *every* term is a case-insensitive substring of it.
+    """
+
+    MODES = ("left", "center", "right")
+
+    def __init__(self, search_conversations, list_center_texts, list_right_texts):
+        self._search_conversations = search_conversations
+        self._list_center_texts = list_center_texts
+        self._list_right_texts = list_right_texts
+        self.mode = "center"
+        self.query = ""
+        self.matches = []
+        self.cursor = -1
+
+    @staticmethod
+    def parse_terms(query):
+        return [t for t in (query or "").lower().split() if t]
+
+    def _recompute(self):
+        terms = self.parse_terms(self.query)
+        if not terms:
+            self.matches = []
+        elif self.mode == "left":
+            self.matches = list(self._search_conversations(terms))
+        else:
+            texts = (
+                self._list_center_texts()
+                if self.mode == "center"
+                else self._list_right_texts()
+            )
+            self.matches = [
+                i for i, text in enumerate(texts)
+                if all(term in (text or "").lower() for term in terms)
+            ]
+        self.cursor = 0 if self.matches else -1
+
+    def set_mode(self, mode):
+        if mode in self.MODES:
+            self.mode = mode
+            self._recompute()
+
+    def set_query(self, query):
+        self.query = query
+        self._recompute()
+
+    def current(self):
+        if 0 <= self.cursor < len(self.matches):
+            return self.matches[self.cursor]
+        return None
+
+    def next(self):
+        if not self.matches:
+            return None
+        self.cursor = (self.cursor + 1) % len(self.matches)
+        return self.current()
+
+    def prev(self):
+        if not self.matches:
+            return None
+        self.cursor = (self.cursor - 1) % len(self.matches)
+        return self.current()
+
+    def match_label(self):
+        if not self.matches:
+            return (0, 0)
+        return (self.cursor + 1, len(self.matches))
+
+
 class MainWindow(QMainWindow):
     """Main application window with session controls."""
-    
+
+    # Text-scale presets for the summary window (BU100); index 1 is 100%.
+    SUMMARY_SCALES = (0.85, 1.0, 1.2, 1.45, 1.75)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Chronicle')
@@ -291,10 +415,19 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         """Handle key press events."""
         if event.key() == Qt.Key_Escape:
+            # A visible find bar consumes Esc first (BU099).
+            if getattr(self, "_find_bar", None) and self._find_bar.isVisible():
+                self._close_find_bar()
+                return
             # Clear scope when ESC is pressed
             self._clear_scope()
         else:
             super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "_find_bar", None) and self._find_bar.isVisible():
+            self._position_find_bar()
     
     def _clear_scope(self):
         """Clear the current scope and reset to default state."""
@@ -526,7 +659,10 @@ class MainWindow(QMainWindow):
         conv_id = item.data(Qt.UserRole)
         if conv_id is None:
             return
-        
+        self._load_conversation(conv_id)
+
+    def _load_conversation(self, conv_id):
+        """Load a past conversation into the assistant panel by its id."""
         # Load this conversation in the assistant panel
         # First, get the conversation messages
         try:
@@ -561,6 +697,65 @@ class MainWindow(QMainWindow):
             logger.error(f"Failed to load conversation: {str(e)}")
             self._on_status_update(f"Error loading conversation: {str(e)}", is_error=True)
     
+    def _show_conversation_context_menu(self, position):
+        """Show a right-click menu for a past-conversation sidebar item."""
+        item = self.conversations_list.itemAt(position)
+        if item is None:
+            return
+
+        menu = QMenu(self.conversations_list)
+        menu.setStyleSheet(self._ALL_SESSIONS_MENU_QSS)
+        delete_action = menu.addAction("Delete")
+
+        chosen_action = menu.exec(self.conversations_list.mapToGlobal(position))
+        if chosen_action == delete_action:
+            self._delete_conversation(item)
+
+    def _delete_conversation(self, item):
+        """Permanently delete a past conversation and every trace of it."""
+        conv_id = item.data(Qt.UserRole)
+        if conv_id is None:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            'Delete Conversation',
+            "Permanently delete this conversation? This removes it and all its "
+            "messages from the database and cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self.session_manager.db.delete_conversation(conv_id)
+
+            # Drop any in-memory references the answer service holds.
+            service = getattr(self, 'assistant_service', None)
+            if service is not None and hasattr(service, 'forget_conversation'):
+                try:
+                    service.forget_conversation(conv_id)
+                except Exception:
+                    logger.warning(
+                        f"forget_conversation({conv_id}) failed", exc_info=True
+                    )
+
+            # If the deleted conversation is the one on screen, reset the panel.
+            if self._current_conversation_id == conv_id:
+                self._on_new_chat_clicked()
+
+            self._load_past_conversations()
+            logger.info(f"Deleted conversation {conv_id}")
+            self._on_status_update("Conversation deleted.")
+
+        except Exception as e:
+            logger.error(f"Failed to delete conversation {conv_id}: {str(e)}")
+            QMessageBox.warning(
+                self, 'Delete Failed',
+                f"Could not delete the conversation: {str(e)}"
+            )
+
     def _on_session_name_changed(self, row, column):
         """Handle the renaming of a session."""
         if column != 0:
@@ -845,76 +1040,177 @@ class MainWindow(QMainWindow):
         """Handle double-click on a session row to view summary."""
         self._show_session_summary(row)
     
-    def _show_session_summary(self, row):
-        """Show the summary for a session in a separate window."""
+    def _open_summary_window(self, session_id: int, session_name: str) -> bool:
+        """Open the summary for a session as a collapsible, scalable view (BU100).
+
+        Every entry point into the summary window goes through here. Returns
+        False (after informing the user) when the session has no summary.
+        """
         try:
-            session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
-            session_name = self.sessions_list.item(row, 0).text()
-            summary_status = self.sessions_list.item(row, 2).text()
-            
-            if session_id is None:
-                return
-            
-            # Check if session has a summary
-            if summary_status != 'summarized':
+            summaries = self.session_manager.db.get_summaries(session_id)
+
+            if not summaries:
                 QMessageBox.information(
                     self,
                     'No Summary',
                     f"Session '{session_name}' does not have a summary yet.\n\n"
                     "Please transcribe and summarize the session first."
                 )
-                return
-            
-            # Fetch summary from database
-            summaries = self.session_manager.db.get_summaries(session_id)
-            
-            if not summaries:
-                QMessageBox.warning(
-                    self,
-                    'No Summary',
-                    f"No summary found for session '{session_name}'."
-                )
-                return
-            
-            # Get the first summary (or most recent)
+                return False
+
+            # Oldest-first ordering from the database; index 0 is the summary
+            # the previous plain-text view showed.
             summary = summaries[0]
             summary_content = summary.get('content', '')
             summary_type = summary.get('summary_type', 'full')
             model_used = summary.get('model_used', 'unknown')
-            
-            # Create a dialog to display the summary
+            created_at = summary.get('created_at')
+
             dialog = QDialog(self)
             dialog.setWindowTitle(f"Summary - {session_name}")
-            dialog.setMinimumSize(600, 400)
-            
-            layout = QVBoxLayout(dialog)
-            
-            # Header with session info
-            header_label = QLabel(f"Session: {session_name}")
-            header_font = header_label.font()
-            header_font.setPointSize(14)
-            header_font.setBold(True)
-            header_label.setFont(header_font)
-            layout.addWidget(header_label)
-            
-            # Summary type and model info
-            info_label = QLabel(f"Type: {summary_type} | Model: {model_used}")
-            info_label.setStyleSheet("color: gray;")
-            layout.addWidget(info_label)
-            
-            # Summary content
-            text_browser = QTextBrowser()
-            text_browser.setPlainText(summary_content)
-            text_browser.setOpenExternalLinks(True)
-            layout.addWidget(text_browser)
-            
-            # Close button
-            close_button = QPushButton("Close")
+            dialog.setStyleSheet("QDialog { background: #061946; }")
+            dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+            dialog.setSizeGripEnabled(True)
+            # Floor is set by the bottom control row, which keeps a fixed size
+            # at every text scale.
+            dialog.setMinimumSize(560, 400)
+            dialog.resize(getattr(self, '_summary_window_size', None) or QSize(780, 660))
+
+            outer = QVBoxLayout(dialog)
+            outer.setContentsMargins(0, 0, 0, 0)
+            panel = PixelPanel()
+            outer.addWidget(panel)
+
+            layout = QVBoxLayout(panel)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(10)
+
+            # Title row: heading on the left, text-scale stepper on the right.
+            title_row = QHBoxLayout()
+            title_row.setSpacing(8)
+            title_row.addWidget(PixelSectionTitle("SESSION SUMMARY"), 1)
+            zoom_out_button = pixel_mini_button("A-", "Smaller text (Ctrl+-)")
+            zoom_label = QLabel("100%")
+            zoom_label.setAlignment(Qt.AlignCenter)
+            zoom_label.setFixedWidth(56)
+            zoom_label.setStyleSheet("QLabel { color: #8EA7D8; background: transparent; }")
+            zoom_in_button = pixel_mini_button("A+", "Larger text (Ctrl++)")
+            title_row.addWidget(zoom_out_button, 0)
+            title_row.addWidget(zoom_label, 0)
+            title_row.addWidget(zoom_in_button, 0)
+            layout.addLayout(title_row)
+
+            name_label = QLabel(session_name)
+            name_label.setWordWrap(True)
+            name_label.setStyleSheet("QLabel { color: #FFF0BF; background: transparent; }")
+            layout.addWidget(name_label)
+
+            meta_bits = [f"Type: {summary_type}", f"Model: {model_used}"]
+            if created_at:
+                from datetime import datetime
+                meta_bits.append(
+                    datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M')
+                )
+            meta_label = QLabel("   ·   ".join(meta_bits))
+            meta_label.setWordWrap(True)
+            meta_label.setStyleSheet("QLabel { color: #8EA7D8; background: transparent; }")
+            layout.addWidget(meta_label)
+
+            sections_data = parse_summary_sections(summary_content)
+
+            # Scrolling column of collapsible sections.
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 6, 0)
+            container_layout.setSpacing(12)
+
+            sections = []
+            for title, body in sections_data:
+                section = PixelCollapsibleSection(title, body)
+                sections.append(section)
+                container_layout.addWidget(section)
+
+            if not sections:
+                empty_label = QLabel("This summary is empty.")
+                empty_label.setAlignment(Qt.AlignCenter)
+                empty_label.setStyleSheet("QLabel { color: #8EA7D8; background: transparent; }")
+                container_layout.addWidget(empty_label)
+
+            container_layout.addStretch(1)
+            scroll.setWidget(container)
+            layout.addWidget(scroll, 1)
+
+            # Bottom bar: deploy / undeploy everything, then close.
+            bottom_row = QHBoxLayout()
+            bottom_row.setSpacing(8)
+            expand_button = pixel_mini_button("Expand all", width=150, height=42)
+            collapse_button = pixel_mini_button("Collapse all", width=150, height=42)
+            expand_button.clicked.connect(
+                lambda: [s.set_expanded(True) for s in sections]
+            )
+            collapse_button.clicked.connect(
+                lambda: [s.set_expanded(False) for s in sections]
+            )
+            bottom_row.addWidget(expand_button, 0)
+            bottom_row.addWidget(collapse_button, 0)
+            bottom_row.addStretch(1)
+            close_button = PixelButton("Close")
+            close_button.setFixedWidth(120)
             close_button.clicked.connect(dialog.close)
-            layout.addWidget(close_button)
-            
+            bottom_row.addWidget(close_button, 0)
+            layout.addLayout(bottom_row)
+
+            # Text scale, kept for the rest of the app session so the user sets
+            # their comfortable size once.
+            scale_index = getattr(self, '_summary_scale_index', 1)
+
+            def apply_scale(index):
+                self._summary_scale_index = index
+                scale = self.SUMMARY_SCALES[index]
+                for section in sections:
+                    section.set_scale(scale)
+                # Sizes must come from each widget's own stylesheet: the
+                # app-wide QSS sets a font-size for QWidget, which beats setFont.
+                name_label.setStyleSheet(
+                    "QLabel { color: #FFF0BF; background: transparent;"
+                    f" font-family: 'Courier New'; font-size: {13 * scale:.1f}pt;"
+                    " font-weight: 700; }"
+                )
+                meta_label.setStyleSheet(
+                    "QLabel { color: #8EA7D8; background: transparent;"
+                    f" font-family: 'Courier New'; font-size: {10 * scale:.1f}pt; }}"
+                )
+                zoom_label.setText(f"{round(scale * 100)}%")
+                zoom_out_button.setEnabled(index > 0)
+                zoom_in_button.setEnabled(index < len(self.SUMMARY_SCALES) - 1)
+
+            def step_scale(delta):
+                index = max(
+                    0,
+                    min(len(self.SUMMARY_SCALES) - 1,
+                        getattr(self, '_summary_scale_index', 1) + delta)
+                )
+                apply_scale(index)
+
+            zoom_out_button.clicked.connect(lambda: step_scale(-1))
+            zoom_in_button.clicked.connect(lambda: step_scale(1))
+            QShortcut(QKeySequence("Ctrl+="), dialog).activated.connect(lambda: step_scale(1))
+            QShortcut(QKeySequence("Ctrl++"), dialog).activated.connect(lambda: step_scale(1))
+            QShortcut(QKeySequence("Ctrl+-"), dialog).activated.connect(lambda: step_scale(-1))
+            QShortcut(QKeySequence("Ctrl+0"), dialog).activated.connect(lambda: apply_scale(1))
+            apply_scale(scale_index)
+
+            # Remember the size the user left the window at.
+            dialog.finished.connect(
+                lambda _: setattr(self, '_summary_window_size', dialog.size())
+            )
+
             dialog.exec()
-            
+            return True
+
         except Exception as e:
             logger.error(f"Failed to show summary: {str(e)}")
             import traceback
@@ -924,74 +1220,37 @@ class MainWindow(QMainWindow):
                 'Error',
                 f"Failed to load summary: {str(e)}"
             )
-    
+            return False
+
+    def _show_session_summary(self, row):
+        """Show the summary for a session in a separate window."""
+        session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
+        session_name = self.sessions_list.item(row, 0).text()
+        summary_status = self.sessions_list.item(row, 2).text()
+
+        if session_id is None:
+            return
+
+        if summary_status != 'summarized':
+            QMessageBox.information(
+                self,
+                'No Summary',
+                f"Session '{session_name}' does not have a summary yet.\n\n"
+                "Please transcribe and summarize the session first."
+            )
+            return
+
+        self._open_summary_window(session_id, session_name)
+
     def _show_summary_by_session_id(self, session_id: int, session_name: str):
         """Show the summary for a session by session_id.
-        
+
         Args:
             session_id: The session ID
             session_name: The session name
         """
-        try:
-            # Check if session has a summary
-            summaries = self.session_manager.db.get_summaries(session_id)
-            
-            if not summaries:
-                QMessageBox.information(
-                    self,
-                    'No Summary',
-                    f"Session '{session_name}' does not have a summary yet.\n\n"
-                    "Please transcribe and summarize the session first."
-                )
-                return
-            
-            # Get the first summary (or most recent)
-            summary = summaries[0]
-            summary_content = summary.get('content', '')
-            summary_type = summary.get('summary_type', 'full')
-            model_used = summary.get('model_used', 'unknown')
-            
-            # Create a dialog to display the summary
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Summary - {session_name}")
-            dialog.setMinimumSize(600, 400)
-            
-            layout = QVBoxLayout(dialog)
-            
-            # Header with session info
-            header_label = QLabel(f"Session: {session_name}")
-            header_font = header_label.font()
-            header_font.setPointSize(14)
-            header_font.setBold(True)
-            header_label.setFont(header_font)
-            layout.addWidget(header_label)
-            
-            # Summary type and model info
-            info_label = QLabel(f"Type: {summary_type} | Model: {model_used}")
-            info_label.setStyleSheet("color: gray;")
-            layout.addWidget(info_label)
-            
-            # Summary content
-            text_browser = QTextBrowser()
-            text_browser.setPlainText(summary_content)
-            text_browser.setOpenExternalLinks(True)
-            layout.addWidget(text_browser)
-            
-            # Close button
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.close)
-            layout.addWidget(close_button)
-            
-            dialog.exec()
-            
-        except Exception as e:
-            logger.error(f"Failed to show summary: {str(e)}")
-            QMessageBox.critical(
-                self,
-                'Error',
-                f"Failed to load summary: {str(e)}"
-            )
-    
+        self._open_summary_window(session_id, session_name)
+
     def _show_screenshots_by_session_id(self, session_id: int, session_name: str):
         """Show screenshots for a session by session_id.
         
@@ -2311,6 +2570,214 @@ Keywords: {keywords_str}"""
         central_layout.addWidget(self.center_shell, 1)
         central_layout.addWidget(self.right_shell, 0)
 
+        self._wire_pane_focus()
+        self._wire_find_bar()
+
+    # =========================
+    # Active pane focus model (BU098)
+    # =========================
+
+    def _wire_pane_focus(self):
+        """Set up the mutually-exclusive active-pane substrate over the three
+        top-level shells. Background clicks and keyboard focus both drive it.
+        """
+        self._panes = {
+            "left": self.left_shell,
+            "center": self.center_shell,
+            "right": self.right_shell,
+        }
+        self._pane_focus = PaneFocusController()
+
+        for name, shell in self._panes.items():
+            shell.clicked.connect(lambda n=name: self._set_active_pane(n))
+
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_global_focus_changed)
+
+        self._set_active_pane("center")
+
+    @property
+    def _active_pane(self) -> Optional[str]:
+        return self._pane_focus.active
+
+    def _set_active_pane(self, name: str):
+        changed = self._pane_focus.set_active(name)
+        for p in changed:
+            self._panes[p].set_active(self._pane_focus.active == p)
+        # A find bar left open over another pane loses its relevance.
+        if changed and getattr(self, "_find_bar", None) and self._find_bar.isVisible():
+            if self._pane_focus.active != getattr(self, "_find_bar_pane", None):
+                self._close_find_bar()
+
+    def _on_global_focus_changed(self, old, now):
+        if now is None:
+            return
+        pane = resolve_pane_for_widget(now, self._panes)
+        if pane is not None:
+            self._set_active_pane(pane)
+
+    # =========================
+    # In-pane find bar (BU099)
+    # =========================
+
+    def _wire_find_bar(self):
+        self._find_bar = PixelFindBar(self)
+        self._find_bar.hide()
+        self._find_bar_pane = None
+        self._find_highlighted_row = None
+        self._find = FindController(
+            self._find_search_conversations,
+            self._find_center_texts,
+            self._find_right_texts,
+        )
+        self._find_bar.query_changed.connect(self._on_find_query_changed)
+        self._find_bar.next_match.connect(lambda: self._find_step("next"))
+        self._find_bar.prev_match.connect(lambda: self._find_step("prev"))
+        self._find_bar.return_pressed.connect(self._on_find_return)
+        self._find_bar.closed.connect(self._close_find_bar)
+
+        self._find_shortcut = QShortcut(QKeySequence.Find, self)
+        self._find_shortcut.activated.connect(self._open_find_bar)
+
+    # --- corpus adapters (the only DB / widget access) ------------------
+
+    def _layout_rows(self, layout):
+        return [
+            layout.itemAt(i).widget()
+            for i in range(layout.count())
+            if layout.itemAt(i).widget() is not None
+        ]
+
+    def _find_center_texts(self):
+        return [
+            r.property("message_text") or ""
+            for r in self._layout_rows(self._answer_layout)
+        ]
+
+    def _find_right_texts(self):
+        texts = []
+        for r in self._layout_rows(self._transcription_layout):
+            t = r.property("find_text")
+            if not t:
+                bubble = bubble_of_row(r)
+                t = bubble.label.text() if bubble is not None else ""
+            texts.append(t or "")
+        return texts
+
+    def _find_search_conversations(self, terms):
+        try:
+            rows = self.session_manager.db.search_conversations(
+                " ".join(terms), limit=200
+            )
+            return [r["id"] for r in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Find: conversation search failed: {e}")
+            return []
+
+    # --- open / close / position -------------------------------------
+
+    def _open_find_bar(self):
+        pane = self._active_pane or "center"
+        if self._find_bar.isVisible() and self._find_bar_pane == pane:
+            self._find_bar.focus_field()
+            return
+        self._clear_find_highlight()
+        self._find_bar_pane = pane
+        self._find_bar.setParent(self._panes[pane])
+        self._find.set_mode(pane)
+        self._find_bar.show()
+        self._find_bar.raise_()
+        self._position_find_bar()
+        self._find_bar.focus_field()
+        self._on_find_query_changed(self._find_bar.query_text())
+
+    def _position_find_bar(self):
+        pane = self._find_bar_pane
+        if not pane or not self._find_bar.isVisible():
+            return
+        host = self._panes[pane]
+        margin = 10  # clears the panel's pixel-cut border + corner
+        # Shrink to fit inside a narrow pane (sidebar / transcripts panel).
+        avail = host.width() - 2 * margin
+        width = max(150, min(self._find_bar.preferred_width, avail))
+        self._find_bar.setFixedWidth(width)
+        x = max(margin, host.width() - width - margin)
+        self._find_bar.move(x, margin)
+
+    def _close_find_bar(self):
+        self._clear_find_highlight()
+        if getattr(self, "_find_bar", None):
+            self._find_bar.hide()
+        pane = self._find_bar_pane
+        self._find_bar_pane = None
+        if pane and pane in self._panes:
+            self._panes[pane].setFocus()
+
+    # --- match application ------------------------------------------
+
+    def _clear_find_highlight(self):
+        row = getattr(self, "_find_highlighted_row", None)
+        if row is not None:
+            bubble = bubble_of_row(row)
+            if bubble is not None:
+                bubble.set_highlighted(False)
+                bubble.set_match_terms([])
+            self._find_highlighted_row = None
+
+    def _on_find_query_changed(self, query):
+        self._clear_find_highlight()
+        self._find.set_query(query)
+        self._apply_find_current()
+        self._find_bar.set_match_count(*self._find.match_label())
+
+    def _find_step(self, direction):
+        self._clear_find_highlight()
+        (self._find.next if direction == "next" else self._find.prev)()
+        self._apply_find_current()
+        self._find_bar.set_match_count(*self._find.match_label())
+
+    def _on_find_return(self):
+        if self._find.mode == "left":
+            conv_id = self._find.current()
+            if conv_id is not None:
+                self._load_conversation(conv_id)
+            self._close_find_bar()
+        else:
+            self._find_step("next")
+
+    def _apply_find_current(self):
+        match = self._find.current()
+        if match is None:
+            return
+        mode = self._find.mode
+        if mode == "left":
+            self._find_select_conversation(match)
+            return
+        if mode == "center":
+            layout, scroll = self._answer_layout, self._answer_scroll_area
+        else:
+            layout, scroll = self._transcription_layout, self._transcription_scroll_area
+        rows = self._layout_rows(layout)
+        if not (0 <= match < len(rows)):
+            return
+        row = rows[match]
+        bubble = bubble_of_row(row)
+        if bubble is not None:
+            bubble.set_highlighted(True)
+            bubble.set_match_terms(FindController.parse_terms(self._find.query))
+        self._find_highlighted_row = row
+        scroll.ensureWidgetVisible(row, 0, 40)
+
+    def _find_select_conversation(self, conv_id):
+        lst = self.conversations_list
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item.data(Qt.UserRole) == conv_id:
+                lst.setCurrentItem(item)
+                lst.scrollToItem(item)
+                return
+
     def _build_left_sidebar(self) -> QWidget:
         """Build the left Chronicle sidebar: brand, actions, history, controls."""
         panel = PixelPanel()
@@ -2346,7 +2813,7 @@ Keywords: {keywords_str}"""
         self.search_chats_button = PixelButton("  Search Chats", sidebar=True)
         self.search_chats_button.setIcon(self._make_icon("icon_search_light.svg"))
         self.search_chats_button.setIconSize(QSize(28, 28))
-        self.search_chats_button.clicked.connect(lambda: self.session_search_input.setFocus())
+        self.search_chats_button.clicked.connect(self._open_search_dialog)
         layout.addWidget(self.search_chats_button)
 
         self.settings_button = PixelButton("  Settings", sidebar=True)
@@ -2375,6 +2842,10 @@ Keywords: {keywords_str}"""
         self.conversations_list.setTextElideMode(Qt.ElideRight)
         self.conversations_list.setUniformItemSizes(True)
         self.conversations_list.itemClicked.connect(self._on_conversation_selected)
+        self.conversations_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.conversations_list.customContextMenuRequested.connect(
+            self._show_conversation_context_menu
+        )
         history_layout.addWidget(self.conversations_list, 1)
         layout.addWidget(history_panel, 1)
 
@@ -2835,6 +3306,7 @@ Keywords: {keywords_str}"""
 
         row = aligned_bubble(display_text, variant=variant, align=align, max_width=250)
         row.setProperty('source', source)
+        row.setProperty('find_text', display_text)
         row.setToolTip(timestamp or '')
 
         if self._transcription_filter == 'mic' and source != 'mic':
@@ -2842,14 +3314,20 @@ Keywords: {keywords_str}"""
         elif self._transcription_filter == 'system' and source != 'system':
             row.hide()
 
+        # Only stick to the bottom if the user is already there. If they have
+        # scrolled up to read earlier lines, leave their position untouched.
+        scroll_bar = self._transcription_scroll_area.verticalScrollBar()
+        was_at_bottom = (scroll_bar.maximum() - scroll_bar.value()) <= 40
+
         self._transcription_layout.insertWidget(
             self._transcription_layout.count() - 1,
             row
         )
 
-        self._transcription_scroll_area.verticalScrollBar().setValue(
-            self._transcription_scroll_area.verticalScrollBar().maximum()
-        )
+        if was_at_bottom:
+            # Defer until the layout has accounted for the new widget so the
+            # scrollbar maximum is up to date.
+            QTimer.singleShot(0, lambda: scroll_bar.setValue(scroll_bar.maximum()))
 
         if hasattr(self, '_detached_display') and self._detached_display:
             pass
@@ -3382,15 +3860,17 @@ Keywords: {keywords_str}"""
         self._detached_window = QDialog(None)  # No parent - standalone window
         self._detached_window.setWindowTitle('Transcriptions')
         self._detached_window.resize(320, 550)
-        self._detached_window.setMinimumSize(300, 400)
-        self._detached_window.setMaximumSize(340, 800)
-        
+        self._detached_window.setMinimumSize(280, 300)
+        # No maximum size: allow the user to maximize / resize freely.
+        self._detached_window.setSizeGripEnabled(True)
+
         # Set window flags: stay on top but not as modal
         self._detached_window.setWindowFlags(
-            Qt.Window | 
-            Qt.WindowStaysOnTopHint | 
-            Qt.WindowCloseButtonHint | 
-            Qt.WindowMinimizeButtonHint
+            Qt.Window |
+            Qt.WindowStaysOnTopHint |
+            Qt.WindowCloseButtonHint |
+            Qt.WindowMinimizeButtonHint |
+            Qt.WindowMaximizeButtonHint
         )
         
         # Prevent the detached window from activating the main window when minimized
@@ -3403,8 +3883,8 @@ Keywords: {keywords_str}"""
         
         # Main panel (outer) - similar to _build_transcripts_panel
         main_panel = PixelPanel()
-        main_panel.setMinimumWidth(300)
-        main_panel.setMaximumWidth(340)
+        main_panel.setMinimumWidth(260)
+        # No maximum width: let the panel scale with the window.
         
         self._detached_window.setLayout(QVBoxLayout(self._detached_window))
         self._detached_window.layout().setContentsMargins(0, 0, 0, 0)
@@ -3596,15 +4076,20 @@ Keywords: {keywords_str}"""
         elif filter_value == 'system' and source != 'system':
             row.hide()
         
+        # Only stick to the bottom if the user is already there. If they have
+        # scrolled up to read earlier lines, leave their position untouched.
+        scroll_bar = self._detached_scroll_area.verticalScrollBar()
+        was_at_bottom = (scroll_bar.maximum() - scroll_bar.value()) <= 40
+
         self._detached_layout.insertWidget(
             self._detached_layout.count() - 1,
             row
         )
-        
-        # Auto-scroll
-        self._detached_scroll_area.verticalScrollBar().setValue(
-            self._detached_scroll_area.verticalScrollBar().maximum()
-        )
+
+        if was_at_bottom:
+            # Defer until the layout has accounted for the new widget so the
+            # scrollbar maximum is up to date.
+            QTimer.singleShot(0, lambda: scroll_bar.setValue(scroll_bar.maximum()))
     
     def _on_close_detached_window(self):
         """Close the detached transcription window."""
@@ -3867,56 +4352,9 @@ Keywords: {keywords_str}"""
                     'There are no sessions with summaries.'
                 )
                 return
-            
-            # Fetch summary from database
-            summaries = self.session_manager.db.get_summaries(session_id)
-            
-            if not summaries:
-                QMessageBox.information(
-                    self,
-                    'No Summary',
-                    f"Session '{session_name}' does not have a summary yet.\n\n"
-                    "Please transcribe and summarize the session first."
-                )
-                return
-            
-            # Get the first summary
-            summary = summaries[0]
-            summary_content = summary.get('content', '')
-            summary_type = summary.get('summary_type', 'full')
-            model_used = summary.get('model_used', 'unknown')
-            
-            # Create a dialog to display the summary
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Summary - {session_name}")
-            dialog.setMinimumSize(600, 400)
-            
-            layout = QVBoxLayout(dialog)
-            
-            # Header with session info
-            header_label = QLabel(f"Session: {session_name}")
-            header_font = header_label.font()
-            header_font.setPointSize(14)
-            header_font.setBold(True)
-            header_label.setFont(header_font)
-            layout.addWidget(header_label)
-            
-            # Summary type and model info
-            info_label = QLabel(f"Type: {summary_type} | Model: {model_used}")
-            layout.addWidget(info_label)
-            
-            # Summary content
-            summary_browser = QTextBrowser()
-            summary_browser.setPlainText(summary_content)
-            layout.addWidget(summary_browser)
-            
-            # Close button
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.close)
-            layout.addWidget(close_button)
-            
-            dialog.exec()
-            
+
+            self._open_summary_window(session_id, session_name)
+
         except Exception as e:
             logger.error(f"Failed to view summary: {str(e)}")
             import traceback
@@ -4801,14 +5239,18 @@ Keywords: {keywords_str}"""
         """
         session_id = self._session_completer_map.get(text)
         if session_id is not None:
-            self._selected_session_id = session_id
-            self._update_scope_label()
-            # Clear previous transcripts and load new ones
-            self._clear_transcription_view()
-            if hasattr(self, '_detached_window') and self._detached_window:
-                self._on_close_detached_window()
-            self._load_transcripts_for_session(session_id)
-            logger.info(f"Selected session for assistant: {session_id}")
+            self._select_session_by_id(session_id)
+
+    def _select_session_by_id(self, session_id: int):
+        """Select a session as the assistant's transcript scope and load its lines."""
+        self._selected_session_id = session_id
+        self._update_scope_label()
+        # Clear previous transcripts and load new ones
+        self._clear_transcription_view()
+        if hasattr(self, '_detached_window') and self._detached_window:
+            self._on_close_detached_window()
+        self._load_transcripts_for_session(session_id)
+        logger.info(f"Selected session for assistant: {session_id}")
     
     # ------------------------------------------------------------------
     # "All Sessions" browser window
@@ -5421,9 +5863,133 @@ Keywords: {keywords_str}"""
             messages_layout.addStretch()
         
         list_widget.itemClicked.connect(on_selection_changed)
-        
+
         dialog.exec_()
-    
+
+    def _open_search_dialog(self):
+        """Global keyword search dialog: transcript lines and past conversations.
+
+        Opened from the sidebar "Search Chats" button. Queries accept one or more
+        whitespace-separated keywords, AND-matched and case-insensitive, via
+        ``db.search_transcripts`` / ``db.search_conversations``. Activating a
+        transcript result focuses that session in the transcripts panel;
+        activating a conversation result loads it in the assistant panel.
+        """
+        from datetime import datetime
+
+        db = self.session_manager.db
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Search")
+        dialog.resize(640, 520)
+        layout = QVBoxLayout(dialog)
+
+        query_row = QHBoxLayout()
+        query_input = QLineEdit()
+        query_input.setPlaceholderText("Keywords…")
+        search_button = QPushButton("Search")
+        query_row.addWidget(query_input, 1)
+        query_row.addWidget(search_button, 0)
+        layout.addLayout(query_row)
+
+        tabs = QTabWidget()
+        trans_list = QListWidget()
+        conv_list = QListWidget()
+        tabs.addTab(trans_list, "Transcripts")
+        tabs.addTab(conv_list, "Conversations")
+        layout.addWidget(tabs, 1)
+
+        def _placeholder(list_widget, text):
+            list_widget.clear()
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.NoItemFlags)
+            list_widget.addItem(item)
+
+        def _run_search():
+            query = query_input.text().strip()
+            on_transcripts = tabs.currentIndex() == 0
+            list_widget = trans_list if on_transcripts else conv_list
+            if not query:
+                _placeholder(list_widget, "Type keywords and press Enter")
+                return
+            try:
+                if on_transcripts:
+                    rows = db.search_transcripts(query, limit=50)
+                else:
+                    rows = db.search_conversations(query, limit=50)
+            except Exception as e:
+                logger.error(f"Search dialog query failed: {str(e)}")
+                QMessageBox.warning(dialog, "Search failed", f"Search failed: {str(e)}")
+                return
+            list_widget.clear()
+            if not rows:
+                _placeholder(list_widget, "No matches.")
+                return
+            if on_transcripts:
+                for r in rows:
+                    session_name = r.get("session_name") or f"Session {r.get('session_id')}"
+                    ts = r.get("timestamp", 0)
+                    time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                    text = " ".join((r.get("text") or "").split())
+                    if len(text) > 120:
+                        text = text[:120].rstrip() + "…"
+                    item = QListWidgetItem(f"{session_name}  ·  {time_str}\n{text}")
+                    item.setSizeHint(QSize(0, 46))
+                    item.setData(Qt.UserRole, (r.get("session_id"), ts))
+                    trans_list.addItem(item)
+            else:
+                for r in rows:
+                    title = r.get("title") or f"Conversation #{r.get('id')}"
+                    updated_at = r.get("updated_at", 0)
+                    date_str = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d")
+                    item = QListWidgetItem(f"{title}  ·  {date_str}\n{r.get('snippet', '')}")
+                    item.setSizeHint(QSize(0, 46))
+                    item.setData(Qt.UserRole, r.get("id"))
+                    conv_list.addItem(item)
+
+        def _on_tab_changed(_index):
+            if query_input.text().strip():
+                _run_search()
+
+        def _select_conversation_row(conv_id):
+            if not hasattr(self, "conversations_list"):
+                return
+            for i in range(self.conversations_list.count()):
+                item = self.conversations_list.item(i)
+                if item.data(Qt.UserRole) == conv_id:
+                    self.conversations_list.setCurrentItem(item)
+                    break
+
+        def _on_item_activated(item):
+            data = item.data(Qt.UserRole)
+            if data is None:
+                return
+            if tabs.currentIndex() == 0:
+                session_id, _ts = data
+                if session_id is None:
+                    return
+                dialog.accept()
+                self._select_session_by_id(session_id)
+                idx = self.scope_combo.findData("current")
+                if idx >= 0:
+                    self.scope_combo.setCurrentIndex(idx)
+            else:
+                conv_id = data
+                dialog.accept()
+                self._load_conversation(conv_id)
+                _select_conversation_row(conv_id)
+
+        search_button.clicked.connect(_run_search)
+        query_input.returnPressed.connect(_run_search)
+        tabs.currentChanged.connect(_on_tab_changed)
+        trans_list.itemActivated.connect(_on_item_activated)
+        conv_list.itemActivated.connect(_on_item_activated)
+
+        _placeholder(trans_list, "Type keywords and press Enter")
+        _placeholder(conv_list, "Type keywords and press Enter")
+        query_input.setFocus()
+        dialog.exec_()
+
     def _on_detach_assistant(self):
         """Create a detached window for the assistant chat panel."""
         if self._detached_assistant_window:
