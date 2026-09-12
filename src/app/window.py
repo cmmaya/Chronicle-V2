@@ -6,18 +6,20 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
                                 QToolButton, QToolBar, QBoxLayout, QSizePolicy, QInputDialog,
-                                QTabWidget)
-from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint
+                                QTabWidget, QButtonGroup)
+from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint, QStandardPaths
 from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence, QFont
 from typing import Optional
 import logging
+import os
 
 from .session_manager import SessionManager
 from .pixel_theme import app_qss, asset_path
 from .pixel_widgets import (
     PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, PixelScopePrompt,
     PixelFindBar, PixelCollapsibleSection, aligned_bubble, bubble_of_row, NAVY_INNER,
-    parse_summary_sections, pixel_mini_button,
+    parse_summary_sections, pixel_mini_button, PixelSessionCard, pixel_filter_chip,
+    pixel_group_header,
 )
 from .session import Session
 from ..summarization import SummaryGenerator
@@ -369,6 +371,7 @@ class MainWindow(QMainWindow):
         self._transcription_layout = None
         self._transcription_history = []  # Store transcriptions for detached window
         self._transcription_filter = 'all'  # Filter state: 'all', 'mic', or 'system'
+        self._transcription_autoscroll = True  # Stick to bottom while the user hasn't scrolled up
         
         # Assistant panel state
         self._current_question = None  # Store original question for retry
@@ -401,7 +404,9 @@ class MainWindow(QMainWindow):
         self._init_session_manager(sessions_path)
 
     def eventFilter(self, obj, event):
-        """Filter events for editing screenshot descriptions."""
+        """Filter events for editing screenshot descriptions and for clearing
+        the session-name display in the search bar when the user clicks into
+        it to start a new search."""
         if event.type() == event.Type.MouseButtonDblClick:
             # Check if it's a description label
             if obj.objectName().startswith('desc_label_'):
@@ -410,6 +415,10 @@ class MainWindow(QMainWindow):
                 if filepath and session_id:
                     self._edit_screenshot_description(obj, filepath, session_id)
                     return True
+        elif event.type() == event.Type.MouseButtonPress:
+            if obj is getattr(self, 'session_search_input', None) and getattr(self, '_search_input_shows_session', False):
+                self._search_input_shows_session = False
+                self.session_search_input.clear()
         return super().eventFilter(obj, event)
     
     def keyPressEvent(self, event):
@@ -446,6 +455,8 @@ class MainWindow(QMainWindow):
                 active_session = self.session_manager.get_active_session()
                 self._selected_session_id = active_session.id
                 self.scope_combo.setCurrentIndex(0)  # "Specific Session"
+                self.session_search_input.setText(active_session.name)
+                self._search_input_shows_session = True
                 self._clear_transcription_view()
                 self._load_transcripts_for_session(active_session.id, allow_live=True)
             else:
@@ -462,6 +473,7 @@ class MainWindow(QMainWindow):
 
                 # Clear the session search input
                 self.session_search_input.clear()
+                self._search_input_shows_session = False
         finally:
             self._clearing_scope = False
 
@@ -521,6 +533,7 @@ class MainWindow(QMainWindow):
             # Track active/selected session for assistant
             self._active_session_id = None
             self._selected_session_id = None
+            self._search_input_shows_session = False
             
             self._update_ui_state()
             self._load_past_conversations()
@@ -3005,6 +3018,7 @@ Keywords: {keywords_str}"""
         self.session_search_input.setObjectName("SessionSearchInput")
         self.session_search_input.setPlaceholderText("Search sessions...")
         self.session_search_input.setMinimumHeight(46)
+        self.session_search_input.installEventFilter(self)
         top_bar.addWidget(self.session_search_input, 1)
 
         self.session_search_button = PixelToolButton()
@@ -3047,11 +3061,11 @@ Keywords: {keywords_str}"""
         # Tab buttons removed - keeping UI cleaner
         # Original tabs: ANSWERS and CHAT
 
-        self._scope_label = QLabel("Scope: Any Session — all meetings")
+        self._scope_label = QLabel("")
         self._scope_label.setObjectName("ScopeLabel")
         self._scope_label.setAlignment(Qt.AlignCenter)
         self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
-        self._scope_label.setVisible(True)
+        self._scope_label.setVisible(False)
         layout.addWidget(self._scope_label)
 
         self.session_name_label = QLabel("Session Name:")
@@ -3192,6 +3206,14 @@ Keywords: {keywords_str}"""
         self.transcript_filter_button.clicked.connect(self._cycle_transcription_filter)
         top.addWidget(self.transcript_filter_button)
 
+        self.download_transcript_button = PixelToolButton()
+        self.download_transcript_button.setIcon(self._make_icon("icon_download.svg"))
+        self.download_transcript_button.setIconSize(QSize(28, 28))
+        self.download_transcript_button.setText("⇩")
+        self.download_transcript_button.setToolTip("Download transcript")
+        self.download_transcript_button.clicked.connect(self._on_download_transcripts)
+        top.addWidget(self.download_transcript_button)
+
         self.detach_transcription_button = PixelToolButton()
         self.detach_transcription_button.setIcon(self._make_icon("icon_export.svg"))
         self.detach_transcription_button.setIconSize(QSize(28, 28))
@@ -3286,6 +3308,9 @@ Keywords: {keywords_str}"""
         self._transcription_scroll_area = QScrollArea()
         self._transcription_scroll_area.setWidgetResizable(True)
         self._transcription_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._transcription_scroll_area.verticalScrollBar().valueChanged.connect(
+            self._on_transcription_scroll_changed
+        )
 
         self._transcription_container = QWidget()
         self._transcription_scroll_area.setWidget(self._transcription_container)
@@ -3316,23 +3341,36 @@ Keywords: {keywords_str}"""
         elif self._transcription_filter == 'system' and source != 'system':
             row.hide()
 
-        # Only stick to the bottom if the user is already there. If they have
-        # scrolled up to read earlier lines, leave their position untouched.
+        # Only stick to the bottom if the user is already there (tracked live via
+        # _on_transcription_scroll_changed, not recomputed here). If they have
+        # scrolled up to read earlier lines, leave their position untouched -
+        # and it stays untouched until they scroll back to the bottom themselves.
         scroll_bar = self._transcription_scroll_area.verticalScrollBar()
-        was_at_bottom = (scroll_bar.maximum() - scroll_bar.value()) <= 40
+        should_autoscroll = self._transcription_autoscroll
 
         self._transcription_layout.insertWidget(
             self._transcription_layout.count() - 1,
             row
         )
 
-        if was_at_bottom:
+        if should_autoscroll:
             # Defer until the layout has accounted for the new widget so the
             # scrollbar maximum is up to date.
             QTimer.singleShot(0, lambda: scroll_bar.setValue(scroll_bar.maximum()))
 
         if hasattr(self, '_detached_display') and self._detached_display:
             pass
+
+    def _on_transcription_scroll_changed(self, value: int):
+        """Track whether the transcript stream is scrolled to the bottom.
+
+        Updates _transcription_autoscroll live as the user scrolls, so new
+        transcripts only auto-follow once the user is actually back at the
+        bottom - scrolling up stops the auto-follow, and it resumes as soon
+        as they scroll back down themselves.
+        """
+        scroll_bar = self._transcription_scroll_area.verticalScrollBar()
+        self._transcription_autoscroll = (scroll_bar.maximum() - value) <= 40
 
     def _clear_transcription_view(self):
         """Clear all transcriptions from the view."""
@@ -3341,7 +3379,8 @@ Keywords: {keywords_str}"""
         
         # Reset viewing flag - go back to live mode
         self._viewing_historical_transcripts = False
-        
+        self._transcription_autoscroll = True
+
         if hasattr(self, '_transcription_layout') and self._transcription_layout:
             # Remove all widgets except the stretch (last item)
             while self._transcription_layout.count() > 1:
@@ -3578,6 +3617,10 @@ Keywords: {keywords_str}"""
             # Allow live transcriptions to be shown (use allow_live=True)
             self._load_session_transcripts_for_current_session(allow_live=True)
         elif scope_value == 'any':
+            # Any Session scope doesn't pin a session name in the search bar
+            if getattr(self, '_search_input_shows_session', False):
+                self._search_input_shows_session = False
+                self.session_search_input.clear()
             # When scope is "Any Session", check if a specific session is selected
             if self._selected_session_id is not None:
                 self._load_transcripts_for_session(self._selected_session_id)
@@ -3688,6 +3731,52 @@ Keywords: {keywords_str}"""
         except Exception as e:
             logger.error(f"Failed to load transcripts for session {session_id}: {e}")
             self._on_status_update(f"Error loading transcripts: {str(e)}", is_error=True)
+
+    def _resolve_transcript_session_name(self) -> str:
+        """Resolve a filesystem-safe session name for the current transcript view."""
+        session_name = None
+        try:
+            if self._selected_session_id is not None:
+                session = self.session_manager.db.get_session(self._selected_session_id)
+                if session:
+                    session_name = session.get('name')
+            elif self.session_manager:
+                active_session = self.session_manager.get_active_session()
+                if active_session:
+                    session_name = active_session.name
+        except Exception as e:
+            logger.error(f"Failed to resolve session name for transcript download: {e}")
+
+        session_name = session_name or "session"
+        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in session_name)
+        return safe_name or "session"
+
+    def _on_download_transcripts(self):
+        """Save the currently displayed transcript stream to a .txt file in Downloads."""
+        if not self._transcription_history:
+            self._on_status_update("No transcripts to download")
+            return
+
+        try:
+            from datetime import datetime
+
+            downloads_dir = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
+            if not downloads_dir:
+                self._on_status_update("Could not find Downloads folder", is_error=True)
+                return
+
+            session_name = self._resolve_transcript_session_name()
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"chronicle_transcript_{session_name}_{timestamp}.txt"
+            file_path = os.path.join(downloads_dir, filename)
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(self._transcription_history))
+
+            self._on_status_update(f"Transcript downloaded: {filename}")
+        except Exception as e:
+            logger.error(f"Failed to download transcript: {e}")
+            self._on_status_update(f"Failed to download transcript: {str(e)}", is_error=True)
 
     def _on_status_update(self, message: str, is_error: bool = False):
         """Handle status updates from the session manager."""
@@ -4185,6 +4274,7 @@ Keywords: {keywords_str}"""
                 self._selected_session_id = active_session.id
                 self.scope_combo.setCurrentIndex(0)  # "Specific Session"
                 self.session_search_input.setText(active_session.name)
+                self._search_input_shows_session = True
                 self._update_scope_label()
                 self._load_session_transcripts_for_current_session(allow_live=True)
             
@@ -4991,13 +5081,23 @@ Keywords: {keywords_str}"""
                 pass
             self._pending_detached_scope_prompt = None
 
-    def _switch_scope_to_specific(self, session_id: int):
+    def _switch_scope_to_specific(self, session_id: int, display_name: Optional[str] = None):
         """Select `session_id` and move the scope combo to Specific Session
         through the normal signal path, so the detached combo, the transcript
         panel and the scope label all follow (`_on_scope_changed` guards the
-        recursion via `_scope_sync_guard`).
+        recursion via `_scope_sync_guard`). Also pins the session's name in
+        the search bar for as long as it stays selected.
+
+        Args:
+            display_name: Text to show in the search bar. Defaults to the
+                bare session name; pass the caller's own (e.g. completer)
+                display text to preserve richer formatting.
         """
         self._selected_session_id = session_id
+        name = display_name or self._session_name_for_id(session_id)
+        if name and hasattr(self, 'session_search_input'):
+            self.session_search_input.setText(name)
+            self._search_input_shows_session = True
         index = self.scope_combo.findData("current")
         if index < 0:
             self._update_scope_label()
@@ -5193,15 +5293,18 @@ Keywords: {keywords_str}"""
                     session_id = active_session.id if active_session else None
                 name = self._session_name_for_id(session_id)
                 detail = name if name else "(no session selected)"
-                self._scope_label.setText(f"Scope: Specific Session — {detail}")
+                self._scope_label.setText(f"Scope: {detail}")
+                self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
+                self._scope_label.setVisible(True)
             else:
-                self._scope_label.setText("Scope: Any Session — all meetings")
-            self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
-            self._scope_label.setVisible(True)
+                # The scope combo/search bar already conveys "Any Session";
+                # the label is only shown to name the specific session in scope.
+                self._scope_label.setVisible(False)
         except Exception as e:
             logger.error(f"Failed to update scope label: {e}")
             self._scope_label.setText("Scope: (error)")
             self._scope_label.setStyleSheet("color: gray; font-style: italic;")
+            self._scope_label.setVisible(True)
 
         # Also update summary icon state
         self._update_summary_icon_state()
@@ -5241,17 +5344,17 @@ Keywords: {keywords_str}"""
         """
         session_id = self._session_completer_map.get(text)
         if session_id is not None:
-            self._select_session_by_id(session_id)
+            self._select_session_by_id(session_id, display_name=text)
 
-    def _select_session_by_id(self, session_id: int):
-        """Select a session as the assistant's transcript scope and load its lines."""
-        self._selected_session_id = session_id
-        self._update_scope_label()
-        # Clear previous transcripts and load new ones
-        self._clear_transcription_view()
+    def _select_session_by_id(self, session_id: int, display_name: Optional[str] = None):
+        """Select a session as the assistant's transcript scope and load its lines.
+
+        Moves the scope combo to Specific Session for this session (selecting
+        a session always scopes to it) via `_switch_scope_to_specific`.
+        """
         if hasattr(self, '_detached_window') and self._detached_window:
             self._on_close_detached_window()
-        self._load_transcripts_for_session(session_id)
+        self._switch_scope_to_specific(session_id, display_name=display_name)
         logger.info(f"Selected session for assistant: {session_id}")
     
     # ------------------------------------------------------------------
@@ -5260,194 +5363,420 @@ Keywords: {keywords_str}"""
     _ALL_SESSIONS_MENU_QSS = """
         QMenu {
             background-color: #071D52;
-            border: 2px solid #3E6B9B;
+            border: 2px solid #3A67C7;
             color: #FFF0BF;
-            padding: 4px;
+            padding: 5px;
             font-family: "Courier New";
-            font-size: 12px;
+            font-size: 13px;
         }
-        QMenu::item { padding: 5px 22px 5px 14px; }
-        QMenu::item:selected { background-color: #3E6B9B; }
-        QMenu::separator { height: 1px; background: #3E6B9B; margin: 4px 6px; }
+        QMenu::item { padding: 6px 24px 6px 14px; border-radius: 4px; }
+        QMenu::item:selected { background-color: #315DB1; }
+        QMenu::item:disabled { color: #5E75A8; }
+        QMenu::separator { height: 1px; background: #254D9C; margin: 5px 6px; }
     """
 
     _ALL_SESSIONS_DIALOG_QSS = """
         QDialog#AllSessionsDialog { background: #061946; }
-        QDialog#AllSessionsDialog QLabel#Hint {
-            color: #9FB6E4; font-size: 11px; padding: 0 2px 2px 2px;
+        QLabel#AllSessionsMuted {
+            color: #8EA7D8; font-family: "Courier New"; font-size: 9pt;
         }
-        QDialog#AllSessionsDialog QTableWidget {
-            background: #071D52;
-            color: #FFF0BF;
-            border: 2px solid #254D9C;
-            gridline-color: #17356F;
+        QLineEdit#AllSessionsFilter {
+            border-radius: 6px;
+            padding: 5px 10px;
+            min-height: 22px;
             font-family: "Courier New";
-            font-size: 12px;
-        }
-        QDialog#AllSessionsDialog QTableWidget::item { padding: 3px 8px; border: 0; }
-        QDialog#AllSessionsDialog QTableWidget::item:selected {
-            background: #315DB1; color: #FFF0BF;
-        }
-        QDialog#AllSessionsDialog QHeaderView::section {
-            background: #274F9B;
-            color: #FFF0BF;
-            border: 0;
-            border-right: 1px solid #17356F;
-            padding: 6px 8px;
-            font-size: 12px;
+            font-size: 10pt;
             font-weight: 700;
         }
-        QDialog#AllSessionsDialog QTableCornerButton::section {
-            background: #274F9B; border: 0;
-        }
-        QDialog#AllSessionsDialog QToolButton#RowActions {
-            background: #F6E0A6;
-            color: #071846;
-            border: none;
-            border-radius: 5px;
-            padding: 4px 10px;
-            font-family: "Courier New";
-            font-size: 11px;
-            font-weight: 700;
-        }
-        QDialog#AllSessionsDialog QToolButton#RowActions:hover { background: #FFE7B4; }
-        QDialog#AllSessionsDialog QToolButton#RowActions::menu-indicator { image: none; }
+        QLineEdit#AllSessionsFilter:focus { border: 2px solid #FFEFC1; }
     """
 
+    # (key, label) for the segmented filter above the card list.
+    _ALL_SESSIONS_FILTERS = (
+        ("all", "All"),
+        ("needs_transcript", "Needs transcript"),
+        ("needs_summary", "Needs summary"),
+    )
+
+    def _live_session_state(self):
+        """``(session_id, "recording" | "paused")`` for the session being
+        captured right now, or None. Read from the in-memory session manager,
+        not the DB ``status`` column, which can be left "active" by a crash."""
+        current = getattr(self.session_manager, 'current_session', None)
+        if current is None:
+            return None
+        if current.status == Session.STATUS_ACTIVE:
+            return (current.id, 'recording')
+        if current.status == Session.STATUS_PAUSED:
+            return (current.id, 'paused')
+        return None
+
+    def _load_sessions_for_browser(self) -> list:
+        """All sessions, newest first, with the stored status flags reconciled
+        against the transcripts / summaries that actually exist."""
+        db = self.session_manager.db
+        sessions = db.list_sessions()
+        for session in sessions:
+            session_id = session['id']
+            trans_status = session.get('transcription_status', 'none')
+            sum_status = session.get('summary_status', 'none')
+            if trans_status == 'none' and db.get_transcripts(session_id):
+                trans_status = 'transcribed'
+            if sum_status == 'none' and db.get_summaries(session_id):
+                sum_status = 'summarized'
+            session['transcription_status'] = trans_status
+            session['summary_status'] = sum_status
+        return sessions
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+    def _session_card_meta(self, session: dict, live_state) -> str:
+        """Second line of a session card: time span / duration, or live timer."""
+        from datetime import datetime
+
+        start = session.get('start_time') or 0
+        end = session.get('end_time') or 0
+        try:
+            start_dt = datetime.fromtimestamp(start) if start else None
+        except (ValueError, OSError, OverflowError):
+            start_dt = None
+        start_str = start_dt.strftime('%H:%M') if start_dt else 'Unknown time'
+
+        if live_state == 'recording':
+            current = self.session_manager.current_session
+            began = getattr(current, 'start_time', None) or start_dt
+            elapsed = (datetime.now() - began).total_seconds() if began else 0
+            return f"Started {start_str}  ·  recording {self._format_elapsed(elapsed)}"
+        if live_state == 'paused':
+            return f"Started {start_str}  ·  paused"
+
+        if start and end and end > start:
+            try:
+                end_str = datetime.fromtimestamp(end).strftime('%H:%M')
+            except (ValueError, OSError, OverflowError):
+                end_str = ''
+            minutes = max(1, round((end - start) / 60))
+            duration = f"{minutes} min" if minutes < 60 else f"{minutes // 60} h {minutes % 60:02d} min"
+            return f"{start_str} – {end_str}  ·  {duration}" if end_str else f"{start_str}  ·  {duration}"
+        return start_str
+
+    @staticmethod
+    def _session_day_label(start_time) -> str:
+        """Group title for a session's day: Today / Yesterday / weekday + date."""
+        from datetime import datetime, date, timedelta
+
+        if not start_time:
+            return "Undated"
+        try:
+            day = datetime.fromtimestamp(start_time).date()
+        except (ValueError, OSError, OverflowError):
+            return "Undated"
+        today = date.today()
+        if day == today:
+            return "Today"
+        if day == today - timedelta(days=1):
+            return "Yesterday"
+        return f"{day:%a} · {day:%b} {day.day}, {day.year}"
+
     def _show_all_sessions_window(self):
-        """Show all sessions in a detached, theme-matched browser window."""
+        """Browse every session as cards grouped by day (BU102).
+
+        Each card shows the session's processing state, an Open button and a
+        "•••" actions menu; the session being recorded right now is marked
+        with a pulsing LIVE (or PAUSED) badge and a running timer.
+        """
         from datetime import datetime
 
         dialog = QDialog(self)
         dialog.setObjectName("AllSessionsDialog")
         dialog.setWindowTitle("All Sessions")
-        dialog.resize(880, 560)
         dialog.setStyleSheet(self._ALL_SESSIONS_DIALOG_QSS)
+        dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        dialog.setSizeGripEnabled(True)
+        dialog.setMinimumSize(700, 460)
+        dialog.resize(getattr(self, '_all_sessions_window_size', None) or QSize(920, 640))
 
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = PixelPanel()
+        outer.addWidget(panel)
 
-        hint = QLabel("Double-click a session to load it · use Actions for transcribe / summarize / delete")
-        hint.setObjectName("Hint")
-        layout.addWidget(hint)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
 
-        # Load sessions and reconcile the stored status flags with reality.
-        sessions = self.session_manager.db.list_sessions()
-        for session in sessions:
-            session_id = session['id']
-            trans_status = session.get('transcription_status', 'none')
-            sum_status = session.get('summary_status', 'none')
-            if trans_status == 'none' and self.session_manager.db.get_transcripts(session_id):
-                trans_status = 'transcribed'
-            if sum_status == 'none' and self.session_manager.db.get_summaries(session_id):
-                sum_status = 'summarized'
-            session['transcription_status'] = trans_status
-            session['summary_status'] = sum_status
+        # Title row: heading on the left, counts on the right.
+        title_row = QHBoxLayout()
+        title_row.addWidget(PixelSectionTitle("ALL SESSIONS"), 1)
+        count_label = QLabel()
+        count_label.setObjectName("AllSessionsMuted")
+        count_label.setTextFormat(Qt.RichText)
+        title_row.addWidget(count_label, 0)
+        layout.addLayout(title_row)
 
-        table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Session", "Transcript", "Summary", "Date", "Actions"])
-        table.setRowCount(len(sessions))
-        table.verticalHeader().setVisible(False)
-        table.setShowGrid(False)
-        table.setWordWrap(False)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.setContextMenuPolicy(Qt.NoContextMenu)
-        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        table.verticalHeader().setDefaultSectionSize(32)
-        table.horizontalHeader().setHighlightSections(False)
+        # Filter row: free-text search plus the segmented status filter.
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        search = QLineEdit()
+        search.setObjectName("AllSessionsFilter")
+        search.setPlaceholderText("Search by name or date…")
+        search.setClearButtonEnabled(True)
+        filter_row.addWidget(search, 1)
+        filter_group = QButtonGroup(dialog)
+        filter_group.setExclusive(True)
+        for key, label in self._ALL_SESSIONS_FILTERS:
+            chip = pixel_filter_chip(label)
+            chip.setProperty("filterKey", key)
+            chip.setChecked(key == getattr(self, '_all_sessions_filter', 'all'))
+            filter_group.addButton(chip)
+            filter_row.addWidget(chip, 0)
+        if filter_group.checkedButton() is None:
+            filter_group.buttons()[0].setChecked(True)
+        layout.addLayout(filter_row)
 
-        hh = table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.Fixed)
-        table.setColumnWidth(4, 108)
+        # Scrolling column of session cards.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        container = QWidget()
+        list_layout = QVBoxLayout(container)
+        list_layout.setContentsMargins(0, 0, 8, 4)
+        list_layout.setSpacing(8)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
 
-        ready_color = QColor("#8FE39B")
-        pending_color = QColor("#8EA7D8")
+        # Bottom bar: usage hint, then refresh / close.
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(8)
+        hint = QLabel("Double-click a card or press Open to load a session")
+        hint.setObjectName("AllSessionsMuted")
+        bottom_row.addWidget(hint, 1)
+        refresh_btn = PixelButton("Refresh")
+        refresh_btn.setFixedWidth(120)
+        close_btn = PixelButton("Close")
+        close_btn.setFixedWidth(120)
+        bottom_row.addWidget(refresh_btn, 0)
+        bottom_row.addWidget(close_btn, 0)
+        layout.addLayout(bottom_row)
 
-        def _status_item(is_ready: bool) -> QTableWidgetItem:
-            item = QTableWidgetItem("Ready" if is_ready else "—")
-            item.setTextAlignment(Qt.AlignCenter)
-            item.setForeground(ready_color if is_ready else pending_color)
-            return item
+        state = {
+            'sessions': [],
+            'cards': {},       # session_id -> PixelSessionCard (visible ones)
+            'order': [],       # visible session ids, top to bottom
+            'selected': None,
+            'live': None,      # last seen _live_session_state()
+        }
 
-        for row, session in enumerate(sessions):
-            session_id = session['id']
-            trans_ready = session['transcription_status'] == 'transcribed'
-            sum_ready = session['summary_status'] == 'summarized'
-
-            name_item = QTableWidgetItem(session['name'])
-            name_item.setData(Qt.UserRole, session_id)
-            name_item.setToolTip(session['name'])
-            table.setItem(row, 0, name_item)
-
-            table.setItem(row, 1, _status_item(trans_ready))
-            table.setItem(row, 2, _status_item(sum_ready))
-
-            start_time = session.get('start_time', 0)
-            date_str = ''
-            if start_time:
-                try:
-                    date_str = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M')
-                except (ValueError, OSError, OverflowError):
-                    date_str = ''
-            date_item = QTableWidgetItem(date_str)
-            date_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row, 3, date_item)
-
-            table.setCellWidget(row, 4, self._build_session_actions_cell(session, dialog))
-
-        def on_row_activated(row, _col):
-            if row < 0 or row >= len(sessions):
-                return
-            session_id = sessions[row].get('id')
-            if session_id is None:
-                return
-            self._selected_session_id = session_id
-            self._update_scope_label()
-            self._clear_transcription_view()
-            if getattr(self, '_detached_window', None):
-                self._on_close_detached_window()
-            self._load_transcripts_for_session(session_id)
+        def open_session(session_id):
+            self._select_session_by_id(session_id)
             QApplication.processEvents()
             logger.info(f"Selected session from All Sessions window: {session_id}")
             dialog.close()
 
-        table.cellDoubleClicked.connect(on_row_activated)
-        layout.addWidget(table)
+        def select(session_id):
+            previous = state['cards'].get(state['selected'])
+            if previous is not None:
+                previous.set_selected(False)
+            state['selected'] = session_id
+            card = state['cards'].get(session_id)
+            if card is not None:
+                card.set_selected(True)
 
-        button_row = QHBoxLayout()
-        button_row.addStretch(1)
-        refresh_btn = PixelButton("Refresh")
-        refresh_btn.clicked.connect(lambda: self._refresh_all_sessions_window(dialog))
-        close_btn = PixelButton("Close")
+        def matches(session) -> bool:
+            key = filter_group.checkedButton().property("filterKey")
+            trans_ready = session['transcription_status'] == 'transcribed'
+            sum_ready = session['summary_status'] == 'summarized'
+            if key == 'needs_transcript' and trans_ready:
+                return False
+            if key == 'needs_summary' and (sum_ready or not trans_ready):
+                return False
+            needle = search.text().strip().lower()
+            if not needle:
+                return True
+            start = session.get('start_time') or 0
+            try:
+                stamp = datetime.fromtimestamp(start).strftime('%Y-%m-%d %H:%M') if start else ''
+            except (ValueError, OSError, OverflowError):
+                stamp = ''
+            return needle in session['name'].lower() or needle in stamp
+
+        def clear_list():
+            while list_layout.count():
+                item = list_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.hide()
+                    widget.deleteLater()
+            state['cards'] = {}
+            state['order'] = []
+
+        def render():
+            clear_list()
+            live = state['live']
+            live_id = live[0] if live else None
+            sessions = state['sessions']
+            visible = [s for s in sessions if matches(s)]
+
+            total = len(sessions)
+            counts = f"{total} session{'s' if total != 1 else ''}"
+            if len(visible) != total:
+                counts = f"{len(visible)} of {counts}"
+            if live:
+                dot = "#FF6B5E" if live[1] == 'recording' else "#F2B84B"
+                word = "recording" if live[1] == 'recording' else "paused"
+                counts += f'  ·  <span style="color:{dot};">●</span> 1 {word}'
+            count_label.setText(counts)
+
+            if not visible:
+                if total:
+                    message = "No sessions match this search or filter."
+                else:
+                    message = "No sessions yet.\nStart a recording and it will show up here."
+                empty = QLabel(message)
+                empty.setAlignment(Qt.AlignCenter)
+                empty.setObjectName("AllSessionsMuted")
+                empty.setStyleSheet("QLabel { padding: 40px 0; font-size: 11pt; }")
+                list_layout.addWidget(empty)
+                list_layout.addStretch(1)
+                return
+
+            groups = []  # [(label, [session, ...])], preserving newest-first order
+            for session in visible:
+                label = self._session_day_label(session.get('start_time'))
+                if not groups or groups[-1][0] != label:
+                    groups.append((label, []))
+                groups[-1][1].append(session)
+
+            for label, members in groups:
+                list_layout.addWidget(pixel_group_header(label, len(members)))
+                for session in members:
+                    session_id = session['id']
+                    live_state = live[1] if session_id == live_id else None
+                    card = PixelSessionCard(
+                        session['name'],
+                        self._session_card_meta(session, live_state),
+                        session['transcription_status'] == 'transcribed',
+                        session['summary_status'] == 'summarized',
+                        live_state=live_state,
+                    )
+                    card.actions_button.setMenu(
+                        self._build_session_actions_menu(session, card, dialog, live_state)
+                    )
+                    card.clicked.connect(lambda sid=session_id: select(sid))
+                    card.open_requested.connect(lambda sid=session_id: open_session(sid))
+                    list_layout.addWidget(card)
+                    state['cards'][session_id] = card
+                    state['order'].append(session_id)
+
+            list_layout.addStretch(1)
+            if state['selected'] in state['cards']:
+                state['cards'][state['selected']].set_selected(True)
+
+        def reload():
+            state['live'] = self._live_session_state()
+            try:
+                state['sessions'] = self._load_sessions_for_browser()
+            except Exception as e:
+                logger.error(f"Failed to list sessions: {e}")
+                state['sessions'] = []
+            render()
+
+        def on_filter_changed(button):
+            self._all_sessions_filter = button.property("filterKey")
+            render()
+
+        def open_selected():
+            session_id = state['selected'] if state['selected'] in state['cards'] else None
+            if session_id is None and state['order']:
+                session_id = state['order'][0]
+            if session_id is not None:
+                open_session(session_id)
+
+        # Live indicator: blink the badge, advance the timer, and rebuild the
+        # list if recording starts, stops, pauses or resumes meanwhile.
+        def tick():
+            live = self._live_session_state()
+            if live != state['live']:
+                reload()
+                return
+            if not live:
+                return
+            card = state['cards'].get(live[0])
+            if card is None:
+                return
+            card.live_badge.pulse()
+            session = next((s for s in state['sessions'] if s['id'] == live[0]), None)
+            if session is not None:
+                card.set_meta(self._session_card_meta(session, live[1]))
+
+        live_timer = QTimer(dialog)
+        live_timer.setInterval(600)
+        live_timer.timeout.connect(tick)
+
+        search.textChanged.connect(lambda _text: render())
+        search.returnPressed.connect(open_selected)
+        filter_group.buttonClicked.connect(on_filter_changed)
+        refresh_btn.clicked.connect(reload)
         close_btn.clicked.connect(dialog.close)
-        button_row.addWidget(refresh_btn)
-        button_row.addWidget(close_btn)
-        layout.addLayout(button_row)
 
+        # Rename / delete / transcribe / summarize refresh the list in place.
+        dialog._reload_sessions = reload
+
+        def on_finished(_result):
+            live_timer.stop()
+            self._all_sessions_window_size = dialog.size()
+
+        dialog.finished.connect(on_finished)
+
+        reload()
+        live_timer.start()
+        search.setFocus()
         dialog.exec()
 
-    def _build_session_actions_cell(self, session: dict, dialog: QDialog) -> QWidget:
-        """Build the per-row 'Actions' menu button for the All Sessions table."""
+    def _build_session_actions_menu(self, session: dict, card, dialog: QDialog, live_state) -> QMenu:
+        """Build the "•••" menu of a session card in the All Sessions window.
+
+        Processing and deleting are disabled while the session is still being
+        recorded - there is no finished audio to work on yet.
+        """
         session_id = session['id']
         session_name = session['name']
         trans_ready = session['transcription_status'] == 'transcribed'
         sum_ready = session['summary_status'] == 'summarized'
+        is_live = live_state is not None
 
-        menu = QMenu(dialog)
+        menu = QMenu(card)
         menu.setStyleSheet(self._ALL_SESSIONS_MENU_QSS)
 
+        def run_step(chip, busy_text, runner):
+            # Show progress on the card, then run the (blocking) step and
+            # refresh the list with its outcome.
+            chip.set_state('busy', busy_text)
+            QApplication.processEvents()
+
+            def go():
+                runner(session_id, None)
+                self._refresh_all_sessions_window(dialog)
+
+            QTimer.singleShot(50, go)
+
         if not trans_ready:
-            menu.addAction("Transcribe", lambda: self._on_transcribe_clicked(session_id, None))
+            action = menu.addAction(
+                "Transcribe" if not is_live else "Transcribe (after recording stops)",
+                lambda: run_step(card.transcript_chip, "Transcribing", self._run_transcription),
+            )
+            action.setEnabled(not is_live)
         elif not sum_ready:
-            menu.addAction("Summarize", lambda: self._on_summarize_clicked(session_id, None))
+            action = menu.addAction(
+                "Summarize" if not is_live else "Summarize (after recording stops)",
+                lambda: run_step(card.summary_chip, "Summarizing", self._run_summarization),
+            )
+            action.setEnabled(not is_live)
         if sum_ready:
             menu.addAction("View summary",
                            lambda: self._show_summary_by_session_id(session_id, session_name))
@@ -5456,22 +5785,12 @@ Keywords: {keywords_str}"""
         menu.addAction("Rename…",
                        lambda: self._rename_session_from_dialog(session_id, session_name, dialog))
         menu.addSeparator()
-        menu.addAction("Delete session",
-                       lambda: self._delete_from_all_sessions(session_id, dialog))
-
-        button = QToolButton()
-        button.setObjectName("RowActions")
-        button.setText("Actions ▾")
-        button.setPopupMode(QToolButton.InstantPopup)
-        button.setFocusPolicy(Qt.NoFocus)
-        button.setCursor(Qt.PointingHandCursor)
-        button.setMenu(menu)
-
-        wrapper = QWidget()
-        wl = QHBoxLayout(wrapper)
-        wl.setContentsMargins(6, 3, 6, 3)
-        wl.addWidget(button)
-        return wrapper
+        delete_action = menu.addAction(
+            "Delete session" if not is_live else "Delete (stop recording first)",
+            lambda: self._delete_from_all_sessions(session_id, dialog),
+        )
+        delete_action.setEnabled(not is_live)
+        return menu
 
     def _rename_session_from_dialog(self, session_id: int, old_name: str, dialog: QDialog):
         """Prompt for a new session name and persist it."""
@@ -5498,10 +5817,10 @@ Keywords: {keywords_str}"""
             self._refresh_all_sessions_window(dialog)
 
     def _refresh_all_sessions_window(self, dialog):
-        """Refresh the all sessions window."""
-        # Simply recreate the window
-        dialog.close()
-        self._show_all_sessions_window()
+        """Rebuild the All Sessions card list in place."""
+        reload = getattr(dialog, '_reload_sessions', None)
+        if reload is not None:
+            reload()
 
     def _on_session_search_selected(self, index: int):
         """Handle session selection from the combobox.
@@ -5972,9 +6291,6 @@ Keywords: {keywords_str}"""
                     return
                 dialog.accept()
                 self._select_session_by_id(session_id)
-                idx = self.scope_combo.findData("current")
-                if idx >= 0:
-                    self.scope_combo.setCurrentIndex(idx)
             else:
                 conv_id = data
                 dialog.accept()

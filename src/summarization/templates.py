@@ -47,6 +47,101 @@ class SummaryTemplate:
         return self.user_template.format(transcript=transcript, context=context_str)
 
 
+# Shared by FULL (the template the app actually uses via generate_and_store)
+# and GENERAL_TRANSCRIPT, so the two never drift apart. Section 3 reports due
+# dates only - undated tasks are intentionally dropped.
+_TRANSCRIPT_SYSTEM_PROMPT = (
+    "You are a transcript analysis assistant. You summarize transcripts from audio recordings, "
+    "which may come from meetings, classes, lectures, interviews, calls, tutorials, personal notes, "
+    "or mixed microphone and system audio. "
+    "Use only information explicitly present in the transcript. Do not add external context, "
+    "assumptions, interpretations, recommendations, or invented details. "
+    "Do not infer names, dates, responsibilities, decisions, intentions, causes, or next steps "
+    "unless they are clearly stated in the transcript. "
+    "If information is missing, unclear, or ambiguous, use 'Not specified' or "
+    "'Unclear in transcript'.\n\n"
+    "Due dates are the most important information in any transcript. Read the entire transcript "
+    "for them, including passing remarks, corrections, and asides near the end of the recording. "
+    "Missing a stated deadline is a worse error than reporting one whose wording is unclear: if a "
+    "deadline was mentioned but is hard to make out, report it and mark it as unclear rather than "
+    "leaving it out.\n\n"
+    "Summarize faithfully and concisely. Do not add sections, commentary, advice, or conclusions "
+    "beyond the requested format."
+)
+
+_TRANSCRIPT_USER_TEMPLATE = (
+    "Analyze the following transcript.\n\n"
+    "Transcript:\n{transcript}{context}\n\n"
+    "Return the result using exactly the structure below. Do not add extra sections.\n\n"
+
+    "1. Overview\n"
+    "Write one concise paragraph summarizing the main topic and the relevant context explicitly "
+    "mentioned. Maximum 100 words. If the transcript contains any due dates, end the paragraph "
+    "with one sentence stating how many there are and which one is nearest.\n\n"
+
+    "2. Key Points\n"
+    "Provide 3-7 focused key points. Each must represent a distinct topic, explanation, argument, "
+    "decision, statement, event, or relevant detail from the transcript. Group related ideas and "
+    "avoid repetition. Do not invent importance or implications that are not stated.\n\n"
+
+    "Format:\n"
+    "1. <key point>\n"
+    "2. <key point>\n\n"
+
+    "3. Due Dates\n"
+    "Report every deadline or due date mentioned in the transcript: anything that must be done, "
+    "delivered, submitted, paid, answered, or attended by a specific date or time. Include an "
+    "entry only when a date or time reference is explicitly tied to something. Do not list tasks, "
+    "follow-ups, or intentions that have no date attached. Never invent, estimate, or assume a "
+    "date.\n\n"
+
+    "Rules:\n"
+    "- Write the date as it was spoken (\"next Friday\", \"end of the month\", \"the 15th\"). If "
+    "the recording date appears in the Meeting Context, add the resolved calendar date in "
+    "parentheses, e.g. \"next Friday (2026-09-18)\". If there is no recording date, do not "
+    "resolve relative dates.\n"
+    "- Include any stated time, time zone, or condition (\"before 5 pm\", \"before class "
+    "starts\").\n"
+    "- If a date was changed or postponed, report the final date and note the earlier one "
+    "(\"moved from March 3\").\n"
+    "- If speakers give conflicting dates, or the date is garbled or ambiguous, still report the "
+    "entry and write: Unclear in transcript: <what was said>.\n"
+    "- List each distinct deadline once, even if it is repeated.\n"
+    "- Order entries chronologically when the order is clear; otherwise keep the order in which "
+    "they were mentioned.\n\n"
+
+    "Use this exact format for each entry:\n"
+    "Title: <what is due, 3-8 words>\n"
+    "Due date: <date/time as stated, plus resolved date if available>\n"
+    "Description: <what must be done or delivered, and by whom if stated; under 40 words>\n\n"
+
+    "If no due dates are mentioned, write exactly:\n"
+    "No due dates were mentioned in the transcript.\n\n"
+
+    "4. Decisions\n"
+    "List only explicit decisions, agreements, conclusions, or resolutions clearly stated in the "
+    "transcript. Do not infer decisions from discussion, preferences, or unresolved ideas.\n\n"
+
+    "Format:\n"
+    "1. <decision>\n\n"
+
+    "If none are found, write exactly:\n"
+    "No explicit decisions were found in the transcript.\n\n"
+
+    "5. Open Questions or Unclear Points\n"
+    "List only explicit questions, unresolved issues, pending topics, or unclear parts present in "
+    "the transcript. Do not add questions the speakers did not raise.\n\n"
+
+    "Format:\n"
+    "1. <open question or unclear point>\n\n"
+
+    "If none are found, write exactly:\n"
+    "No explicit open questions or unclear points were found in the transcript."
+)
+
+_TRANSCRIPT_FIELDS = ["overview", "key_points", "due_dates", "decisions", "open_questions"]
+
+
 class TemplateRegistry:
     """Registry of available summary templates."""
     
@@ -96,106 +191,21 @@ class TemplateRegistry:
         fields=["decisions", "stakeholders"]
     )
     
-    # Full Template - comprehensive summary
+    # Full Template - the one generate_and_store(summary_type="full") uses, so
+    # this is what every summary in the app runs on.
     FULL = SummaryTemplate(
         template_type=TemplateType.FULL,
-        system_prompt="You are a meeting assistant that creates comprehensive summaries. "
-                      "Extract key points, action items, decisions, and notable moments. "
-                      "Be thorough but organized. Use clear formatting.",
-        user_template="Create a comprehensive summary of this meeting.\n\n"
-                      "Transcript:\n{transcript}{context}\n\n"
-                      "Include:\n"
-                      "1. Overview (2-3 sentences)\n"
-                      "2. Key Points (5-7 items)\n"
-                      "3. Action Items (with assignees if mentioned)\n"
-                      "4. Decisions Made\n"
-                      "5. Next Steps (if any)\n\n"
-                      "Be concise but capture all important information.",
-        fields=["overview", "key_points", "action_items", "decisions", "next_steps"]
+        system_prompt=_TRANSCRIPT_SYSTEM_PROMPT,
+        user_template=_TRANSCRIPT_USER_TEMPLATE,
+        fields=_TRANSCRIPT_FIELDS,
     )
-    
+
     # General Transcript Template - single API call for all summary types
     GENERAL_TRANSCRIPT_SUMMARY = SummaryTemplate(
         template_type=TemplateType.GENERAL_TRANSCRIPT,
-        system_prompt=(
-            "You are a transcript analysis assistant. You summarize transcripts from audio recordings, "
-            "which may come from meetings, classes, lectures, interviews, calls, tutorials, personal notes, "
-            "or mixed microphone and system audio. "
-            "Use only information explicitly present in the transcript. Do not add external context, "
-            "assumptions, interpretations, recommendations, or invented details. "
-            "Do not infer names, dates, responsibilities, decisions, intentions, causes, or next steps "
-            "unless they are clearly stated in the transcript. "
-            "If information is missing, unclear, ambiguous, or not specified, use 'Not specified' or "
-            "'Unclear in transcript'. "
-            "Summarize faithfully and concisely. Group related information when useful, but do not change "
-            "the meaning of what was said. "
-            "Do not add sections, commentary, advice, conclusions, or suggestions beyond the requested format."
-        ),
-        user_template=(
-            "Analyze the following transcript.\n\n"
-            "Transcript:\n{transcript}{context}\n\n"
-            "Return the result using exactly the structure below. Do not add extra sections.\n\n"
-
-            "1. Overview\n"
-            "Write one concise paragraph summarizing the main topic described in the transcript and the "
-            "relevant context explicitly mentioned. Maximum 100 words. Do not include information that is "
-            "not present in the transcript.\n\n"
-
-            "2. Key Points\n"
-            "Provide 3-7 focused key points. Each key point must represent a distinct topic, section, "
-            "explanation, argument, decision, statement, event, or relevant detail from the transcript. "
-            "Group related ideas together and avoid repetition. Do not invent importance or implications "
-            "that are not stated.\n\n"
-
-            "Format:\n"
-            "1. <key point>\n"
-            "2. <key point>\n"
-            "3. <key point>\n\n"
-
-            "3. Action Items\n"
-            "List only explicit tasks, assignments, follow-ups, or requested actions mentioned in the "
-            "transcript. Do not infer tasks from general discussion. Do not create action items from vague "
-            "ideas unless a concrete action was explicitly requested or assigned.\n\n"
-
-            "Use this exact format for each action item:\n"
-            "Title: <short task title>\n"
-            "Description: <what needs to be done, under 50 words>\n"
-            "Due date: <explicit date/deadline or 'Not specified'>\n"
-            "Responsible: <explicit person/role or 'Not specified'>\n\n"
-
-            "If no explicit action items are found, write exactly:\n"
-            "No explicit action items were found in the transcript.\n\n"
-
-            "4. Decisions\n"
-            "List only explicit decisions, agreements, conclusions, or resolutions clearly stated in the "
-            "transcript. Do not infer decisions from discussion, preferences, or unresolved ideas.\n\n"
-
-            "Format:\n"
-            "1. <decision>\n"
-            "2. <decision>\n\n"
-
-            "If no explicit decisions are found, write exactly:\n"
-            "No explicit decisions were found in the transcript.\n\n"
-
-            "5. Open Questions or Unclear Points\n"
-            "List only explicit questions, unresolved issues, pending topics, ambiguities, or unclear parts "
-            "present in the transcript. Do not add questions that were not raised or implied clearly by the "
-            "speakers.\n\n"
-
-            "Format:\n"
-            "1. <open question or unclear point>\n"
-            "2. <open question or unclear point>\n\n"
-
-            "If none are found, write exactly:\n"
-            "No explicit open questions or unclear points were found in the transcript."
-        ),
-        fields=[
-            "overview",
-            "key_points",
-            "action_items",
-            "decisions",
-            "open_questions"
-        ]
+        system_prompt=_TRANSCRIPT_SYSTEM_PROMPT,
+        user_template=_TRANSCRIPT_USER_TEMPLATE,
+        fields=_TRANSCRIPT_FIELDS,
     )
     
     @classmethod

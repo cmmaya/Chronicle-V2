@@ -1556,3 +1556,63 @@ cases: basic rendering, bold surviving escaping and reflow, and unpaired
 asterisks like "2**3" left alone). Qt harness re-run against a sample carrying
 both a lead-in line and markdown bold - all interaction checks still green, and
 the rendered view shows no stray `Summary` section and no visible asterisks.
+
+## BU101 - Transcript Download Button
+
+Summary:
+Added a download button to the Transcripts Window panel, alongside the
+existing filter and detach buttons, that saves the currently displayed
+transcript stream to a `.txt` file in the Windows Downloads folder and
+confirms the save via a status notification.
+
+Files Changed:
+
+- src/app/window.py (new button + `_on_download_transcripts` /
+  `_resolve_transcript_session_name`, `QStandardPaths` and `os` imports)
+- assets/pixel/icon_download.svg (new pixel-art download glyph, same palette
+  as `icon_export.svg`)
+
+Implementation:
+
+- `download_transcript_button` (`PixelToolButton`) added to the top button row
+  in `_build_transcripts_panel`, same icon size and styling as
+  `transcript_filter_button` / `detach_transcription_button`.
+- `_on_download_transcripts` exports `self._transcription_history` (the same
+  `[HH:MM:SS] Source: text` lines already shown in the panel/detached window)
+  to `chronicle_transcript_<session_name>_<YYYYMMDD_HHMMSS>.txt` under
+  `QStandardPaths.DownloadLocation`. An empty history shows a "No transcripts
+  to download" notification instead of writing a file; a write failure is
+  caught and reported through `_on_status_update(..., is_error=True)`.
+- `_resolve_transcript_session_name` picks the session name from the selected
+  session (`db.get_session`) or the active session, falling back to
+  `"session"`, and sanitizes it to alnum/`-`/`_` for use in a filename.
+
+Definition of Done Satisfied:
+
+- [x] Download button appears in the transcripts panel next to filter/detach,
+      same visual style
+- [x] Clicking it writes the visible transcript to a `.txt` file in the
+      Windows Downloads folder
+- [x] A status notification confirms the save (or reports the error)
+- [x] Empty transcript view shows a notification instead of writing a file
+
+Validation:
+
+- `python -m py_compile src/app/window.py` -> OK.
+- PySide6 not installed in this env, so the button click / file write / Qt
+  status bar update need a manual run in the app.
+
+Next:
+
+- none
+
+### BU101 follow-up - download icon redesign
+
+The initial `icon_download.svg` reused the same chevron-cluster pattern as
+`icon_export.svg`, which didn't read as "download". Redesigned it as a
+pixelated version of the classic arrow-into-tray download glyph (matching the
+reference image the user shared): a vertical shaft, a triangular arrowhead
+narrowing to a single-cell apex, and a wide horizontal bar underneath
+representing the tray. Same `#FFE8AD` fill and `crispEdges` rendering as the
+rest of `assets/pixel/`, so it stays visually consistent with the other
+toolbar icons while looking distinctly like a download action.

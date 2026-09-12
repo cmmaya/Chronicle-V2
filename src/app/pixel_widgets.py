@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QPen,
     QBrush,
     QFont,
+    QFontMetrics,
 )
 
 
@@ -874,6 +875,8 @@ _SUMMARY_SECTION_ALIASES = {
     "action points": "Action Items",
     "actions": "Action Items",
     "tasks": "Action Items",
+    "due dates": "Due Dates",
+    "deadlines": "Due Dates",
     "decisions": "Decisions",
     "decisions made": "Decisions",
     "agreements": "Decisions",
@@ -1224,3 +1227,392 @@ class PixelCollapsibleSection(QWidget):
         self.body_panel.layout().setContentsMargins(pad + 4, pad, pad + 4, pad)
         self.body_label.adjustSize()
         self.adjustSize()
+
+
+# =========================
+# All Sessions browser (BU102)
+# =========================
+
+LIVE_RED = QColor("#FF6B5E")
+PAUSED_AMBER = QColor("#F2B84B")
+CARD_FILL_HOVER = QColor("#0B2762")
+CARD_FILL_SELECTED = QColor("#12306E")
+
+
+def _label_qss(color: str, pt: float, bold: bool = False, extra: str = "") -> str:
+    # Font sizes must live in the widget's own stylesheet: the app-wide QSS
+    # declares a font-size for QWidget, which beats setFont.
+    weight = " font-weight: 700;" if bold else ""
+    return (
+        f"QLabel {{ color: {color}; background: transparent; border: none;"
+        f" font-family: 'Courier New'; font-size: {pt:.1f}pt;{weight} {extra} }}"
+    )
+
+
+class PixelElidedLabel(QLabel):
+    """Single-line label that elides its text with "…" to the width it gets,
+    so long session names never push the rest of a card row off screen."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = text
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(40)
+        self._elide()
+
+    def full_text(self) -> str:
+        return self._full_text
+
+    def set_full_text(self, text: str):
+        self._full_text = text
+        self._elide()
+
+    def _elide(self):
+        width = max(self.width(), 40)
+        super().setText(self.fontMetrics().elidedText(self._full_text, Qt.ElideRight, width))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange):
+            self._elide()
+
+
+class PixelLiveBadge(QLabel):
+    """"● LIVE" / "❚❚ PAUSED" badge for the session being captured right now.
+    While recording, `pulse()` blinks the dot so the badge reads as live."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.RichText)
+        self._state = None
+        self._dim = False
+        self.setVisible(False)
+
+    def state(self):
+        return self._state
+
+    def set_state(self, state):
+        """`state` is "recording", "paused" or None (badge hidden)."""
+        self._state = state
+        self._dim = False
+        self.setVisible(state is not None)
+        self._restyle()
+
+    def pulse(self):
+        if self._state == "recording":
+            self._dim = not self._dim
+            self._restyle()
+
+    def _restyle(self):
+        if self._state == "recording":
+            dot = "#7A3434" if self._dim else LIVE_RED.name()
+            self.setText(f'<span style="color:{dot};">●</span>&nbsp;LIVE')
+            self.setToolTip("This session is recording right now")
+            self.setStyleSheet(_label_qss(
+                "#FFD9D3", 8.5, bold=True,
+                extra=f"background: #3A1430; border: 1px solid {LIVE_RED.name()};"
+                " border-radius: 4px; padding: 2px 7px;"
+            ))
+        elif self._state == "paused":
+            self.setText("❚❚&nbsp;PAUSED")
+            self.setToolTip("This session is paused - resume it to keep recording")
+            self.setStyleSheet(_label_qss(
+                PAUSED_AMBER.name(), 8.5, bold=True,
+                extra=f"background: #3A2E14; border: 1px solid {PAUSED_AMBER.name()};"
+                " border-radius: 4px; padding: 2px 7px;"
+            ))
+
+
+class PixelStatusChip(QLabel):
+    """Small status pill for a processing step (transcript / summary)."""
+
+    _STYLES = {
+        "ready": ("✓", "#8FE39B", "#10362F", "1px solid #3C9A6B"),
+        "pending": ("○", "#8EA7D8", "transparent", "1px dashed #3A5C9E"),
+        "busy": ("…", "#FFE9A8", "#3A3320", "1px solid #B89A4E"),
+    }
+
+    def __init__(self, label: str, parent=None):
+        super().__init__(parent)
+        self._label = label
+        self.setAlignment(Qt.AlignCenter)
+        self.set_state("pending")
+
+    def set_state(self, state: str, text: str = ""):
+        glyph, fg, bg, border = self._STYLES[state]
+        self.setText(f"{glyph} {text or self._label}")
+        self.setStyleSheet(_label_qss(
+            fg, 8.5, bold=True,
+            extra=f"background: {bg}; border: {border}; border-radius: 4px; padding: 3px 8px;"
+        ))
+        if state == "ready":
+            self.setToolTip(f"{self._label} ready")
+        elif state == "pending":
+            self.setToolTip(f"No {self._label.lower()} yet")
+        else:
+            self.setToolTip(text or self._label)
+
+
+def pixel_filter_chip(text: str) -> QToolButton:
+    """Checkable pixel pill used as one option of a segmented filter."""
+    btn = QToolButton()
+    btn.setText(text)
+    btn.setCheckable(True)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setFocusPolicy(Qt.NoFocus)
+    btn.setMinimumHeight(36)
+    btn.setStyleSheet(
+        """
+        QToolButton {
+            color: #FFF0BF;
+            background: #274F9B;
+            border: 2px solid #3A67C7;
+            border-radius: 6px;
+            padding: 4px 12px;
+            font-family: 'Courier New';
+            font-size: 9pt;
+            font-weight: 700;
+        }
+        QToolButton:hover { background: #315DB1; }
+        QToolButton:checked {
+            color: #071846;
+            background: #F6E0A6;
+            border: 2px solid #FFEFC1;
+        }
+        """
+    )
+    return btn
+
+
+def pixel_group_header(text: str, count: int = 0) -> QWidget:
+    """Day divider for a list of cards: spaced title, a count and a rule."""
+    widget = QWidget()
+    layout = QHBoxLayout(widget)
+    layout.setContentsMargins(2, 8, 2, 0)
+    layout.setSpacing(10)
+
+    title = QLabel(text.upper())
+    spaced = QFont("Courier New")
+    spaced.setBold(True)
+    spaced.setLetterSpacing(QFont.AbsoluteSpacing, 1.5)
+    title.setFont(spaced)
+    title.setStyleSheet(_label_qss("#FFE9A8", 9, bold=True))
+    layout.addWidget(title, 0)
+
+    if count:
+        count_label = QLabel(f"{count}")
+        count_label.setStyleSheet(_label_qss("#8EA7D8", 9))
+        layout.addWidget(count_label, 0)
+
+    rule = QWidget()
+    rule.setFixedHeight(2)
+    rule.setAttribute(Qt.WA_StyledBackground, True)
+    rule.setStyleSheet("background: #1E3F82;")
+    layout.addWidget(rule, 1, Qt.AlignVCenter)
+    return widget
+
+
+class PixelSessionCard(QWidget):
+    """One session in the All Sessions browser: name, time, processing chips,
+    an Open button and a "•••" actions button (its menu is set by the owner).
+
+    A session that is recording (or paused) right now gets a LIVE / PAUSED
+    badge, a coloured side stripe and matching border.
+    """
+
+    clicked = Signal()
+    open_requested = Signal()
+
+    def __init__(self, name: str, meta: str, trans_ready: bool, sum_ready: bool,
+                 live_state=None, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setAutoFillBackground(False)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = False
+        self._selected = False
+        self._live_state = None
+
+        self.live_badge = PixelLiveBadge()
+        self.name_label = PixelElidedLabel(name)
+        self.name_label.setToolTip(name)
+        self.name_label.setStyleSheet(_label_qss("#FFF0BF", 11, bold=True))
+        self.meta_label = QLabel(meta)
+        self.meta_label.setStyleSheet(_label_qss("#8EA7D8", 9))
+
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        name_row.addWidget(self.live_badge, 0)
+        name_row.addWidget(self.name_label, 1)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(4)
+        text_col.addLayout(name_row)
+        text_col.addWidget(self.meta_label)
+
+        self.transcript_chip = PixelStatusChip("Transcript")
+        self.summary_chip = PixelStatusChip("Summary")
+        chip_font = QFont("Courier New")
+        chip_font.setPointSizeF(8.5)
+        chip_font.setBold(True)
+        metrics = QFontMetrics(chip_font)
+        self.transcript_chip.setMinimumWidth(metrics.horizontalAdvance("… Transcribing") + 22)
+        self.summary_chip.setMinimumWidth(metrics.horizontalAdvance("… Summarizing") + 22)
+
+        self.open_button = QToolButton()
+        self.open_button.setText("Open")
+        self.open_button.setToolTip("Load this session into the assistant")
+        self.open_button.setCursor(Qt.PointingHandCursor)
+        self.open_button.setFocusPolicy(Qt.NoFocus)
+        self.open_button.setFixedHeight(32)
+        self.open_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #071846;
+                background: #F6E0A6;
+                border: 2px solid #FFEFC1;
+                border-radius: 5px;
+                padding: 0px 14px;
+                font-family: 'Courier New';
+                font-size: 9.5pt;
+                font-weight: 700;
+            }
+            QToolButton:hover { background: #FFE7B4; }
+            QToolButton:pressed { background: #E8CF8E; }
+            """
+        )
+        self.open_button.clicked.connect(self.open_requested.emit)
+
+        self.actions_button = QToolButton()
+        self.actions_button.setText("•••")
+        self.actions_button.setToolTip("More actions")
+        self.actions_button.setCursor(Qt.PointingHandCursor)
+        self.actions_button.setFocusPolicy(Qt.NoFocus)
+        self.actions_button.setPopupMode(QToolButton.InstantPopup)
+        self.actions_button.setFixedSize(40, 32)
+        self.actions_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #FFF0BF;
+                background: #274F9B;
+                border: 2px solid #3A67C7;
+                border-radius: 5px;
+                font-family: 'Courier New';
+                font-size: 10pt;
+                font-weight: 700;
+            }
+            QToolButton:hover { background: #315DB1; }
+            QToolButton:pressed { background: #1E3F82; }
+            QToolButton::menu-indicator { image: none; width: 0px; }
+            """
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(22, 10, 14, 10)
+        layout.setSpacing(10)
+        layout.addLayout(text_col, 1)
+        layout.addWidget(self.transcript_chip, 0, Qt.AlignVCenter)
+        layout.addWidget(self.summary_chip, 0, Qt.AlignVCenter)
+        layout.addSpacing(6)
+        layout.addWidget(self.open_button, 0, Qt.AlignVCenter)
+        layout.addWidget(self.actions_button, 0, Qt.AlignVCenter)
+
+        self.setMinimumHeight(68)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.set_status(trans_ready, sum_ready)
+        self.set_live_state(live_state)
+
+    # --- state -----------------------------------------------------------
+
+    def set_status(self, trans_ready: bool, sum_ready: bool):
+        self.transcript_chip.set_state("ready" if trans_ready else "pending")
+        self.summary_chip.set_state("ready" if sum_ready else "pending")
+
+    def set_meta(self, text: str):
+        if self.meta_label.text() != text:
+            self.meta_label.setText(text)
+
+    def set_live_state(self, state):
+        """"recording", "paused" or None."""
+        self._live_state = state
+        self.live_badge.set_state(state)
+        self.update()
+
+    def live_state(self):
+        return self._live_state
+
+    def set_selected(self, value: bool):
+        value = bool(value)
+        if value != self._selected:
+            self._selected = value
+            self.update()
+
+    # --- events ----------------------------------------------------------
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.open_requested.emit()
+        super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        rect = self.rect().adjusted(1, 1, -2, -2)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        live_color = None
+        if self._live_state == "recording":
+            live_color = LIVE_RED
+        elif self._live_state == "paused":
+            live_color = PAUSED_AMBER
+
+        if self._selected:
+            fill = CARD_FILL_SELECTED
+        elif self._hover:
+            fill = CARD_FILL_HOVER
+        else:
+            fill = NAVY_INNER
+
+        if self._selected:
+            border = CREAM_BORDER
+        elif live_color is not None:
+            border = live_color
+        elif self._hover:
+            border = BORDER_BLUE_ACTIVE
+        else:
+            border = BORDER_BLUE
+
+        path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 7)
+        painter.setBrush(QBrush(fill))
+        painter.setPen(QPen(border, 2))
+        painter.drawPath(path)
+
+        # Left stripe: live colour for the ongoing session, a quiet blue otherwise.
+        stripe = live_color if live_color is not None else (
+            CREAM if self._selected else BORDER_BLUE_LIGHT
+        )
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(stripe))
+        painter.drawRect(rect.x() + 8, rect.y() + 12, 4, max(0, rect.height() - 24))
+
+        super().paintEvent(event)

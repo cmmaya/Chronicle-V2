@@ -9,7 +9,7 @@ ASSISTANT_AGENTS = {
     "agents": {
         "chronicle_assistant": {
             "label": "Chronicle Assistant",
-            "model": "google/gemini-2.5-flash",
+            "model": "google/gemini-3.8-flash",
             "system_instruction": (
                 "You are a helpful meeting assistant. Answer questions based only on the provided Chronicle evidence, "
                 "which may include transcripts, summaries, screenshots, and assistant conversation history. "
@@ -20,7 +20,7 @@ ASSISTANT_AGENTS = {
         },
         "concise_helper": {
             "label": "Concise Helper",
-            "model": "google/gemini-2.5-flash",
+            "model": "google/gemini-3.8-flash",
             "system_instruction": (
                 "You are a brief and direct meeting assistant. Provide short, accurate answers based only on "
                 "the transcript. If unclear, ask a clarifying question. Prioritize key facts over elaboration."
@@ -28,7 +28,7 @@ ASSISTANT_AGENTS = {
         },
         "research_helper": {
             "label": "Research Helper",
-            "model": "google/gemini-2.5-flash",
+            "model": "google/gemini-3.8-flash",
             "system_instruction": (
                 "You are a research assistant. If the question is about meeting transcripts, summaries, "
                 "or session content, answer based on the provided context. If the question is about general "
@@ -43,7 +43,7 @@ ASSISTANT_AGENTS = {
 # Summarization Settings
 SUMMARIZATION = {
     # Model configuration
-    "model": "google/gemini-2.5-flash",
+    "model": "google/gemini-3.8-flash",
     
     # Custom instructions for the summarization AI
     # These will be prepended to the system prompt for all summaries
@@ -53,7 +53,7 @@ SUMMARIZATION = {
     ),
     
     # API settings
-    "max_tokens": 2500,
+    "max_tokens": 8000,
     "temperature": 0.0,
     "top_p": 0.2,
 }
@@ -113,6 +113,7 @@ ALLOWED_MODELS = [
     "google/gemini-2.5-flash-lite",
     "google/gemini-2.5-flash",
     "google/gemini-2.5-pro",
+    "google/gemini-3.8-flash",
     # DeepSeek
     "deepseek/deepseek-chat-v3.2",
     "deepseek/deepseek-v3.1-terminus",
@@ -153,7 +154,7 @@ ANY_SESSION_TEMPERATURE = 0.2
 # session" path, so there is no ambiguity threshold to tune. Kept for reference.
 SCOPE_OFFER_MARGIN = 0.15
 
-DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+DEFAULT_MODEL = "google/gemini-3.8-flash"
 
 # Internal storage for selected model
 _selected_model = DEFAULT_MODEL

@@ -20,7 +20,8 @@ class ModelType(Enum):
     DEEPSEEK_Coder = "deepseek/deepseek-coder"
     GEMINI_FLASH = "google/gemini-2.0-flash-001"
     GEMINI_2_5_FLASH = "google/gemini-2.5-flash"
-    
+    GEMINI_3_8_FLASH = "google/gemini-3.8-flash"
+
     @property
     def display_name(self) -> str:
         """Human-readable model name."""
@@ -30,6 +31,7 @@ class ModelType(Enum):
             ModelType.DEEPSEEK_Coder: "DeepSeek Coder",
             ModelType.GEMINI_FLASH: "Gemini Flash 2.0",
             ModelType.GEMINI_2_5_FLASH: "Gemini 2.5 Flash",
+            ModelType.GEMINI_3_8_FLASH: "Gemini 3.8 Flash",
         }
         return names.get(self, self.value)
 
@@ -41,9 +43,15 @@ class SummaryGenerator:
     summary generation from meeting transcripts.
     """
     
-    DEFAULT_MODEL = ModelType.GEMINI_2_5_FLASH
+    DEFAULT_MODEL = ModelType.GEMINI_3_8_FLASH
     FALLBACK_MODEL = ModelType.DEEPSEEK_V3
-    DEFAULT_MAX_TOKENS = 2500
+    # Reasoning tokens count against max_tokens on OpenRouter, so this leaves
+    # room for the model to think and still finish a long-transcript summary.
+    DEFAULT_MAX_TOKENS = 8000
+    # Low effort is enough to resolve relative dates ("next Friday") without
+    # letting reasoning eat the output budget.
+    REASONING_EFFORT = "low"
+    REQUEST_TIMEOUT = 120
     DEFAULT_TEMPERATURE = 0.0
     DEFAULT_TOP_P = 0.2
     
@@ -61,7 +69,7 @@ class SummaryGenerator:
         Args:
             api_key: OpenRouter API key (defaults to OPENROUTER_API_KEY env var)
             db: Database instance for storing summaries (optional)
-            model: AI model to use (defaults to Gemini 2.5 Flash)
+            model: AI model to use (defaults to Gemini 3.8 Flash)
             max_tokens: Maximum tokens in response
             temperature: Sampling temperature (0.0-1.0)
             top_p: Nucleus sampling parameter (0.0-1.0)
@@ -149,15 +157,16 @@ class SummaryGenerator:
             "model": model.value,
             "messages": messages,
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature
+            "temperature": self.temperature,
+            "reasoning": {"effort": self.REASONING_EFFORT},
         }
-        
+
         try:
             response = self.requests.post(
                 self.api_url,
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=self.REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
@@ -410,7 +419,22 @@ class SummaryGenerator:
             logger.error(f"Failed to store summary: {e}")
             return None
     
-    def generate_and_store(self, 
+    def _recording_date(self, session_id: int) -> Optional[str]:
+        """Session start as 'YYYY-MM-DD (Weekday)', or None if unavailable."""
+        if not self.db:
+            return None
+        try:
+            from datetime import datetime
+            session = self.db.get_session(session_id) or {}
+            start_time = session.get("start_time")
+            if not start_time:
+                return None
+            return datetime.fromtimestamp(start_time).strftime("%Y-%m-%d (%A)")
+        except Exception as e:
+            logger.warning(f"Could not read recording date for session {session_id}: {e}")
+            return None
+
+    def generate_and_store(self,
                           transcript: str,
                           session_id: int,
                           summary_type: str = "full",
@@ -437,7 +461,13 @@ class SummaryGenerator:
         
         template_type = type_map.get(summary_type, TemplateType.FULL)
         template = TemplateRegistry.get_template(template_type)
-        
+
+        # The recording date lets the model resolve relative deadlines
+        # ("next Friday") into calendar dates in the Due Dates section.
+        recording_date = self._recording_date(session_id)
+        if recording_date:
+            context = {"Recording date": recording_date, **(context or {})}
+
         result = self.generate(transcript, template, context)
         
         # Store in database

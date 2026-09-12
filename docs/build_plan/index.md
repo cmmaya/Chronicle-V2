@@ -104,3 +104,9 @@ Summary Window Enhancement — user-requested UI feature
 | BU    | Name                                    | Status    | Depends On          | Next  |
 | ---   | ---                                     | ---       | ---                 | ---   |
 | BU100 | Collapsible Sectioned Summary View      | Completed | none                | none  |
+
+Transcript Download — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU101 | Transcript Download Button              | Completed | none                | none  |

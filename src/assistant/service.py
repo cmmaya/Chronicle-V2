@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # (ANY_SESSION_REFACTOR brief 2.4).
 MAX_HISTORY_MESSAGES = 10
 
+# Upper bound on one session summary in the Specific Session prompt. Real
+# summaries run ~3k chars; this only guards against a runaway row.
+MAX_SUMMARY_CHARS = 8000
+
 
 @dataclass
 class AnswerResponse:
@@ -595,13 +599,9 @@ class AssistantAnswerService:
         """Convert context dict to prompt-friendly text."""
         parts = []
 
-        # Add conversation history first (most relevant to current conversation)
-        if context.get("conversation_history"):
-            parts.append("## Conversation History")
-            for turn in context["conversation_history"]:
-                role_label = "User" if turn.get("role") == "user" else "Assistant"
-                parts.append(f"{role_label}: {turn.get('content', '')}")
-            parts.append("")
+        # Conversation history is deliberately not rendered here: _build_messages
+        # already replays it as real chat turns, and rendering it again doubled
+        # the history tokens on every follow-up question.
 
         if context.get("sessions"):
             parts.append("## Relevant Sessions")
@@ -610,9 +610,15 @@ class AssistantAnswerService:
             parts.append("")
 
         if context.get("summaries"):
-            parts.append("## Summaries")
+            # Full text, so the Due Dates section reaches the model (a 500-char
+            # cut stopped inside the Overview). Regenerating a summary appends a
+            # new row, so keep only the latest per type (rows arrive oldest first).
+            latest = {}
             for s in context["summaries"]:
-                parts.append(f"[{s.get('summary_type', 'summary')}]: {s.get('content', '')[:500]}")
+                latest[s.get("summary_type", "summary")] = s.get("content", "")
+            parts.append("## Summaries")
+            for summary_type, content in latest.items():
+                parts.append(f"[{summary_type}]: {content[:MAX_SUMMARY_CHARS]}")
             parts.append("")
 
         if context.get("transcripts"):
