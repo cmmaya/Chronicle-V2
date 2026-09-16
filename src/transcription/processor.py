@@ -3,11 +3,12 @@ import logging
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Callable
 import glob as glob_module
 import threading
 
-from .parakeet import ParakeetEngine, ParakeetError, ModelLoadError
+from .parakeet import ParakeetEngine, ParakeetError, ModelLoadError, get_shared_engine
+from ..audio.importer import IMPORTED_CHUNK_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -25,23 +26,26 @@ class TranscriptionProcessor:
     # Maximum characters for context prompt (context limit)
     MAX_CONTEXT_LENGTH = 2000
     
-    def __init__(self, 
+    def __init__(self,
                  session_path: str,
                  db=None,
                  model_path: Optional[str] = None,
                  scorer_path: Optional[str] = None,
-                 language: str = 'en'):
+                 language: str = 'en',
+                 engine: Optional[ParakeetEngine] = None):
 
         """Initialize transcription processor.
-        
+
         Args:
             session_path: Path to session directory containing audio files
             db: Database instance for storing transcripts (optional)
-            model_path: Parakeet ONNX model name/path. If None, ParakeetEngine defaults to
-                        'nemo-parakeet-tdt-0.6b-v3'.
+            model_path: Parakeet ONNX model name/path. If given, the processor
+                        loads its own engine for it; otherwise it uses the
+                        app-wide shared engine (one model copy in memory).
             scorer_path: Not used for Parakeet (kept for API compatibility)
             language: Optional language code kept for API compatibility. Parakeet v3 can
                       auto-detect supported languages.
+            engine: Engine to use instead of the shared one.
         """
         self.session_path = Path(session_path)
         self.audio_path = self.session_path / 'audio'
@@ -49,11 +53,16 @@ class TranscriptionProcessor:
         self.mic_audio_path = self.audio_path / 'mic'
         self.system_audio_path = self.audio_path / 'system'
         self.db = db
-        self.whisper = ParakeetEngine(
-            model_path=model_path,
-            scorer_path=scorer_path,
-            language=language,
-        )
+        if engine is not None:
+            self.whisper = engine
+        elif model_path:
+            self.whisper = ParakeetEngine(
+                model_path=model_path,
+                scorer_path=scorer_path,
+                language=language,
+            )
+        else:
+            self.whisper = get_shared_engine()
         self._is_loaded = False
         
         # Track processed chunks to avoid re-transcription
@@ -164,7 +173,15 @@ class TranscriptionProcessor:
         
         # Fallback: use file modification time
         return datetime.fromtimestamp(filepath.stat().st_mtime)
-    
+
+    @staticmethod
+    def _extract_end_timestamp(filepath: Path) -> Optional[datetime]:
+        """End time from a ``<start>_<end>[_suffix].wav`` chunk name, if present."""
+        try:
+            return datetime.strptime(filepath.stem[16:31], '%Y%m%d_%H%M%S')
+        except ValueError:
+            return None
+
     def transcribe_audio(self, audio_path: str, initial_prompt: Optional[str] = None) -> str:
         """Transcribe a single audio file.
         
@@ -206,19 +223,46 @@ class TranscriptionProcessor:
         """
         return self._process_audio_by_source(session_id, self.SOURCE_SYSTEM)
     
+    @staticmethod
+    def chunk_key(audio_file: Path) -> str:
+        """How a chunk is recorded in ``transcripts.audio_file``."""
+        return f'{audio_file.parent.name}/{audio_file.name}'
+
+    def _already_transcribed(self, session_id: int) -> Callable[[Path, str], bool]:
+        """Predicate telling whether a chunk already has a transcript row.
+
+        Live transcription writes a row per chunk while recording, so a batch
+        pass over the same session must skip those chunks - running it used
+        to insert every line a second time.
+        """
+        if not self.db or not hasattr(self.db, 'get_transcribed_chunk_keys'):
+            return lambda audio_file, source: False
+        audio_files, legacy_keys = self.db.get_transcribed_chunk_keys(session_id)
+
+        def check(audio_file: Path, source: str) -> bool:
+            if self.chunk_key(audio_file) in audio_files:
+                return True
+            # Older rows don't name their file; a chunk's file name starts
+            # with its start time, which those rows do carry.
+            stamp = int(self._extract_timestamp(audio_file).timestamp())
+            return (source, stamp) in legacy_keys
+
+        return check
+
     def _process_audio_by_source(self, session_id: int, source: str) -> List[Dict[str, Any]]:
-        """Process all audio files of a specific source type.
-        
+        """Transcribe every audio file of one source that has no transcript yet.
+
         Args:
             session_id: Database session ID
             source: Audio source ('microphone' or 'system')
-            
+
         Returns:
             List of transcription results
         """
-        audio_files = self._get_audio_files(source=source)
+        done = self._already_transcribed(session_id)
+        audio_files = [f for f in self._get_audio_files(source=source) if not done(f, source)]
         results = []
-        
+
         for audio_file in audio_files:
             try:
                 result = self._transcribe_and_store(audio_file, session_id, source)
@@ -463,8 +507,13 @@ class TranscriptionProcessor:
             # Store original text before deduplication
             original_text = text
             
-            # Deduplicate based on previous transcript
-            deduplicated_text = self._deduplicate_transcription(text)
+            # Deduplicate based on previous transcript. Uploaded audio (BU104)
+            # is cut at pauses with no overlap, so there is nothing to strip -
+            # and the fuzzy matcher would delete genuinely repeated phrases.
+            if audio_file.stem.endswith(IMPORTED_CHUNK_SUFFIX):
+                deduplicated_text = text
+            else:
+                deduplicated_text = self._deduplicate_transcription(text)
             
             # Update context for next transcription (pass original for comparison)
             self._update_context(deduplicated_text, original_text)
@@ -475,7 +524,9 @@ class TranscriptionProcessor:
                     session_id=session_id,
                     timestamp=timestamp,
                     text=deduplicated_text,
-                    source=source
+                    source=source,
+                    end_timestamp=self._extract_end_timestamp(audio_file),
+                    audio_file=self.chunk_key(audio_file),
                 )
                 logger.info(f"Stored transcript for {audio_file.name}")
             
@@ -557,15 +608,18 @@ class TranscriptionProcessor:
         """
         if not self._is_loaded:
             self.load_model()
-        
+
+        done = self._already_transcribed(session_id)
         new_chunks = self.get_new_chunks(source)
         results = []
-        
+
         for audio_file in new_chunks:
             filepath_str = str(audio_file)
-            
+
             # Skip if already marked as processed (race condition protection)
-            if self._is_chunk_processed(filepath_str):
+            # or transcribed live
+            if self._is_chunk_processed(filepath_str) or done(audio_file, source):
+                self._mark_chunk_processed(filepath_str)
                 continue
             
             try:
@@ -611,9 +665,9 @@ class TranscriptionProcessor:
         Returns:
             Dictionary with 'microphone' and 'system' lists of results
         """
-        if not self._is_loaded:
-            self.load_model()
-        
+        # No eager load_model(): transcribe_audio() loads on the first file
+        # that actually needs it, so a session whose chunks were all
+        # transcribed live never pulls the model into memory.
         microphone_results = self.process_microphone_audio(session_id)
         system_results = self.process_system_audio(session_id)
         
@@ -653,8 +707,10 @@ class TranscriptionProcessor:
         return self.whisper.get_model_info()
     
     def unload_model(self) -> None:
-        """Unload model to free memory."""
-        self.whisper.unload()
+        """Unload model to free memory (never the shared engine, which live
+        transcription may be using; the app unloads that when idle)."""
+        if self.whisper is not get_shared_engine():
+            self.whisper.unload()
         self._is_loaded = False
         logger.info("TranscriptionProcessor model unloaded")
     

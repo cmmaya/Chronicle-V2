@@ -131,7 +131,7 @@ You will receive:
 
 - A screenshot image.
 - A session summary.
-- A transcript excerpt from approximately 40 seconds around the screenshot timestamp.
+- A transcript excerpt covering roughly 20 seconds before and 20 seconds after the screenshot was taken.
 
 Your task is to create concise contextual metadata that will help future AI systems understand why this screenshot matters and retrieve it when answering questions about the session.
 
@@ -150,12 +150,16 @@ Instructions:
 Return exactly this schema:
 
 {
+  "short_description": "",
   "summary": "",
   "visible_text": [],
   "keywords": []
 }
 
 Field requirements:
+
+short_description:
+At most 25 words, used as the screenshot's entry in a search index. Name what is on screen and the topic being discussed, e.g. "Jira board for the Q3 release while discussing blocked auth tickets". Do not start with filler such as "This screenshot shows" or "A screenshot of".
 
 summary:
 A concise paragraph (50-150 words) describing:
@@ -187,39 +191,55 @@ The JSON must always be valid and all fields must always be present."""
             response: The raw response string from the model.
             
         Returns:
-            Dictionary with the parsed fields.
+            Dictionary that always has ``short_description`` and ``summary``
+            (str) and ``visible_text`` and ``keywords`` (list of str).
         """
         import json
         import re
-        
-        # Try to extract JSON from the response
-        json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
-        if json_match:
+
+        result = None
+        for pattern in (r'\{[^{}]*\}', r'\{.*\}'):
+            json_match = re.search(pattern, response or '', re.DOTALL)
+            if not json_match:
+                continue
             try:
-                return json.loads(json_match.group())
+                parsed = json.loads(json_match.group())
             except json.JSONDecodeError:
-                pass
-        
-        # Try to find JSON array or object in the response
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if json_match:
-            try:
-                result = json.loads(json_match.group())
-                # Ensure all required fields exist
-                return {
-                    "summary": result.get("summary", ""),
-                    "visible_text": result.get("visible_text", []),
-                    "keywords": result.get("keywords", [])
-                }
-            except json.JSONDecodeError:
-                pass
-        
-        # If JSON parsing fails, create a simple response
+                continue
+            if isinstance(parsed, dict):
+                result = parsed
+                break
+
+        if result is None:
+            # Unparseable reply: keep the text as the summary so nothing is lost.
+            result = {"summary": (response or "")[:500]}
+
         return {
-            "summary": response[:500] if response else "",
-            "visible_text": [],
-            "keywords": []
+            "short_description": self._as_text(result.get("short_description")),
+            "summary": self._as_text(result.get("summary")),
+            # A bare string of visible text may contain commas, so it is only
+            # split on line breaks; keywords are comma-separated.
+            "visible_text": self._as_list(result.get("visible_text"), "\n"),
+            "keywords": self._as_list(result.get("keywords"), ","),
         }
+
+    @staticmethod
+    def _as_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return " ".join(str(v).strip() for v in value if str(v).strip())
+        return str(value).strip()
+
+    @staticmethod
+    def _as_list(value, separator: str) -> list:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.split(separator)
+        elif not isinstance(value, (list, tuple)):
+            value = [value]
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
     
     # Default vision model - hardcoded for screenshot context generation
     DEFAULT_VISION_MODEL = "qwen/qwen3.5-flash-02-23"
@@ -349,6 +369,16 @@ The JSON must always be valid and all fields must always be present."""
                     visible_text_json,
                     keywords_json
                 )
+                # BU106: the model's short description becomes the screenshot's
+                # search-index entry, replacing the transcript-derived preview.
+                short_description = context.get('short_description', '')
+                if short_description:
+                    from .metadata import PREVIEW_MAX_CHARS, PREVIEW_SOURCE_AI
+                    self.database.update_screenshot_preview(
+                        screenshot_id,
+                        short_description[:PREVIEW_MAX_CHARS],
+                        PREVIEW_SOURCE_AI,
+                    )
                 logger.info(f"Stored AI context for screenshot {screenshot_id}")
             else:
                 logger.warning(f"Screenshot not found in database: {screenshot_path}")

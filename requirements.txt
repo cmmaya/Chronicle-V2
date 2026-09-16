@@ -49,3 +49,7 @@ onnx-asr[cpu,hub]
 # already comes via onnx-asr[cpu,hub]. Nothing here may relax the onnxruntime
 # pin -- see src/rag/embeddings.py for why the direct-load approach is used.
 tokenizers>=0.15,<1.0
+
+# Upload Audio (BU104): decodes uploaded recordings - iPhone Voice Memos .m4a
+# (AAC / Apple Lossless), WAV, MP3, ... Wheels bundle FFmpeg; no system install.
+av>=12.0

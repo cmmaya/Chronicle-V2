@@ -4,6 +4,7 @@ Provides controlled access to session data without exposing raw database
 or SQL execution capabilities to the answer service.
 """
 
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Protocol
 
 from .context import AssistantContextRetriever
@@ -408,15 +409,10 @@ class AssistantRetrievalTools:
                 "content": s.content,
             })
 
-        # Add screenshots
+        # Add screenshots (every ScreenshotReference field, so the dict can be
+        # turned back into a reference for rendering)
         for sc in context.screenshots:
-            result["screenshots"].append({
-                "session_id": sc.session_id,
-                "session_name": sc.session_name,
-                "timestamp": sc.timestamp,
-                "filepath": sc.filepath,
-                "description": sc.description,
-            })
+            result["screenshots"].append(asdict(sc))
 
         # Add conversation history
         for turn in context.conversation_history:

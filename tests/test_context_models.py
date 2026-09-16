@@ -126,8 +126,10 @@ class TestScreenshotReference(unittest.TestCase):
             filepath="/sessions/1/screenshots/screen_001.png",
         )
         text = ref.to_prompt_text()
-        self.assertIn("Screenshot at", text)
-        self.assertIn("/sessions/1/screenshots/screen_001.png", text)
+        self.assertIn("[Screenshot (no id)", text)
+        self.assertIn("(no description yet)", text)
+        # BU108: file paths never reach the prompt.
+        self.assertNotIn("/sessions/1/screenshots/screen_001.png", text)
 
     def test_to_prompt_text_with_description(self):
         ref = ScreenshotReference(
@@ -136,9 +138,11 @@ class TestScreenshotReference(unittest.TestCase):
             timestamp=1700000050,
             filepath="/sessions/1/screenshots/screen_001.png",
             description="Whiteboard",
+            screenshot_id=7,
         )
         text = ref.to_prompt_text()
-        self.assertIn("- Whiteboard", text)
+        self.assertIn("[Screenshot #7 ·", text)
+        self.assertIn("Whiteboard", text)
 
 
 class TestAssistantContext(unittest.TestCase):

@@ -6,24 +6,31 @@ from PySide6.QtWidgets import (QMainWindow, QMenuBar, QWidget, QVBoxLayout,
                                 QGridLayout, QSlider, QDialogButtonBox, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
                                 QToolButton, QToolBar, QBoxLayout, QSizePolicy, QInputDialog,
-                                QTabWidget, QButtonGroup)
-from PySide6.QtCore import Qt, QTimer, QMetaObject, Slot, Q_ARG, QThread, Signal, QStringListModel, QSize, QPoint, QStandardPaths
-from PySide6.QtGui import QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence, QFont
-from typing import Optional
+                                QTabWidget, QButtonGroup, QGraphicsOpacityEffect, QFileDialog)
+from PySide6.QtCore import (Qt, QTimer, Slot, QThread, Signal,
+                             QStringListModel, QSize, QPoint, QStandardPaths,
+                             QPropertyAnimation, QEasingCurve)
+from PySide6.QtGui import (QAction, QPixmap, QColor, QIcon, QShortcut, QKeySequence, QFont)
+from typing import Optional, Callable
 import logging
 import os
+from datetime import datetime, timedelta
 
 from .session_manager import SessionManager
 from .pixel_theme import app_qss, asset_path
 from .pixel_widgets import (
     PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, PixelScopePrompt,
-    PixelFindBar, PixelCollapsibleSection, aligned_bubble, bubble_of_row, NAVY_INNER,
+    PixelFindBar, PixelCollapsibleSection, aligned_bubble, aligned_bubble_with_time,
+    bubble_of_row, NAVY_INNER,
     parse_summary_sections, pixel_mini_button, PixelSessionCard, pixel_filter_chip,
     pixel_group_header,
 )
+from ..audio_capture.core import ChunkedAudioRecorder
+from ..audio.importer import SUPPORTED_EXTENSIONS as UPLOAD_AUDIO_EXTENSIONS
 from .session import Session
 from ..summarization import SummaryGenerator
-from ..config import ASSISTANT_AGENTS, SESSION, ALLOWED_MODELS, get_selected_model, set_selected_model
+from ..config import (ASSISTANT_AGENTS, SESSION, SCREENSHOT, ALLOWED_MODELS,
+                      get_selected_model, set_selected_model)
 from ..assistant.service import AssistantAnswerService
 from ..assistant.scope_offer import (
     format_scope_offer_prompt,
@@ -37,106 +44,19 @@ _CANDIDATE_TITLE_DEFAULT = "SELECT A SESSION"
 _CANDIDATE_BTN_DEFAULT = "Use Selected Session"
 _CANDIDATE_TITLE_HANDOFF = "ASK IN SPECIFIC SESSION"
 _CANDIDATE_BTN_HANDOFF = "Ask in Specific Session"
-from ..screenshots.context_generator import ScreenshotContextGenerator
+from .screenshot_viewer import ScreenshotViewer
+from .global_hotkey import GlobalHotkey
+from ..screenshots.hotkeys import ClipboardDeduper
 
 logger = logging.getLogger(__name__)
 
-
-class ScreenshotContextThread(QThread):
-    """Thread for running screenshot context generation asynchronously."""
-    
-    # Signals to communicate with the main thread
-    finished_signal = Signal(object)  # Emits the context dict
-    error_signal = Signal(str)  # Emits error message
-    
-    def __init__(self, screenshot_path, summary, transcript_excerpt, db):
-        super().__init__()
-        self.screenshot_path = screenshot_path
-        self.summary = summary
-        self.transcript_excerpt = transcript_excerpt
-        self.db = db
-    
-    def run(self):
-        """Run the screenshot context generation in a separate thread."""
-        try:
-            context_gen = ScreenshotContextGenerator(database=self.db)
-            context = context_gen.generate_context(
-                screenshot_path=self.screenshot_path,
-                summary=self.summary,
-                transcript_excerpt=self.transcript_excerpt,
-                store=True
-            )
-            self.finished_signal.emit(context)
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
-class ScreenshotContextBatchThread(QThread):
-    """Thread for running screenshot context generation for multiple screenshots sequentially."""
-    
-    # Signals to communicate with the main thread
-    progress_signal = Signal(int, int, object, str)  # current, total, context/None, filepath
-    finished_signal = Signal(list)  # Emits list of (context, filepath) tuples
-    
-    def __init__(self, screenshots_data, summary, db):
-        """
-        Args:
-            screenshots_data: List of dicts with 'filepath' and 'timestamp' keys
-            summary: Session summary string
-            db: Database instance
-        """
-        super().__init__()
-        self.screenshots_data = screenshots_data
-        self.summary = summary
-        self.db = db
-    
-    def run(self):
-        """Run the screenshot context generation for all screenshots sequentially."""
-        results = []
-        
-        try:
-            context_gen = ScreenshotContextGenerator(database=self.db)
-            total = len(self.screenshots_data)
-            
-            for idx, screenshot in enumerate(self.screenshots_data):
-                filepath = screenshot.get('filepath', '')
-                screenshot_timestamp = screenshot.get('timestamp', 0)
-                
-                if not filepath:
-                    self.progress_signal.emit(idx + 1, total, None, filepath)
-                    continue
-                
-                # Get transcript excerpt for this screenshot
-                transcript_excerpt = ""
-                all_transcripts = self.db.get_transcripts(screenshot.get('session_id', 0))
-                if all_transcripts:
-                    sorted_transcripts = sorted(
-                        all_transcripts,
-                        key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
-                    )
-                    nearest_2 = sorted_transcripts[:2]
-                    transcript_excerpt = " | ".join(
-                        t.get('text', '')[:200] for t in nearest_2 if t.get('text')
-                    )
-                
-                try:
-                    context = context_gen.generate_context(
-                        screenshot_path=filepath,
-                        summary=self.summary if self.summary else None,
-                        transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                        store=True
-                    )
-                    results.append((context, filepath))
-                    self.progress_signal.emit(idx + 1, total, context, filepath)
-                except Exception as e:
-                    logger.warning(f"Failed to generate context for {filepath}: {e}")
-                    self.progress_signal.emit(idx + 1, total, None, filepath)
-            
-            self.finished_signal.emit(results)
-            
-        except Exception as e:
-            logger.error(f"Batch screenshot context generation failed: {e}")
-            self.finished_signal.emit(results)
+# BU103: a live transcript bubble keeps growing through consecutive same-source
+# chunks until either a real pause shows up or it's been running too long.
+# A gap between one chunk's end and the next chunk's start bigger than ~1.5x
+# the chunk duration means the VAD check upstream silently dropped a window -
+# that dropped window *is* the pause (see docs/build_plan/BU103.md).
+TRANSCRIPT_PAUSE_GAP_SECONDS = ChunkedAudioRecorder.CHUNK_DURATION * 1.5
+TRANSCRIPT_MAX_GROUP_SECONDS = 60
 
 
 class AssistantQueryThread(QThread):
@@ -176,6 +96,13 @@ class AssistantQueryThread(QThread):
             self.finished_signal.emit(response)
         except Exception as e:
             self.error_signal.emit(str(e))
+        finally:
+            # assistant_service holds the DB and opened a connection for this
+            # thread; release it before the thread exits (_db is private, but
+            # this is the one place outside the service that needs it).
+            db = getattr(self.assistant_service, '_db', None)
+            if db is not None and hasattr(db, 'release_thread_connection'):
+                db.release_thread_connection()
 
 
 class RagBackfillThread(QThread):
@@ -205,6 +132,8 @@ class RagBackfillThread(QThread):
             self.finished_signal.emit(summary)
         except Exception as e:  # noqa: BLE001
             self.error_signal.emit(str(e))
+        finally:
+            self._db.release_thread_connection()
 
 
 class PaneFocusController:
@@ -332,6 +261,30 @@ class MainWindow(QMainWindow):
     # Text-scale presets for the summary window (BU100); index 1 is 100%.
     SUMMARY_SCALES = (0.85, 1.0, 1.2, 1.45, 1.75)
 
+    # BU103: thread-safe hop for live transcription results (text, source,
+    # timestamp_start, timestamp_end). A Qt signal - rather than
+    # QMetaObject.invokeMethod/Q_ARG, which silently drops arguments beyond 3
+    # in this PySide6 build - is used because Qt's own signal/slot argument
+    # marshaling reliably carries all 4 strings across the audio thread ->
+    # UI thread hop.
+    _live_transcription_ready = Signal(str, str, str, str)
+
+    # Perf rework: SessionManager now runs live transcription and
+    # finalization (transcribe/index/summarize on Stop) on its own background
+    # threads, so its status_callback / session_finalized_callback can fire
+    # from a thread other than the UI's. These two signals are the only
+    # thread-safe way in; _on_status_update / _on_session_finalized (the
+    # callbacks SessionManager holds) do nothing but emit, and the real work
+    # runs in the connected slot, on the UI thread, via QueuedConnection.
+    _status_ready = Signal(str, bool)
+    _session_finalized_ready = Signal(int, object)  # (session_id, outcome dict)
+
+    # Generic version of the same hop, for a SessionManager.submit_job()
+    # completion callback (Transcribe / Summarize / Upload Audio): carries a
+    # zero-arg callable to run on the UI thread instead of a fixed payload.
+    # See _post_to_ui().
+    _ui_callback_ready = Signal(object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Chronicle')
@@ -372,7 +325,18 @@ class MainWindow(QMainWindow):
         self._transcription_history = []  # Store transcriptions for detached window
         self._transcription_filter = 'all'  # Filter state: 'all', 'mic', or 'system'
         self._transcription_autoscroll = True  # Stick to bottom while the user hasn't scrolled up
-        
+        # BU103: one "open group" per source ('mic' / 'system') the live stream
+        # is currently appending to - {row, bubble, start_dt, last_end_dt}.
+        self._transcript_groups = {}
+        self._live_transcription_ready.connect(
+            self._append_transcription, Qt.QueuedConnection
+        )
+        self._status_ready.connect(self._apply_status_update, Qt.QueuedConnection)
+        self._session_finalized_ready.connect(
+            self._apply_session_finalized, Qt.QueuedConnection
+        )
+        self._ui_callback_ready.connect(self._run_ui_callback, Qt.QueuedConnection)
+
         # Assistant panel state
         self._current_question = None  # Store original question for retry
         self._current_candidates = []  # Store current candidates for selection
@@ -385,6 +349,28 @@ class MainWindow(QMainWindow):
         
         # Session search components
         self._recent_sessions = []  # Store sessions for dropdown
+
+        # Perf rework: sessions currently finalizing (transcribe/index/
+        # summarize) on SessionManager's background job thread, and the
+        # currently-open All Sessions dialog if any (kept in sync when a
+        # background finalize completes while it's open).
+        self._finalizing_session_ids = set()
+        self._all_sessions_dialog = None
+
+        # BU110: open screenshot viewers (session_id -> viewer; non-modal, one
+        # per session), the system-wide capture hotkey held while a session
+        # is live, and the opt-in clipboard import of Win+Shift+S snips.
+        self._screenshot_viewers = {}
+        self._summary_windows = {}  # session_id -> open (non-modal) summary window
+        self._viewers_hidden_for_capture = []
+        self._capture_in_progress = False
+        self._capture_hotkey = GlobalHotkey(lambda: int(self.winId()), parent=self)
+        self._capture_hotkey.activated.connect(self._on_capture_hotkey)
+        self._capture_hotkey_fallback = None
+        self._capture_hotkey_failed_spec = None
+        self._clipboard_deduper = ClipboardDeduper()
+        if SCREENSHOT.get("import_clipboard_snips"):
+            QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
 
         # Sidebar collapse state. The collapsed rail keeps action/session icons visible
         # and gives the reclaimed horizontal space only to the answers viewport.
@@ -404,18 +390,9 @@ class MainWindow(QMainWindow):
         self._init_session_manager(sessions_path)
 
     def eventFilter(self, obj, event):
-        """Filter events for editing screenshot descriptions and for clearing
-        the session-name display in the search bar when the user clicks into
-        it to start a new search."""
-        if event.type() == event.Type.MouseButtonDblClick:
-            # Check if it's a description label
-            if obj.objectName().startswith('desc_label_'):
-                filepath = obj.property('filepath')
-                session_id = obj.property('session_id')
-                if filepath and session_id:
-                    self._edit_screenshot_description(obj, filepath, session_id)
-                    return True
-        elif event.type() == event.Type.MouseButtonPress:
+        """Clear the session-name display in the search bar when the user
+        clicks into it to start a new search."""
+        if event.type() == event.Type.MouseButtonPress:
             if obj is getattr(self, 'session_search_input', None) and getattr(self, '_search_input_shows_session', False):
                 self._search_input_shows_session = False
                 self.session_search_input.clear()
@@ -482,35 +459,6 @@ class MainWindow(QMainWindow):
 
         logger.info("Scope cleared via ESC key")
 
-    def _edit_screenshot_description(self, label, filepath, session_id):
-        """Edit screenshot description with a dialog."""
-        from PySide6.QtWidgets import QInputDialog, QLineEdit
-
-        # Get current description
-        current_desc = label.property('description') or ''
-
-        text, ok = QInputDialog.getText(
-            self,
-            'Edit Description',
-            'Enter a description for this screenshot:',
-            QLineEdit.Normal,
-            current_desc
-        )
-
-        if ok and text is not None:
-            new_description = text.strip()
-            # Update in database
-            self.session_manager.db.update_screenshot_description(filepath, new_description)
-            # Update label
-            if new_description:
-                label.setText(f"Description: {new_description}")
-                label.setStyleSheet("color: black;")
-            else:
-                label.setText("<i>Double-click to add description</i>")
-                label.setStyleSheet("color: gray;")
-            label.setProperty('description', new_description)
-            self._on_status_update('Screenshot description updated')
-        
     def _init_session_manager(self, sessions_path: str):
         """Initialize the session manager.
         
@@ -522,23 +470,37 @@ class MainWindow(QMainWindow):
                 base_path=sessions_path,
                 db_path='chronicle.db',
                 status_callback=self._on_status_update,
-                live_transcription_ui_callback=self._on_live_transcription
+                live_transcription_ui_callback=self._on_live_transcription,
+                session_finalized_callback=self._on_session_finalized,
             )
-            
+
             # Initialize Assistant Answer Service
             self.assistant_service = AssistantAnswerService(
                 db=self.session_manager.db
             )
-            
+
             # Track active/selected session for assistant
             self._active_session_id = None
             self._selected_session_id = None
             self._search_input_shows_session = False
-            
+
             self._update_ui_state()
             self._load_past_conversations()
             self._refresh_session_completer()
             self._on_status_update('App Started')
+
+            # Finish any session the last run left mid-way (closed or
+            # crashed while active/paused/processing, or stopped without
+            # finalizing) - runs in the background, one at a time.
+            try:
+                pending = self.session_manager.finalize_pending_sessions()
+                if pending:
+                    self._finalizing_session_ids.update(pending)
+                    self._on_status_update(
+                        f"Finishing {len(pending)} session(s) left over from last time…"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to queue pending session finalization: {e}")
         except Exception as e:
             self._on_status_update(f'Failed to initialize: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to initialize: {str(e)}')
@@ -817,124 +779,99 @@ class MainWindow(QMainWindow):
     def _on_transcribe_clicked(self, session_id: int, combo: QComboBox):
         """Handle the transcribe action for a session."""
         try:
-            # Run transcription in background using timer to allow UI to update
-            QTimer.singleShot(50, lambda: self._run_transcription(session_id, combo))
-            
+            self._run_transcription(session_id, combo)
         except Exception as e:
             logger.error(f"Failed to start transcription: {str(e)}")
             self._on_status_update(f"Error: {str(e)}", is_error=True)
             # Reload to reset state
             self._refresh_session_completer()
-    
-    def _run_transcription(self, session_id: int, combo: QComboBox):
-        """Run the transcription process for a session."""
-        try:
-            # Load the session using session manager
-            session = self.session_manager.load_session(session_id)
-            
-            QApplication.processEvents()
-            
-            # Process transcriptions
-            results = session.process_transcriptions()
-            
-            # Update transcription status in database
-            if results:
-                self.session_manager.db.update_session(session_id, transcription_status='transcribed')
-                mic_count = len(results.get('microphone', []))
-                sys_count = len(results.get('system', []))
-                if mic_count > 0 or sys_count > 0:
-                    self._on_status_update(f'Transcribed {mic_count + sys_count} audio chunks')
-            else:
-                self._on_status_update('No audio files found to transcribe')
-            
-            # Reload the sessions list to update UI
-            self._refresh_session_completer()
-            
-        except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self._on_status_update(f"Transcription failed: {str(e)}", is_error=True)
-            QMessageBox.warning(self, 'Transcription Failed', str(e))
-            # Reload to reset button state
-            self._refresh_session_completer()
-    
+
+    def _run_transcription(self, session_id: int, combo: Optional[QComboBox] = None,
+                           on_done: Optional[Callable[[], None]] = None):
+        """Transcribe a session's audio that has no transcript yet, then index it.
+
+        Runs on SessionManager's background job thread and returns at once -
+        this used to load a Parakeet model and run inference synchronously on
+        the UI thread. TranscriptionProcessor skips any chunk that already has
+        a transcript row, so this stays cheap when live transcription already
+        covered the session.
+
+        Args:
+            session_id: Session to transcribe.
+            combo: Unused; kept for callers still passing it.
+            on_done: Called on the UI thread after the built-in status/dialog
+                handling, whether the job succeeded or failed (e.g. to refresh
+                an All Sessions card).
+        """
+        def done(outcome, error):
+            def apply():
+                if error is not None:
+                    logger.error(f"Transcription failed: {error}")
+                    self._on_status_update(f"Transcription failed: {error}", is_error=True)
+                    QMessageBox.warning(self, 'Transcription Failed', str(error))
+                elif outcome.get('has_transcripts'):
+                    count = outcome.get('transcribed', 0)
+                    self._on_status_update(
+                        f"Transcribed {count} audio chunk(s)" if count else 'Already transcribed'
+                    )
+                else:
+                    self._on_status_update('No audio files found to transcribe')
+                self._refresh_session_completer()
+                if on_done:
+                    on_done()
+            self._post_to_ui(apply)
+
+        self.session_manager.submit_job(
+            f'transcribe session {session_id}',
+            lambda: self.session_manager.transcribe_session(session_id),
+            done,
+        )
+
     def _on_summarize_clicked(self, session_id: int, combo: QComboBox):
         """Handle the summarize action for a session."""
         try:
-            # Run summarization in background using timer to allow UI to update
-            QTimer.singleShot(50, lambda: self._run_summarization(session_id, combo))
-            
+            self._run_summarization(session_id, combo)
         except Exception as e:
             logger.error(f"Failed to start summarization: {str(e)}")
             self._on_status_update(f"Error: {str(e)}", is_error=True)
             # Reload to reset state
             self._refresh_session_completer()
-    
-    def _run_summarization(self, session_id: int, combo: QComboBox):
-        """Run the summarization process for a session."""
-        try:
-            # Load the session using session manager
-            session = self.session_manager.load_session(session_id)
-            
-            QApplication.processEvents()
-            
-            # Get transcripts from database
-            transcripts = self.session_manager.db.get_transcripts(session_id)
-            
-            if not transcripts:
-                self._on_status_update('No transcripts found for summarization')
-                QMessageBox.warning(self, 'No Transcripts', 'No transcripts available. Please transcribe first.')
+
+    def _run_summarization(self, session_id: int, combo: Optional[QComboBox] = None,
+                           on_done: Optional[Callable[[], None]] = None):
+        """Generate and store a summary, then re-index. Runs on
+        SessionManager's background job thread and returns at once.
+
+        Args:
+            session_id: Session to summarize.
+            combo: Unused; kept for callers still passing it.
+            on_done: Called on the UI thread after the built-in status/dialog
+                handling, whether the job succeeded or failed.
+        """
+        def done(result, error):
+            def apply():
+                if isinstance(error, ValueError) and 'transcript' in str(error).lower():
+                    self._on_status_update('No transcript text found')
+                    QMessageBox.warning(
+                        self, 'No Transcripts', 'No transcripts available. Please transcribe first.'
+                    )
+                elif error is not None:
+                    logger.error(f"Summarization failed: {error}")
+                    self._on_status_update(f"Summarization failed: {error}", is_error=True)
+                    QMessageBox.warning(self, 'Summarization Failed', str(error))
+                else:
+                    self._on_status_update('Summary generated')
+                    self._update_summary_icon_state()
                 self._refresh_session_completer()
-                return
-            
-            # Combine all transcript text
-            full_transcript = ' '.join(
-                t.get('text', '') for t in transcripts if t.get('text')
-            )
-            
-            if not full_transcript.strip():
-                self._on_status_update('No transcript text found')
-                QMessageBox.warning(self, 'No Transcript Text', 'Transcripts are empty.')
-                self._refresh_session_completer()
-                return
-            
-            # Create summary generator (reads API key from .env)
-            summary_gen = SummaryGenerator(db=self.session_manager.db)
-            
-            # Generate and store summary
-            summary_result = summary_gen.generate_and_store(
-                transcript=full_transcript,
-                session_id=session_id,
-                summary_type='full'
-            )
-            
-            # Update summary status in database
-            self.session_manager.db.update_session(session_id, summary_status='summarized')
-            
-            # Index the session content for RAG search (will include the new summary)
-            try:
-                from src.rag.indexer import index_session_content
-                index_session_content(self.session_manager.db, session_id)
-            except Exception as e:
-                logger.error(f"RAG indexing failed: {str(e)}")
-            
-            self._on_status_update('Summary generated')
-            
-            # Update summary icon state to reflect the new summary
-            self._update_summary_icon_state()
-            
-            # Reload the sessions list to update UI
-            self._refresh_session_completer()
-            
-        except Exception as e:
-            logger.error(f"Summarization failed: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self._on_status_update(f"Summarization failed: {str(e)}", is_error=True)
-            QMessageBox.warning(self, 'Summarization Failed', str(e))
-            # Reload to reset button state
-            self._refresh_session_completer()
+                if on_done:
+                    on_done()
+            self._post_to_ui(apply)
+
+        self.session_manager.submit_job(
+            f'summarize session {session_id}',
+            lambda: self.session_manager.summarize_session(session_id),
+            done,
+        )
     
     def _show_session_context_menu(self, position):
         """Show a context menu for the right-clicked session item."""
@@ -1058,7 +995,14 @@ class MainWindow(QMainWindow):
 
         Every entry point into the summary window goes through here. Returns
         False (after informing the user) when the session has no summary.
+
+        Non-modal and one per session (see _present_window), so it never
+        blocks an open screenshot viewer.
         """
+        existing = self._summary_windows.get(session_id)
+        if existing is not None:
+            self._present_window(existing)
+            return True
         try:
             summaries = self.session_manager.db.get_summaries(session_id)
 
@@ -1221,7 +1165,12 @@ class MainWindow(QMainWindow):
                 lambda _: setattr(self, '_summary_window_size', dialog.size())
             )
 
-            dialog.exec()
+            dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+            dialog.destroyed.connect(
+                lambda _=None, sid=session_id: self._summary_windows.pop(sid, None)
+            )
+            self._summary_windows[session_id] = dialog
+            self._present_window(dialog)
             return True
 
         except Exception as e:
@@ -1234,6 +1183,23 @@ class MainWindow(QMainWindow):
                 f"Failed to load summary: {str(e)}"
             )
             return False
+
+    @staticmethod
+    def _present_window(window: QDialog):
+        """Show a summary / screenshot window in front of everything else.
+
+        These windows are non-modal, so several can stay open side by side
+        and none blocks another. The exception is when a modal dialog (All
+        Sessions) is up: a non-modal window would open behind it and ignore
+        input, so it becomes modal too and stacks on top until closed.
+        """
+        if not window.isVisible() and QApplication.activeModalWidget() is not None:
+            window.setWindowModality(Qt.ApplicationModal)
+        if window.isMinimized():
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def _show_session_summary(self, row):
         """Show the summary for a session in a separate window."""
@@ -1264,1166 +1230,87 @@ class MainWindow(QMainWindow):
         """
         self._open_summary_window(session_id, session_name)
 
+    def _open_screenshot_viewer(self, session_id: int, session_name: str,
+                                focus_screenshot_id: Optional[int] = None):
+        """Open the screenshot viewer for a session (BU109).
+
+        Every screenshot entry point goes through here. The viewer is
+        non-modal - the main window stays usable while a session records -
+        and there is one per session: asking again brings it to the front
+        (BU110).
+        """
+        try:
+            viewer = self._screenshot_viewers.get(session_id)
+            if viewer is not None:
+                if focus_screenshot_id is not None:
+                    viewer.focus_screenshot(focus_screenshot_id)
+                self._present_window(viewer)
+                return
+
+            viewer = ScreenshotViewer(
+                self.session_manager.db,
+                session_id,
+                session_name,
+                parent=self,
+                focus_screenshot_id=focus_screenshot_id,
+                on_status=self._on_status_update,
+            )
+            viewer.setAttribute(Qt.WA_DeleteOnClose, True)
+            viewer.destroyed.connect(
+                lambda _=None, sid=session_id: self._screenshot_viewers.pop(sid, None)
+            )
+            self._screenshot_viewers[session_id] = viewer
+            self._present_window(viewer)
+        except Exception as e:
+            logger.error(f"Failed to show screenshots: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(self, 'Error', f"Failed to load screenshots: {str(e)}")
+
     def _show_screenshots_by_session_id(self, session_id: int, session_name: str):
-        """Show screenshots for a session by session_id.
-        
-        Args:
-            session_id: The session ID
-            session_name: The session name
-        """
+        """Show the screenshots of a session, or say it has none. The live
+        session always opens, so new captures show up as they are taken."""
         try:
-            # Reuse the same rich screenshot dialog (with context generator)
-            screenshots = self.session_manager.db.get_screenshots(session_id)
-
-            if not screenshots:
-                QMessageBox.information(
-                    self,
-                    'No Screenshots',
-                    f"Session '{session_name}' does not have any screenshots."
-                )
-                return
-
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Screenshots - {session_name}")
-            dialog.setMinimumSize(800, 600)
-
-            layout = QVBoxLayout(dialog)
-
-            header_label = QLabel(f"Screenshots for: {session_name}")
-            header_font = header_label.font()
-            header_font.setPointSize(14)
-            header_font.setBold(True)
-            header_label.setFont(header_font)
-            layout.addWidget(header_label)
-
-            scroll_area = QScrollArea()
-            scroll_area.setWidgetResizable(True)
-
-            grid_widget = QWidget()
-            grid_layout = QGridLayout(grid_widget)
-            grid_layout.setSpacing(10)
-
-            screenshot_labels = []
-            time_labels = []
-            selected_screenshot_index = [None]
-
-            def get_context_for_screenshot(idx):
-                if idx is None or idx >= len(screenshots):
-                    return ""
-                screenshot = screenshots[idx]
-                ai_summary = screenshot.get('ai_summary', '')
-                visible_text = screenshot.get('visible_text', '')
-                keywords = screenshot.get('keywords', '')
-
-                if not ai_summary:
-                    return ""
-
-                import json, os
-                try:
-                    visible_text_list = json.loads(visible_text) if visible_text else []
-                except:
-                    visible_text_list = []
-                try:
-                    keywords_list = json.loads(keywords) if keywords else []
-                except:
-                    keywords_list = []
-
-                visible_text_str = ", ".join(visible_text_list) if visible_text_list else "None"
-                keywords_str = ", ".join(keywords_list) if keywords_list else "None"
-                filename = os.path.basename(screenshot.get('filepath', ''))
-
-                return f"""Screenshot: {filename}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}"""
-
-            def update_selection(new_index):
-                old_index = selected_screenshot_index[0]
-                if old_index is not None and old_index < len(screenshot_labels):
-                    screenshot_labels[old_index].setStyleSheet("")
-                    time_labels[old_index].setStyleSheet("")
-
-                selected_screenshot_index[0] = new_index
-
-                if new_index is not None:
-                    screenshot_labels[new_index].setStyleSheet("border: 3px solid #0078d4;")
-                    time_labels[new_index].setStyleSheet("border: 3px solid #0078d4; border-top: none;")
-                    context = get_context_for_screenshot(new_index)
-                    if context:
-                        context_text.setPlainText(context)
-                    else:
-                        context_text.setPlainText("No context available for this screenshot. Click 'Give Context to Selected' to generate it.")
-                else:
-                    context_text.setPlainText("")
-
-            def on_screenshot_clicked(idx):
-                update_selection(idx)
-                if has_summary and idx is not None:
-                    give_context_selected_button.setEnabled(True)
-                # Enable delete button when a screenshot is selected
-                delete_button.setEnabled(idx is not None)
-
-            from datetime import datetime
-            for idx, screenshot in enumerate(screenshots):
-                filepath = screenshot.get('filepath', '')
-                timestamp = screenshot.get('timestamp', 0)
-
-                try:
-                    dt = datetime.fromtimestamp(timestamp) if timestamp else None
-                    time_str = dt.strftime('%H:%M:%S') if dt else ''
-                except Exception:
-                    time_str = ''
-
-                container = QWidget()
-                container_layout = QVBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.setSpacing(2)
-
-                image_label = QLabel()
-                pixmap = QPixmap(filepath)
-                if not pixmap.isNull():
-                    scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    image_label.setPixmap(scaled_pixmap)
-                else:
-                    image_label.setText(f"Failed to load image\n{filepath}")
-
-                image_label.setAlignment(Qt.AlignCenter)
-                image_label.setCursor(Qt.PointingHandCursor)
-
-                screenshot_labels.append(image_label)
-
-                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp, i=idx: (
-                    event.accept(),
-                    on_screenshot_clicked(i)
-                )
-
-                image_label.mouseDoubleClickEvent = lambda event, fp=filepath, ts=timestamp: (
-                    event.accept(),
-                    self._show_full_image(fp, ts)
-                )
-
-                time_label = QLabel(f"Captured at: {time_str}")
-                time_label.setAlignment(Qt.AlignCenter)
-                time_labels.append(time_label)
-
-                container_layout.addWidget(image_label)
-                container_layout.addWidget(time_label)
-
-                grid_layout.addWidget(container, idx // 2, idx % 2)
-
-            scroll_area.setWidget(grid_widget)
-            layout.addWidget(scroll_area)
-
-            selection_hint = QLabel("Click on a screenshot to select it and view its context")
-            selection_hint.setStyleSheet("color: gray; font-style: italic;")
-            layout.addWidget(selection_hint)
-
-            context_label = QLabel("Screenshot Context:")
-            context_label.setFont(header_font)
-            layout.addWidget(context_label)
-
-            context_text = QTextEdit()
-            context_text.setReadOnly(True)
-            context_text.setMaximumHeight(100)
-
-            summaries = self.session_manager.db.get_summaries(session_id)
-            has_summary = bool(summaries and len(summaries) > 0)
-            
-            if has_summary:
-                context_text.setPlaceholderText("Select a screenshot and click 'Give Context to Selected' to generate context, or 'Give Context to All' for all screenshots...")
-            else:
-                context_text.setPlaceholderText("Generate a summary first before generating screenshot context.")
-
-            layout.addWidget(context_text)
-
-            button_layout = QHBoxLayout()
-
-            give_context_selected_button = QPushButton("Give Context to Selected")
-            give_context_selected_button.setEnabled(False)
-            if not has_summary:
-                give_context_selected_button.setToolTip("Generate a summary first before generating screenshot context")
-            else:
-                give_context_selected_button.setToolTip("Generate context for the currently selected screenshot")
-
-            give_context_all_button = QPushButton("Give Context to All")
-            give_context_all_button.setEnabled(has_summary and len(screenshots) > 0)
-            if not has_summary:
-                give_context_all_button.setToolTip("Generate a summary first before generating screenshot context")
-
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.close)
-
-            delete_button = QPushButton("Delete Selected")
-            delete_button.setEnabled(False)
-            delete_button.setStyleSheet("color: red;")
-
-            button_layout.addWidget(give_context_selected_button)
-            button_layout.addWidget(give_context_all_button)
-            button_layout.addStretch()
-            button_layout.addWidget(delete_button)
-            button_layout.addWidget(close_button)
-
-            layout.addLayout(button_layout)
-
-            # Handlers (copied from session-row implementation)
-            # Store thread references for cleanup
-            context_thread = [None]  # Use list to allow mutation in closure
-            all_context_threads = [None]  # For "Give Context to All"
-
-            def on_give_context_selected():
-                selected_idx = selected_screenshot_index[0]
-                if selected_idx is None:
-                    QMessageBox.information(self, 'No Selection', 'Please select a screenshot first.')
-                    return
-
-                # Check if a thread is already running
-                if context_thread[0] is not None and context_thread[0].isRunning():
-                    return
-
-                give_context_selected_button.setEnabled(False)
-                give_context_selected_button.setText("Generating...")
-                context_text.setPlainText("Generating context for selected screenshot...")
-                QApplication.processEvents()
-
-                # Get the screenshot data
-                screenshot = screenshots[selected_idx]
-                filepath = screenshot.get('filepath', '')
-                screenshot_timestamp = screenshot.get('timestamp', 0)
-
-                if not filepath:
-                    context_text.setPlainText("Invalid screenshot filepath.")
-                    give_context_selected_button.setEnabled(True)
-                    give_context_selected_button.setText("Give Context to Selected")
-                    return
-
-                # Prepare parameters for the thread
-                summary_content = ""
-                if has_summary:
-                    summary = summaries[0]
-                    summary_content = summary.get('content', '')
-
-                all_transcripts = self.session_manager.db.get_transcripts(session_id)
-
-                transcript_excerpt = ""
-                if all_transcripts:
-                    sorted_transcripts = sorted(all_transcripts, key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp))
-                    nearest_2 = sorted_transcripts[:2]
-                    transcript_excerpt = " | ".join(t.get('text', '')[:200] for t in nearest_2 if t.get('text'))
-
-                # Create and configure the thread
-                thread = ScreenshotContextThread(
-                    screenshot_path=filepath,
-                    summary=summary_content if summary_content else None,
-                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                    db=self.session_manager.db
-                )
-
-                def on_context_finished(context):
-                    try:
-                        ai_summary = context.get('summary', 'N/A')
-                        visible_text = context.get('visible_text', [])
-                        keywords = context.get('keywords', [])
-
-                        if isinstance(visible_text, list):
-                            visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                        else:
-                            visible_text_str = str(visible_text) if visible_text else "None"
-
-                        if isinstance(keywords, list):
-                            keywords_str = ", ".join(keywords) if keywords else "None"
-                        else:
-                            keywords_str = str(keywords) if keywords else "None"
-
-                        import os
-                        filename = os.path.basename(filepath)
-
-                        context_text.setPlainText(f"""Screenshot: {filename}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}""")
-
-                        self._on_status_update(f"Generated context for selected screenshot")
-                    except Exception as e:
-                        logger.error(f"Error processing context result: {e}")
-                        context_text.setPlainText(f"Error processing result: {str(e)}")
-                    finally:
-                        give_context_selected_button.setEnabled(True)
-                        give_context_selected_button.setText("Give Context to Selected")
-                        context_thread[0] = None
-
-                def on_context_error(error_msg):
-                    logger.error(f"Failed to generate screenshot context: {error_msg}")
-                    context_text.setPlainText(f"Error generating context: {error_msg}")
-                    QMessageBox.warning(self, 'Context Generation Failed', error_msg)
-                    give_context_selected_button.setEnabled(True)
-                    give_context_selected_button.setText("Give Context to Selected")
-                    context_thread[0] = None
-
-                # Connect signals and start thread
-                thread.finished_signal.connect(on_context_finished)
-                thread.error_signal.connect(on_context_error)
-                context_thread[0] = thread
-                thread.start()
-
-            def on_give_context_all():
-                # Check if a thread is already running
-                if all_context_threads[0] is not None and all_context_threads[0].isRunning():
-                    return
-
-                give_context_all_button.setEnabled(False)
-                give_context_all_button.setText("Generating...")
-                context_text.setPlainText("Generating context for all screenshots...")
-                QApplication.processEvents()
-
-                # Prepare common data
-                summary_content = ""
-                if has_summary:
-                    summary = summaries[0]
-                    summary_content = summary.get('content', '')
-
-                # Prepare screenshots data for batch thread
-                screenshots_data = [
-                    {
-                        'filepath': s.get('filepath', ''),
-                        'timestamp': s.get('timestamp', 0),
-                        'session_id': session_id
-                    }
-                    for s in screenshots
-                ]
-
-                # Create batch thread (processes sequentially)
-                batch_thread = ScreenshotContextBatchThread(
-                    screenshots_data=screenshots_data,
-                    summary=summary_content,
-                    db=self.session_manager.db
-                )
-
-                context_display_parts = []
-
-                def on_progress(current, total, context, filepath):
-                    if context is not None:
-                        try:
-                            ai_summary = context.get('summary', 'N/A')
-                            visible_text = context.get('visible_text', [])
-                            keywords = context.get('keywords', [])
-
-                            if isinstance(visible_text, list):
-                                visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                            else:
-                                visible_text_str = str(visible_text) if visible_text else "None"
-
-                            if isinstance(keywords, list):
-                                keywords_str = ", ".join(keywords) if keywords else "None"
-                            else:
-                                keywords_str = str(keywords) if keywords else "None"
-
-                            import os
-                            filename = os.path.basename(filepath)
-
-                            screenshot_entry = f"""Screenshot: {filename}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}"""
-
-                            context_display_parts.append(screenshot_entry)
-                        except Exception as e:
-                            logger.error(f"Error processing context result: {e}")
-                            import os
-                            context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
-                    else:
-                        import os
-                        context_display_parts.append(f"[Error for {os.path.basename(filepath)}: Failed to generate]")
-
-                    # Update UI with current progress
-                    context_text.setPlainText(f"Processed {current}/{total} screenshots...\n\n" + "\n\n".join(context_display_parts))
-                    QApplication.processEvents()
-
-                def on_batch_finished(results):
-                    if context_display_parts:
-                        context_text.setPlainText("\n\n".join(context_display_parts))
-                        self._on_status_update(f"Generated context for {len(context_display_parts)} screenshot(s)")
-                    else:
-                        context_text.setPlainText("No context could be generated.")
-                    give_context_all_button.setEnabled(True)
-                    give_context_all_button.setText("Give Context to All")
-                    all_context_threads[0] = None
-
-                batch_thread.progress_signal.connect(on_progress)
-                batch_thread.finished_signal.connect(on_batch_finished)
-                all_context_threads[0] = batch_thread
-                batch_thread.start()
-
-            def on_delete_screenshot():
-                """Delete the selected screenshot from database and file system."""
-                selected_idx = selected_screenshot_index[0]
-                if selected_idx is None:
-                    return
-
-                screenshot = screenshots[selected_idx]
-                filepath = screenshot.get('filepath', '')
-                screenshot_id = screenshot.get('id')
-
-                if not filepath:
-                    return
-
-                reply = QMessageBox.question(
-                    self,
-                    'Delete Screenshot',
-                    f"Are you sure you want to delete this screenshot?\n\n{filepath}\n\nThis will remove it from the database and delete the file.",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-
-                if reply != QMessageBox.Yes:
-                    return
-
-                try:
-                    # Delete from database
-                    if screenshot_id:
-                        self.session_manager.db.delete_screenshot(screenshot_id)
-                    else:
-                        self.session_manager.db.delete_screenshot_by_filepath(filepath)
-
-                    # Delete file from filesystem
-                    import os
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
-                        logger.info(f"Deleted screenshot file: {filepath}")
-                    else:
-                        logger.warning(f"Screenshot file not found: {filepath}")
-
-                    # Delete description file if it exists
-                    # Format: description_{filename_without_extension}.txt
-                    directory = os.path.dirname(filepath)
-                    filename = os.path.basename(filepath)
-                    if filename.lower().endswith('.png'):
-                        desc_filename = 'description_' + filename[:-4] + '.txt'
-                    elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
-                        desc_filename = 'description_' + filename[:-4] + '.txt'
-                    else:
-                        desc_filename = 'description_' + os.path.splitext(filename)[0] + '.txt'
-                    
-                    desc_filepath = os.path.join(directory, desc_filename)
-                    if os.path.exists(desc_filepath):
-                        os.remove(desc_filepath)
-                        logger.info(f"Deleted description file: {desc_filepath}")
-
-                    self._on_status_update(f"Screenshot deleted")
-
-                    # Close the dialog and refresh
-                    dialog.close()
-
-                    # Reopen the screenshots dialog to refresh the list
-                    self._show_screenshots_by_session_id(session_id, session_name)
-
-                except Exception as e:
-                    logger.error(f"Failed to delete screenshot: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    QMessageBox.warning(self, 'Delete Failed', f"Failed to delete screenshot: {str(e)}")
-
-            delete_button.clicked.connect(on_delete_screenshot)
-            give_context_selected_button.clicked.connect(on_give_context_selected)
-            give_context_all_button.clicked.connect(on_give_context_all)
-
-            dialog.exec()
-
-        except Exception as e:
-            logger.error(f"Failed to show screenshots: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            QMessageBox.critical(
+            has_screenshots = bool(self.session_manager.db.get_screenshots(session_id))
+        except Exception:
+            has_screenshots = True  # let the viewer report the failure
+        live = self._live_session_state()
+        if not has_screenshots and not (live and live[0] == session_id):
+            QMessageBox.information(
                 self,
-                'Error',
-                f"Failed to load screenshots: {str(e)}"
+                'No Screenshots',
+                f"Session '{session_name}' does not have any screenshots."
             )
-    
-    def _toggle_fullscreen(self, dialog: QDialog, btn: QPushButton, image_label: QLabel, pixmap: QPixmap, screen_geometry):
-        """Toggle between fullscreen and normal mode."""
-        if dialog.isFullScreen():
-            dialog.showNormal()
-            btn.setText("Fullscreen")
-            # Scale to 50% when not fullscreen
-            width = int(screen_geometry.width() * 0.5)
-            height = int(screen_geometry.height() * 0.5)
-            dialog.resize(width, height)
-            dialog.move(int((screen_geometry.width() - width) / 2),
-                       int((screen_geometry.height() - height) / 2))
-            # Scale image to fit in the window
-            if not pixmap.isNull():
-                image_label.setPixmap(pixmap.scaled(
-                    screen_geometry.width(),
-                    screen_geometry.height(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                ))
-        else:
-            # Save current geometry for restore
-            dialog.showFullScreen()
-            btn.setText("Exit Fullscreen")
-            # Scale image to fill the fullscreen
-            if not pixmap.isNull():
-                image_label.setPixmap(pixmap.scaled(
-                    screen_geometry.width(),
-                    screen_geometry.height(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                ))
+            return
+        self._open_screenshot_viewer(session_id, session_name)
 
-    def _show_full_image(self, filepath: str, timestamp):
-        """Show a full-size image in a dialog for the given filepath and timestamp.
-
-        Args:
-            filepath: Path to the image file
-            timestamp: Capture timestamp (int/float epoch or ISO string)
-        """
-        try:
-            from datetime import datetime
-            from PySide6.QtWidgets import QApplication, QScrollArea
-
-            # Create dialog with window controls
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Screenshot")
-            dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowMinMaxButtonsHint)
-
-            # Get screen size (fall back to sensible defaults)
-            screen = QApplication.primaryScreen()
-            if screen:
-                screen_geometry = screen.availableGeometry()
-            else:
-                # Use a default size object if primaryScreen not available
-                class _G:
-                    def width(self):
-                        return 1280
-                    def height(self):
-                        return 800
-                screen_geometry = _G()
-
-            # Default to 50% of screen
-            try:
-                width = int(screen_geometry.width() * 0.5)
-                height = int(screen_geometry.height() * 0.5)
-            except Exception:
-                width, height = 800, 600
-
-            dialog.resize(width, height)
-
-            # Center the window
-            try:
-                dialog.move(int((screen_geometry.width() - width) / 2),
-                            int((screen_geometry.height() - height) / 2))
-            except Exception:
-                pass
-
-            layout = QVBoxLayout(dialog)
-            layout.setContentsMargins(5, 5, 5, 5)
-
-            # Timestamp label (if available)
-            time_str = ''
-            if timestamp:
-                try:
-                    if isinstance(timestamp, (int, float)):
-                        dt = datetime.fromtimestamp(timestamp)
-                    elif isinstance(timestamp, str):
-                        try:
-                            dt = datetime.fromisoformat(timestamp)
-                        except Exception:
-                            # Try numeric string
-                            dt = datetime.fromtimestamp(float(timestamp))
-                    else:
-                        dt = None
-
-                    if dt:
-                        time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    try:
-                        time_str = str(timestamp)
-                    except Exception:
-                        time_str = ''
-
-            if time_str:
-                time_label = QLabel(f"Captured at: {time_str}")
-                time_label.setAlignment(Qt.AlignCenter)
-                layout.addWidget(time_label)
-
-            # Image with scroll area for zooming/panning
-            scroll_area = QScrollArea()
-            scroll_area.setWidgetResizable(True)
-            try:
-                scroll_area.setAlignment(Qt.AlignCenter)
-            except Exception:
-                # Older Qt versions may not support setAlignment on QScrollArea
-                pass
-
-            image_label = QLabel()
-            image_label.setAlignment(Qt.AlignCenter)
-            pixmap = QPixmap(filepath)
-
-            if not pixmap.isNull():
-                # Scale image to fit in the scroll area
-                try:
-                    image_label.setPixmap(pixmap.scaled(
-                        screen_geometry.width(),
-                        screen_geometry.height(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation
-                    ))
-                except Exception:
-                    image_label.setPixmap(pixmap)
-            else:
-                image_label.setText(f"Failed to load image\n{filepath}")
-
-            scroll_area.setWidget(image_label)
-            layout.addWidget(scroll_area)
-
-            # Button layout for Close and Fullscreen
-            button_layout = QHBoxLayout()
-            button_layout.addStretch()
-
-            # Fullscreen toggle button
-            fullscreen_btn = QPushButton("Fullscreen")
-            fullscreen_btn.clicked.connect(lambda: self._toggle_fullscreen(dialog, fullscreen_btn, image_label, pixmap, screen_geometry))
-            button_layout.addWidget(fullscreen_btn)
-
-            # Close button
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.close)
-            button_layout.addWidget(close_button)
-
-            layout.addLayout(button_layout)
-
-            dialog.exec()
-
-        except Exception as e:
-            logger.error(f"Failed to show full image: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            QMessageBox.critical(self, 'Error', f"Failed to show full image: {str(e)}")
-    
     def _show_session_screenshots(self, row):
-        """Show the screenshots for a session in a separate window."""
+        """Show the screenshots of the session in a session-list row."""
+        session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
+        session_name = self.sessions_list.item(row, 0).text()
+        if session_id is None:
+            return
+        self._show_screenshots_by_session_id(session_id, session_name)
+
+    def _open_screenshot_reference(self, screenshot_id: int):
+        """Open the viewer on a screenshot the assistant pointed to (BU109)."""
+        db = self.session_manager.db
         try:
-            session_id = self.sessions_list.item(row, 0).data(Qt.UserRole)
-            session_name = self.sessions_list.item(row, 0).text()
-            
-            if session_id is None:
-                return
-            
-            # Fetch screenshots from database
-            screenshots = self.session_manager.db.get_screenshots(session_id)
-            
-            if not screenshots:
-                QMessageBox.information(
-                    self,
-                    'No Screenshots',
-                    f"Session '{session_name}' does not have any screenshots yet."
-                )
-                return
-            
-            # Create a dialog to display the screenshots
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Screenshots - {session_name}")
-            dialog.setMinimumSize(800, 600)
-            
-            layout = QVBoxLayout(dialog)
-            
-            # Header with session info
-            header_label = QLabel(f"Screenshots for: {session_name}")
-            header_font = header_label.font()
-            header_font.setPointSize(14)
-            header_font.setBold(True)
-            header_label.setFont(header_font)
-            layout.addWidget(header_label)
-            
-            # Scroll area for screenshots
-            scroll_area = QScrollArea()
-            scroll_area.setWidgetResizable(True)
-            
-            # Grid layout for screenshots
-            grid_widget = QWidget()
-            grid_layout = QGridLayout(grid_widget)
-            grid_layout.setSpacing(10)
-            
-            # Store references to screenshot widgets for selection highlighting
-            screenshot_labels = []
-            time_labels = []
-            selected_screenshot_index = [None]  # Use list to allow mutation in closure
-            
-            def get_context_for_screenshot(idx):
-                """Get formatted context string for a specific screenshot."""
-                if idx is None or idx >= len(screenshots):
-                    return ""
-                screenshot = screenshots[idx]
-                ai_summary = screenshot.get('ai_summary', '')
-                visible_text = screenshot.get('visible_text', '')
-                keywords = screenshot.get('keywords', '')
-                
-                if not ai_summary:
-                    return ""
-                
-                import json
-                try:
-                    visible_text_list = json.loads(visible_text) if visible_text else []
-                except:
-                    visible_text_list = []
-                
-                try:
-                    keywords_list = json.loads(keywords) if keywords else []
-                except:
-                    keywords_list = []
-                
-                visible_text_str = ", ".join(visible_text_list) if visible_text_list else "None"
-                keywords_str = ", ".join(keywords_list) if keywords_list else "None"
-                
-                # Get just the filename for display
-                import os
-                filename = os.path.basename(screenshot.get('filepath', ''))
-                
-                return f"""Screenshot: {filename}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}"""
-            
-            def update_selection(new_index):
-                """Update the selected screenshot and refresh the display."""
-                # Remove highlight from previous selection
-                old_index = selected_screenshot_index[0]
-                if old_index is not None and old_index < len(screenshot_labels):
-                    screenshot_labels[old_index].setStyleSheet("")
-                    time_labels[old_index].setStyleSheet("")
-                
-                # Set new selection
-                selected_screenshot_index[0] = new_index
-                
-                if new_index is not None:
-                    # Add highlight to new selection
-                    screenshot_labels[new_index].setStyleSheet("border: 3px solid #0078d4;")
-                    time_labels[new_index].setStyleSheet("border: 3px solid #0078d4; border-top: none;")
-                    
-                    # Show context for selected screenshot
-                    context = get_context_for_screenshot(new_index)
-                    if context:
-                        context_text.setPlainText(context)
-                    else:
-                        context_text.setPlainText("No context available for this screenshot. Click 'Give Context to Selected' to generate it.")
-                else:
-                    context_text.setPlainText("")
-            
-            def on_screenshot_clicked(idx):
-                """Handle screenshot click - select it and show context."""
-                update_selection(idx)
-                # Enable the "Give Context to Selected" button when a screenshot is selected
-                if has_summary and idx is not None:
-                    give_context_selected_button.setEnabled(True)
-                # Enable delete button when a screenshot is selected
-                delete_button.setEnabled(idx is not None)
-            
-            # Add screenshots to the grid
-            from datetime import datetime
-            for idx, screenshot in enumerate(screenshots):
-                filepath = screenshot.get('filepath', '')
-                timestamp = screenshot.get('timestamp', 0)
-                
-                # Convert timestamp to readable format
-                dt = datetime.fromtimestamp(timestamp)
-                time_str = dt.strftime('%H:%M:%S')
-                
-                # Create container widget for screenshot and timestamp
-                container = QWidget()
-                container_layout = QVBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.setSpacing(2)
-                
-                # Create label with image
-                image_label = QLabel()
-                pixmap = QPixmap(filepath)
-                
-                if not pixmap.isNull():
-                    # Scale to fit while maintaining aspect ratio
-                    scaled_pixmap = pixmap.scaled(300, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    image_label.setPixmap(scaled_pixmap)
-                else:
-                    image_label.setText(f"Failed to load image\n{filepath}")
-                
-                image_label.setAlignment(Qt.AlignCenter)
-                image_label.setCursor(Qt.PointingHandCursor)
-                
-                # Store reference for selection highlighting
-                screenshot_labels.append(image_label)
-                
-                # Click to select (not fullscreen)
-                image_label.mousePressEvent = lambda event, fp=filepath, ts=timestamp, i=idx: (
-                    event.accept(),
-                    on_screenshot_clicked(i)
-                )
-                
-                # Double-click for fullscreen
-                image_label.mouseDoubleClickEvent = lambda event, fp=filepath, ts=timestamp: (
-                    event.accept(),
-                    self._show_full_image(fp, ts)
-                )
-                
-                # Timestamp label
-                time_label = QLabel(f"Captured at: {time_str}")
-                time_label.setAlignment(Qt.AlignCenter)
-                time_labels.append(time_label)
-                
-                container_layout.addWidget(image_label)
-                container_layout.addWidget(time_label)
-                
-                # Add to grid (2 columns)
-                grid_layout.addWidget(container, idx // 2, idx % 2)
-            
-            scroll_area.setWidget(grid_widget)
-            layout.addWidget(scroll_area)
-            
-            # Selection hint
-            selection_hint = QLabel("Click on a screenshot to select it and view its context")
-            selection_hint.setStyleSheet("color: gray; font-style: italic;")
-            layout.addWidget(selection_hint)
-            
-            # Context generation section
-            context_label = QLabel("Screenshot Context:")
-            context_label.setFont(header_font)
-            layout.addWidget(context_label)
-            
-            # Text area for context display
-            context_text = QTextEdit()
-            context_text.setReadOnly(True)
-            context_text.setMaximumHeight(100)
-            
-            # Check if summary exists - required for context generation
-            summaries = self.session_manager.db.get_summaries(session_id)
-            has_summary = bool(summaries and len(summaries) > 0)
-            
-            # Initial message based on summary availability
-            if has_summary:
-                context_text.setPlaceholderText("Select a screenshot and click 'Give Context to Selected' to generate context, or 'Give Context to All' for all screenshots...")
-            else:
-                context_text.setPlaceholderText("Generate a summary first before generating screenshot context.")
-            
-            layout.addWidget(context_text)
-            
-            # Buttons
-            button_layout = QHBoxLayout()
-            
-            # Give Context to Selected button - requires a screenshot to be selected
-            give_context_selected_button = QPushButton("Give Context to Selected")
-            give_context_selected_button.setEnabled(False)  # Disabled until a screenshot is selected
-            
-            if not has_summary:
-                give_context_selected_button.setToolTip("Generate a summary first before generating screenshot context")
-            else:
-                give_context_selected_button.setToolTip("Generate context for the currently selected screenshot")
-            
-            # Give Context to All button - generates context for all screenshots
-            give_context_all_button = QPushButton("Give Context to All")
-            give_context_all_button.setEnabled(has_summary and len(screenshots) > 0)
-            
-            if not has_summary:
-                give_context_all_button.setToolTip("Generate a summary first before generating screenshot context")
-
-            # Delete button
-            delete_button = QPushButton("Delete Selected")
-            delete_button.setEnabled(False)
-            delete_button.setStyleSheet("color: red;")
-
-            # Close button
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.close)
-
-            button_layout.addWidget(give_context_selected_button)
-            button_layout.addWidget(give_context_all_button)
-            button_layout.addStretch()
-            button_layout.addWidget(delete_button)
-            button_layout.addWidget(close_button)
-            
-            layout.addLayout(button_layout)
-            
-            # Store references for the callbacks
-            # Store thread references for cleanup
-            context_thread = [None]  # Use list to allow mutation in closure
-            all_context_threads = [None]  # For "Give Context to All"
-
-            def on_give_context_selected():
-                """Generate context for the selected screenshot."""
-                selected_idx = selected_screenshot_index[0]
-                if selected_idx is None:
-                    QMessageBox.information(self, 'No Selection', 'Please select a screenshot first.')
-                    return
-
-                # Check if a thread is already running
-                if context_thread[0] is not None and context_thread[0].isRunning():
-                    return
-
-                give_context_selected_button.setEnabled(False)
-                give_context_selected_button.setText("Generating...")
-                context_text.setPlainText("Generating context for selected screenshot...")
-                QApplication.processEvents()
-
-                # Get the screenshot data
-                screenshot = screenshots[selected_idx]
-                filepath = screenshot.get('filepath', '')
-                screenshot_timestamp = screenshot.get('timestamp', 0)
-
-                if not filepath:
-                    context_text.setPlainText("Invalid screenshot filepath.")
-                    give_context_selected_button.setEnabled(True)
-                    give_context_selected_button.setText("Give Context to Selected")
-                    return
-
-                # Prepare parameters for the thread
-                summary_content = ""
-                if has_summary:
-                    summary = summaries[0]
-                    summary_content = summary.get('content', '')
-
-                all_transcripts = self.session_manager.db.get_transcripts(session_id)
-
-                transcript_excerpt = ""
-                if all_transcripts:
-                    sorted_transcripts = sorted(
-                        all_transcripts,
-                        key=lambda t: abs(t.get('timestamp', 0) - screenshot_timestamp)
-                    )
-                    nearest_2 = sorted_transcripts[:2]
-                    transcript_excerpt = " | ".join(
-                        t.get('text', '')[:200] for t in nearest_2 if t.get('text')
-                    )
-
-                # Create and configure the thread
-                thread = ScreenshotContextThread(
-                    screenshot_path=filepath,
-                    summary=summary_content if summary_content else None,
-                    transcript_excerpt=transcript_excerpt if transcript_excerpt else None,
-                    db=self.session_manager.db
-                )
-
-                def on_context_finished(context):
-                    try:
-                        ai_summary = context.get('summary', 'N/A')
-                        visible_text = context.get('visible_text', [])
-                        keywords = context.get('keywords', [])
-
-                        # Format visible text as string
-                        if isinstance(visible_text, list):
-                            visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                        else:
-                            visible_text_str = str(visible_text) if visible_text else "None"
-
-                        # Format keywords as string
-                        if isinstance(keywords, list):
-                            keywords_str = ", ".join(keywords) if keywords else "None"
-                        else:
-                            keywords_str = str(keywords) if keywords else "None"
-
-                        # Get just the filename for display
-                        import os
-                        filename = os.path.basename(filepath)
-
-                        context_text.setPlainText(f"""Screenshot: {filename}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}""")
-
-                        self._on_status_update(f"Generated context for selected screenshot")
-                    except Exception as e:
-                        logger.error(f"Error processing context result: {e}")
-                        context_text.setPlainText(f"Error processing result: {str(e)}")
-                    finally:
-                        give_context_selected_button.setEnabled(True)
-                        give_context_selected_button.setText("Give Context to Selected")
-                        context_thread[0] = None
-
-                def on_context_error(error_msg):
-                    logger.error(f"Failed to generate screenshot context: {error_msg}")
-                    context_text.setPlainText(f"Error generating context: {error_msg}")
-                    QMessageBox.warning(self, 'Context Generation Failed', error_msg)
-                    give_context_selected_button.setEnabled(True)
-                    give_context_selected_button.setText("Give Context to Selected")
-                    context_thread[0] = None
-
-                # Connect signals and start thread
-                thread.finished_signal.connect(on_context_finished)
-                thread.error_signal.connect(on_context_error)
-                context_thread[0] = thread
-                thread.start()
-
-            def on_give_context_all():
-                """Generate context for all screenshots."""
-                # Check if a thread is already running
-                if all_context_threads[0] is not None and all_context_threads[0].isRunning():
-                    return
-
-                give_context_all_button.setEnabled(False)
-                give_context_all_button.setText("Generating...")
-                context_text.setPlainText("Generating context for all screenshots...")
-                QApplication.processEvents()
-
-                # Prepare common data
-                summary_content = ""
-                if has_summary:
-                    summary = summaries[0]
-                    summary_content = summary.get('content', '')
-
-                # Prepare screenshots data for batch thread
-                screenshots_data = [
-                    {
-                        'filepath': s.get('filepath', ''),
-                        'timestamp': s.get('timestamp', 0),
-                        'session_id': session_id
-                    }
-                    for s in screenshots
-                ]
-
-                # Create batch thread (processes sequentially)
-                batch_thread = ScreenshotContextBatchThread(
-                    screenshots_data=screenshots_data,
-                    summary=summary_content,
-                    db=self.session_manager.db
-                )
-
-                context_display_parts = []
-
-                def on_progress(current, total, context, filepath):
-                    if context is not None:
-                        try:
-                            ai_summary = context.get('summary', 'N/A')
-                            visible_text = context.get('visible_text', [])
-                            keywords = context.get('keywords', [])
-
-                            if isinstance(visible_text, list):
-                                visible_text_str = ", ".join(visible_text) if visible_text else "None"
-                            else:
-                                visible_text_str = str(visible_text) if visible_text else "None"
-
-                            if isinstance(keywords, list):
-                                keywords_str = ", ".join(keywords) if keywords else "None"
-                            else:
-                                keywords_str = str(keywords) if keywords else "None"
-
-                            import os
-                            filename = os.path.basename(filepath)
-
-                            screenshot_entry = f"""Screenshot: {filename}
-Summary: {ai_summary}
-Visible Text: {visible_text_str}
-Keywords: {keywords_str}"""
-
-                            context_display_parts.append(screenshot_entry)
-                        except Exception as e:
-                            logger.error(f"Error processing context result: {e}")
-                            import os
-                            context_display_parts.append(f"[Error for {os.path.basename(filepath)}: {str(e)}]")
-                    else:
-                        import os
-                        context_display_parts.append(f"[Error for {os.path.basename(filepath)}: Failed to generate]")
-
-                    # Update UI with current progress
-                    context_text.setPlainText(f"Processed {current}/{total} screenshots...\n\n" + "\n\n".join(context_display_parts))
-                    QApplication.processEvents()
-
-                def on_batch_finished(results):
-                    if context_display_parts:
-                        context_text.setPlainText("\n\n".join(context_display_parts))
-                        self._on_status_update(f"Generated context for {len(context_display_parts)} screenshot(s)")
-                    else:
-                        context_text.setPlainText("No context could be generated.")
-                    give_context_all_button.setEnabled(True)
-                    give_context_all_button.setText("Give Context to All")
-                    all_context_threads[0] = None
-
-                batch_thread.progress_signal.connect(on_progress)
-                batch_thread.finished_signal.connect(on_batch_finished)
-                all_context_threads[0] = batch_thread
-                batch_thread.start()
-
-            def on_delete_screenshot():
-                """Delete the selected screenshot from database and file system."""
-                selected_idx = selected_screenshot_index[0]
-                if selected_idx is None:
-                    return
-
-                screenshot = screenshots[selected_idx]
-                filepath = screenshot.get('filepath', '')
-                screenshot_id = screenshot.get('id')
-
-                if not filepath:
-                    return
-
-                reply = QMessageBox.question(
-                    self,
-                    'Delete Screenshot',
-                    f"Are you sure you want to delete this screenshot?\n\n{filepath}\n\nThis will remove it from the database and delete the file.",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-
-                if reply != QMessageBox.Yes:
-                    return
-
-                try:
-                    # Delete from database
-                    if screenshot_id:
-                        self.session_manager.db.delete_screenshot(screenshot_id)
-                    else:
-                        self.session_manager.db.delete_screenshot_by_filepath(filepath)
-
-                    # Delete file from filesystem
-                    import os
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
-                        logger.info(f"Deleted screenshot file: {filepath}")
-                    else:
-                        logger.warning(f"Screenshot file not found: {filepath}")
-
-                    # Delete description file if it exists
-                    # Format: description_{filename_without_extension}.txt
-                    directory = os.path.dirname(filepath)
-                    filename = os.path.basename(filepath)
-                    if filename.lower().endswith('.png'):
-                        desc_filename = 'description_' + filename[:-4] + '.txt'
-                    elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
-                        desc_filename = 'description_' + filename[:-4] + '.txt'
-                    else:
-                        desc_filename = 'description_' + os.path.splitext(filename)[0] + '.txt'
-                    
-                    desc_filepath = os.path.join(directory, desc_filename)
-                    if os.path.exists(desc_filepath):
-                        os.remove(desc_filepath)
-                        logger.info(f"Deleted description file: {desc_filepath}")
-
-                    self._on_status_update(f"Screenshot deleted")
-
-                    # Close the dialog and refresh
-                    dialog.close()
-
-                    # Reopen the screenshots dialog to refresh the list
-                    self._show_session_screenshots(row)
-
-                except Exception as e:
-                    logger.error(f"Failed to delete screenshot: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    QMessageBox.warning(self, 'Delete Failed', f"Failed to delete screenshot: {str(e)}")
-
-            # Connect buttons to handlers
-            delete_button.clicked.connect(on_delete_screenshot)
-            give_context_selected_button.clicked.connect(on_give_context_selected)
-            give_context_all_button.clicked.connect(on_give_context_all)
-            
-            dialog.exec()
-            
-        except Exception as e:
-            logger.error(f"Failed to show screenshots: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            QMessageBox.critical(
-                self,
-                'Error',
-                f"Failed to load screenshots: {str(e)}"
+            row = db.get_screenshot(screenshot_id)
+        except Exception:
+            self._on_status_update(
+                f"Screenshot #{screenshot_id} no longer exists", is_error=True
             )
-    
+            return
+        session_id = row['session_id']
+        session = db.get_session(session_id) or {}
+        self._open_screenshot_viewer(
+            session_id,
+            session.get('name') or f"Session {session_id}",
+            focus_screenshot_id=screenshot_id,
+        )
+
+
     def _create_menu_bar(self):
         """Create the application menu bar."""
         menu_bar = QMenuBar(self)
@@ -3196,28 +2083,22 @@ Keywords: {keywords_str}"""
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(10)
+        top.setSpacing(8)
         top.addStretch()
-        self.transcript_filter_button = PixelToolButton()
-        self.transcript_filter_button.setIcon(self._make_icon("icon_filter.svg"))
-        self.transcript_filter_button.setIconSize(QSize(28, 28))
-        self.transcript_filter_button.setText("⌄")
+        self.transcript_filter_button = PixelToolButton(compact=True)
+        self.transcript_filter_button.setIcon(self._make_icon("icon_filter_smooth.svg"))
         self.transcript_filter_button.setToolTip("Cycle transcript filter")
         self.transcript_filter_button.clicked.connect(self._cycle_transcription_filter)
         top.addWidget(self.transcript_filter_button)
 
-        self.download_transcript_button = PixelToolButton()
-        self.download_transcript_button.setIcon(self._make_icon("icon_download.svg"))
-        self.download_transcript_button.setIconSize(QSize(28, 28))
-        self.download_transcript_button.setText("⇩")
+        self.download_transcript_button = PixelToolButton(compact=True)
+        self.download_transcript_button.setIcon(self._make_icon("icon_download_smooth.svg"))
         self.download_transcript_button.setToolTip("Download transcript")
         self.download_transcript_button.clicked.connect(self._on_download_transcripts)
         top.addWidget(self.download_transcript_button)
 
-        self.detach_transcription_button = PixelToolButton()
-        self.detach_transcription_button.setIcon(self._make_icon("icon_export.svg"))
-        self.detach_transcription_button.setIconSize(QSize(28, 28))
-        self.detach_transcription_button.setText("□")
+        self.detach_transcription_button = PixelToolButton(compact=True)
+        self.detach_transcription_button.setIcon(self._make_icon("icon_detach_smooth.svg"))
         self.detach_transcription_button.setToolTip("Detach transcripts window")
         self.detach_transcription_button.clicked.connect(self._on_detach_transcription)
         top.addWidget(self.detach_transcription_button)
@@ -3311,6 +2192,9 @@ Keywords: {keywords_str}"""
         self._transcription_scroll_area.verticalScrollBar().valueChanged.connect(
             self._on_transcription_scroll_changed
         )
+        self._transcription_scroll_area.verticalScrollBar().rangeChanged.connect(
+            self._on_transcription_range_changed
+        )
 
         self._transcription_container = QWidget()
         self._transcription_scroll_area.setWidget(self._transcription_container)
@@ -3324,16 +2208,64 @@ Keywords: {keywords_str}"""
         wrapper_layout.addWidget(self._transcription_scroll_area, 1)
         return wrapper
 
-    def add_transcription_to_view(self, text: str, source: str, timestamp: str = ''):
-        """Add a transcription bubble to the pixel transcript window."""
+    def add_transcription_to_view(self, text: str, source: str, timestamp: str = '',
+                                   start_dt=None, end_dt=None, animate: bool = True):
+        """Add a transcription chunk to the pixel transcript window.
+
+        Grouped per source (BU103): consecutive chunks with no real pause
+        between them extend the source's currently open bubble instead of
+        starting a new one, so a continuous stretch of talk reads as one
+        growing bubble with a single ``HH:MM`` timestamp. ``start_dt``/
+        ``end_dt`` (datetimes) drive that decision when provided; without
+        them (unknown timing) every chunk starts its own bubble, as before.
+
+        Args:
+            animate: Play the fade-in on a freshly inserted bubble. Loading a
+                past session replays its whole transcript at once through
+                this method (see _load_transcripts_for_session) and passes
+                False, so opening a long session doesn't fire one
+                QPropertyAnimation per historical line.
+        """
+        group = self._transcript_groups.get(source)
+        now = datetime.now()
+
+        extend = False
+        if group is not None and start_dt is not None and end_dt is not None:
+            gap = (start_dt - group['last_end']).total_seconds()
+            duration = (end_dt - group['start_dt']).total_seconds()
+            if gap <= TRANSCRIPT_PAUSE_GAP_SECONDS and duration <= TRANSCRIPT_MAX_GROUP_SECONDS:
+                extend = True
+
+        if extend:
+            # No fade here: this row's bubble is actively resizing (growing
+            # taller as text wraps), and re-triggering a QGraphicsOpacityEffect
+            # on a widget mid-resize - especially while it's scrolled out of
+            # the viewport - corrupted its rendering. Only a freshly inserted
+            # bubble (below, whose size is settled before the fade starts)
+            # gets the fade-in.
+            bubble = group['bubble']
+            bubble.append_text(text)
+            merged_find_text = f"{group['row'].property('find_text')} {text}"
+            group['row'].setProperty('find_text', merged_find_text)
+            group['last_end'] = end_dt
+            return
+
         display_source = "Mic" if source == 'mic' else "System"
+        if start_dt is not None:
+            bubble_time = start_dt.strftime('%H:%M')
+        elif timestamp:
+            bubble_time = timestamp[:5]
+        else:
+            bubble_time = ''
         display_text = f"{display_source}: {text}"
         align = "right" if source == 'mic' else "left"
         variant = "blue" if source == 'mic' else "cream"
 
-        row = aligned_bubble(display_text, variant=variant, align=align, max_width=250)
+        row = aligned_bubble_with_time(
+            display_text, variant=variant, align=align, max_width=250, time_text=bubble_time
+        )
         row.setProperty('source', source)
-        row.setProperty('find_text', display_text)
+        row.setProperty('find_text', f"{display_source}: {text}")
         row.setToolTip(timestamp or '')
 
         if self._transcription_filter == 'mic' and source != 'mic':
@@ -3341,25 +2273,56 @@ Keywords: {keywords_str}"""
         elif self._transcription_filter == 'system' and source != 'system':
             row.hide()
 
-        # Only stick to the bottom if the user is already there (tracked live via
-        # _on_transcription_scroll_changed, not recomputed here). If they have
-        # scrolled up to read earlier lines, leave their position untouched -
-        # and it stays untouched until they scroll back to the bottom themselves.
-        scroll_bar = self._transcription_scroll_area.verticalScrollBar()
-        should_autoscroll = self._transcription_autoscroll
-
+        # Sticking to the bottom (or not) is handled by _on_transcription_range_changed,
+        # which reacts once the scroll area's content has actually finished resizing
+        # for this new bubble - inserting here is enough to trigger it.
         self._transcription_layout.insertWidget(
             self._transcription_layout.count() - 1,
             row
         )
 
-        if should_autoscroll:
-            # Defer until the layout has accounted for the new widget so the
-            # scrollbar maximum is up to date.
-            QTimer.singleShot(0, lambda: scroll_bar.setValue(scroll_bar.maximum()))
+        self._transcript_groups[source] = {
+            'row': row,
+            'bubble': bubble_of_row(row),
+            'start_dt': start_dt or now,
+            'last_end': end_dt or now,
+        }
+        if animate:
+            self._play_transcript_fade(row)
 
         if hasattr(self, '_detached_display') and self._detached_display:
             pass
+
+    def _play_transcript_fade(self, row: QWidget):
+        """Brief opacity fade-in on a freshly inserted bubble row (BU103).
+
+        The QGraphicsOpacityEffect is removed again as soon as the animation
+        finishes, rather than left attached: leaving it on the row meant any
+        *later* resize of that same row (the bubble growing via
+        ``append_text``) still ran through a graphics effect that was never
+        re-triggered for the new size, which corrupted the row's rendering
+        when it happened off-screen (scrolled out of the viewport). With the
+        effect removed right after use, a later append resizes a perfectly
+        plain widget.
+        """
+        effect = QGraphicsOpacityEffect(row)
+        effect.setOpacity(0.35)
+        row.setGraphicsEffect(effect)
+
+        anim = QPropertyAnimation(effect, b"opacity", row)
+        anim.setDuration(200)
+        anim.setStartValue(0.35)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        def _cleanup():
+            if row.graphicsEffect() is effect:
+                row.setGraphicsEffect(None)
+            row.setProperty('_fade_anim', None)
+
+        anim.finished.connect(_cleanup)
+        row.setProperty('_fade_anim', anim)  # keep a live reference while running
+        anim.start()
 
     def _on_transcription_scroll_changed(self, value: int):
         """Track whether the transcript stream is scrolled to the bottom.
@@ -3372,14 +2335,26 @@ Keywords: {keywords_str}"""
         scroll_bar = self._transcription_scroll_area.verticalScrollBar()
         self._transcription_autoscroll = (scroll_bar.maximum() - value) <= 40
 
+    def _on_transcription_range_changed(self, minimum: int, maximum: int):
+        """Keep the transcript stream pinned to the bottom while auto-follow is on.
+
+        Fires whenever the scroll content's height actually changes (new bubble
+        added, filter toggled, etc.) - including any later pass where a bubble's
+        wrapped text grows its final height - so the view always lands on the
+        true last message instead of snapping early to a not-yet-final maximum.
+        """
+        if self._transcription_autoscroll:
+            self._transcription_scroll_area.verticalScrollBar().setValue(maximum)
+
     def _clear_transcription_view(self):
         """Clear all transcriptions from the view."""
         # Clear history
         self._transcription_history = []
-        
+
         # Reset viewing flag - go back to live mode
         self._viewing_historical_transcripts = False
         self._transcription_autoscroll = True
+        self._transcript_groups = {}
 
         if hasattr(self, '_transcription_layout') and self._transcription_layout:
             # Remove all widgets except the stretch (last item)
@@ -3636,18 +2611,9 @@ Keywords: {keywords_str}"""
             allow_live: If True, allow live transcriptions to be shown
         """
         try:
-            # Use selected session from UI first, then fall back to active session
-            session_id = None
-            
-            if self._selected_session_id is not None:
-                # Use the selected session from UI
-                session_id = self._selected_session_id
-            elif self.session_manager:
-                # Fall back to active session (if recording)
-                active_session = self.session_manager.get_active_session()
-                if active_session:
-                    session_id = active_session.id
-            
+            # Selected session from UI first, then the active/recording one.
+            session_id = self._current_display_session_id()
+
             if session_id is not None:
                 self._load_transcripts_for_session(session_id, allow_live=allow_live)
                 logger.info(f"Loaded transcripts for current session: {session_id}")
@@ -3703,23 +2669,33 @@ Keywords: {keywords_str}"""
                 
                 # Format timestamp
                 time_str = ''
+                start_dt = None
                 if timestamp:
                     try:
-                        from datetime import datetime
-                        dt = datetime.fromtimestamp(timestamp)
-                        time_str = dt.strftime('%H:%M:%S')
+                        start_dt = datetime.fromtimestamp(timestamp)
+                        time_str = start_dt.strftime('%H:%M:%S')
                     except:
                         time_str = str(timestamp)
-                
+
                 # Format display text
                 source_label = 'Mic' if source == 'mic' else 'System'
                 display_text = f"[{time_str}] {source_label}: {text}" if time_str else f"{source_label}: {text}"
-                
+
                 # Store in history
                 self._transcription_history.append(display_text)
-                
-                # Add to view (using the add_transcription_to_view method)
-                self.add_transcription_to_view(text, source, time_str)
+
+                # Add to view (using the same grouped call live results use, so
+                # a reloaded session renders with the same grouped bubbles).
+                # animate=False: this is a bulk replay of history, not a
+                # chunk arriving live - a fade-in per bubble here meant
+                # opening a long session fired dozens of animations at once.
+                end_dt = (
+                    start_dt + timedelta(seconds=ChunkedAudioRecorder.CHUNK_DURATION)
+                    if start_dt else None
+                )
+                self.add_transcription_to_view(
+                    text, source, time_str, start_dt=start_dt, end_dt=end_dt, animate=False
+                )
                 
                 # Also add to detached window if it exists
                 if hasattr(self, '_detached_window') and self._detached_window:
@@ -3779,8 +2755,22 @@ Keywords: {keywords_str}"""
             self._on_status_update(f"Failed to download transcript: {str(e)}", is_error=True)
 
     def _on_status_update(self, message: str, is_error: bool = False):
-        """Handle status updates from the session manager."""
-        print(f"[DEBUG] Status update: {message}")
+        """Status-update entry point passed to SessionManager as its
+        status_callback, and called directly all over this file.
+
+        SessionManager now fires this from its live-transcription worker and
+        job threads (not just the UI thread), so it does nothing but emit a
+        signal; Qt.QueuedConnection marshals the call onto the UI thread
+        before _apply_status_update touches any widget - including when this
+        is called from the UI thread itself, so every caller keeps working
+        unchanged.
+        """
+        self._status_ready.emit(message, is_error)
+
+    @Slot(str, bool)
+    def _apply_status_update(self, message: str, is_error: bool = False):
+        """Actually update the status bar / app log. UI thread only."""
+        logger.debug(f"Status update: {message}")
         self.status_label.setText(message)
         self.status_bar.showMessage(message)
 
@@ -3791,6 +2781,54 @@ Keywords: {keywords_str}"""
 
         # Also show in app logs widget
         self._add_app_log(message, is_error)
+
+    def _on_session_finalized(self, session_id: int, outcome: dict):
+        """SessionManager callback (background job thread) fired once a
+        stopped session's transcribe/index/summarize pass has finished.
+        Only emits - see _on_status_update for why."""
+        self._session_finalized_ready.emit(session_id, outcome)
+
+    @Slot(int, object)
+    def _apply_session_finalized(self, session_id: int, outcome: dict):
+        """Report a background finalize's outcome and refresh anything that
+        shows session status. UI thread only."""
+        self._finalizing_session_ids.discard(session_id)
+        outcome = outcome or {}
+        error = outcome.get('error')
+        if error:
+            self._on_status_update(
+                f"Finishing session {session_id} failed: {error}", is_error=True
+            )
+        else:
+            bits = []
+            if outcome.get('transcribed'):
+                bits.append(f"{outcome['transcribed']} chunk(s) transcribed")
+            if outcome.get('summarized'):
+                bits.append('summary generated')
+            detail = ', '.join(bits) if bits else 'already up to date'
+            self._on_status_update(f"Session {session_id} finalized ({detail})")
+
+        self._refresh_session_completer()
+        self._update_summary_icon_state()
+        # An open All Sessions window won't otherwise notice a background
+        # finalize completing (it only reloads on its own actions / the
+        # 600ms live-indicator tick), so refresh it here too.
+        if self._all_sessions_dialog is not None:
+            self._refresh_all_sessions_window(self._all_sessions_dialog)
+
+    def _post_to_ui(self, fn: Callable[[], None]) -> None:
+        """Schedule ``fn()`` to run on the UI thread.
+
+        A SessionManager.submit_job() completion callback runs on its
+        background job thread; wrap any UI-touching code in it with this
+        (rather than calling it directly) before it reaches a widget.
+        Safe to call from the UI thread too - it just adds one queued event.
+        """
+        self._ui_callback_ready.emit(fn)
+
+    @Slot(object)
+    def _run_ui_callback(self, fn: Callable[[], None]) -> None:
+        fn()
 
     def _add_app_log(self, message: str, is_error: bool = False):
         """Add a log message to the app logs widget (shows only the last message).
@@ -3848,91 +2886,103 @@ Keywords: {keywords_str}"""
         if log_label in self._app_logs_messages:
             self._app_logs_messages.remove(log_label)
     
+    def _current_display_session_id(self) -> Optional[int]:
+        """Id of the session whose transcript stream is on screen right now
+        (selected session first, else the one actively recording), or None."""
+        if self._selected_session_id is not None:
+            return self._selected_session_id
+        if self.session_manager:
+            active_session = self.session_manager.get_active_session()
+            if active_session:
+                return active_session.id
+        return None
+
     def _on_live_transcription(self, result: dict):
         """Handle live transcription results from the session manager.
-        
+
         Args:
-            result: Dictionary with keys: text, source, timestamp_start
-        
-        Thread-safe: Uses QTimer.singleShot to update UI from any thread.
+            result: Dictionary with keys: text, source, timestamp_start,
+                timestamp_end, session_id
+
+        Thread-safe: hops onto the UI thread via the `_live_transcription_ready`
+        signal (queued across threads by Qt).
+
+        Live transcription now runs on a queue that can lag behind by a few
+        chunks (see TranscriptionWorker) rather than inline with capture, so a
+        result reaching here can belong to a session the user has since
+        stopped and moved away from - most commonly the tail end of a session
+        arriving just after Stop, once the user has already started or opened
+        a different one. session_id (present on every result since the perf
+        rework) is checked against what's actually on screen so a straggler
+        never gets appended to the wrong session's view.
         """
         # Skip if we're viewing historical transcripts (not live)
         if self._viewing_historical_transcripts:
             return
-        
+
+        result_session_id = result.get('session_id')
+        if result_session_id is not None and result_session_id != self._current_display_session_id():
+            return
+
         try:
             text = result.get('text', '')
             source = result.get('source', 'unknown')
-            timestamp = result.get('timestamp_start', result.get('timestamp', ''))
-            
+            timestamp_start = result.get('timestamp_start', result.get('timestamp', '')) or ''
+            timestamp_end = result.get('timestamp_end', '') or ''
+
             if not text:
                 return
-            
-            # Format timestamp
-            time_str = ''
-            if timestamp:
-                if isinstance(timestamp, str):
-                    try:
-                        from datetime import datetime
-                        dt = datetime.fromisoformat(timestamp)
-                        time_str = dt.strftime('%H:%M:%S')
-                    except:
-                        time_str = str(timestamp)
-                else:
-                    time_str = str(timestamp)
-            
-            # Format display text
-            source_label = 'Mic' if source == 'mic' else 'System'
-            if time_str:
-                display_text = f"[{time_str}] {source_label}: {text}"
-            else:
-                display_text = f"{source_label}: {text}"
-            
-            # Use thread-safe UI update via QMetaObject.invokeMethod
-            # This works correctly when called from any thread (Python threading.Thread)
-            QMetaObject.invokeMethod(
-                self,
-                "_append_transcription",
-                Qt.QueuedConnection,
-                Q_ARG(str, display_text)
+
+            # text, source, timestamp_start and timestamp_end are carried
+            # through as-is (rather than pre-formatted into one display
+            # string) so the grouping logic in add_transcription_to_view can
+            # compare timestamp_end/timestamp_start across chunks to detect
+            # pauses.
+            self._live_transcription_ready.emit(
+                text, source, str(timestamp_start), str(timestamp_end)
             )
-            
+
         except Exception as e:
             logger.error(f"Failed to display live transcription: {e}")
-    
-    @Slot(str)
-    def _append_transcription(self, text: str):
-        """Append transcription text to the display.
-        
-        This method is designed to be called via QMetaObject.invokeMethod
-        from any thread for thread-safe UI updates.
-        
+
+    @Slot(str, str, str, str)
+    def _append_transcription(self, text: str, source: str, timestamp_start: str, timestamp_end: str):
+        """Append a transcription chunk to the display.
+
+        Connected to `_live_transcription_ready` with Qt.QueuedConnection, so
+        this always runs on the UI thread even though the signal is emitted
+        from the audio/transcription thread.
+
         Args:
-            text: The transcription text to append (format: "[HH:MM:SS] Source: text")
+            text: The transcribed text
+            source: 'mic' or 'system'
+            timestamp_start: ISO-format start timestamp of the chunk, if known
+            timestamp_end: ISO-format end timestamp of the chunk, if known
         """
-        # Store in history for detached window
-        self._transcription_history.append(text)
-        
-        # Parse the formatted text to extract components
-        # Format: "[HH:MM:SS] Source: text" or "Source: text"
-        timestamp = ''
-        source = 'mic'  # Default to mic
-        clean_text = text
-        
-        import re
-        match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]\s+(Mic|System):\s+(.+)', text)
-        if match:
-            timestamp = match.group(1)
-            source_match = match.group(2).lower()
-            source = 'mic' if source_match == 'mic' else 'system'
-            clean_text = match.group(3)
-        
-        # Use the new chat-like view method
-        self.add_transcription_to_view(clean_text, source, timestamp)
-        
-        # Also update detached window if it exists
+        def _parse(value: str):
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+
+        start_dt = _parse(timestamp_start)
+        end_dt = _parse(timestamp_end) or start_dt
+        time_str = start_dt.strftime('%H:%M:%S') if start_dt else ''
+
+        source_label = 'Mic' if source == 'mic' else 'System'
+        display_text = f"[{time_str}] {source_label}: {text}" if time_str else f"{source_label}: {text}"
+
+        # Store in history for detached window and full-resolution download (BU101)
+        self._transcription_history.append(display_text)
+
+        # Use the grouped chat-like view method
+        self.add_transcription_to_view(text, source, time_str, start_dt=start_dt, end_dt=end_dt)
+
+        # Also update detached window if it exists - kept flat per-chunk (out of scope)
         if hasattr(self, '_detached_window') and self._detached_window:
-            self._add_transcription_to_detached(text)
+            self._add_transcription_to_detached(display_text)
     
     def _on_detach_transcription(self):
         """Create a detached window for live transcriptions."""
@@ -3992,10 +3042,8 @@ Keywords: {keywords_str}"""
         top.addStretch()
         
         # Use same filter button style as main panel
-        self._detached_filter_button = PixelToolButton()
-        self._detached_filter_button.setIcon(self._make_icon("icon_filter.svg"))
-        self._detached_filter_button.setIconSize(QSize(28, 28))
-        self._detached_filter_button.setText("⌄")
+        self._detached_filter_button = PixelToolButton(compact=True)
+        self._detached_filter_button.setIcon(self._make_icon("icon_filter_smooth.svg"))
         self._detached_filter_button.setToolTip("Filter transcripts")
         self._detached_filter_button.clicked.connect(self._show_detached_filter_menu)
         top.addWidget(self._detached_filter_button)
@@ -4144,20 +3192,23 @@ Keywords: {keywords_str}"""
         import re
         source = 'mic'
         display_text = text
-        
+        bubble_time = ''
+
         match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]\s+(Mic|System):\s+(.+)', text)
         if match:
-            timestamp = match.group(1)
+            bubble_time = match.group(1)[:5]
             source_match = match.group(2).lower()
             source = 'mic' if source_match == 'mic' else 'system'
             clean_text = match.group(3)
             display_source = "Mic" if source == 'mic' else "System"
             display_text = f"{display_source}: {clean_text}"
-        
+
         align = "right" if source == 'mic' else "left"
         variant = "blue" if source == 'mic' else "cream"
-        
-        row = aligned_bubble(display_text, variant=variant, align=align, max_width=250)
+
+        row = aligned_bubble_with_time(
+            display_text, variant=variant, align=align, max_width=250, time_text=bubble_time
+        )
         row.setProperty('source', source)
         
         # Check if this bubble should be visible based on current filter
@@ -4248,7 +3299,13 @@ Keywords: {keywords_str}"""
         
         # Update summary icon button based on selected session
         self._update_summary_icon_state()
-    
+
+        # BU110: the capture hotkey is held only while a session is live.
+        self._sync_capture_hotkey(bool(
+            active_session and active_session.status in (
+                Session.STATUS_ACTIVE, Session.STATUS_PAUSED)
+        ))
+
     def _on_start_session(self):
         """Handle start session button click."""
         try:
@@ -4283,22 +3340,29 @@ Keywords: {keywords_str}"""
             QMessageBox.critical(self, 'Error', f'Failed to start session: {str(e)}')
     
     def _on_stop_session(self):
-        """Handle stop session button click."""
+        """Handle stop session button click.
+
+        Capture stops immediately. Transcribing whatever live transcription
+        hadn't gotten to yet, RAG indexing, and the optional auto-summary all
+        run on SessionManager's background job thread (background=True) so
+        this never blocks the UI; _apply_session_finalized reports when it's
+        done. auto_transcribe=True is now cheap even though it used to mean
+        "re-transcribe everything": TranscriptionProcessor skips any chunk
+        that already has a transcript row.
+        """
         try:
-            # Stop session without auto-transcribing (manual transcription only)
-            session = self.session_manager.stop_session(auto_transcribe=False)
-            
+            session = self.session_manager.stop_session(auto_transcribe=True, background=True)
+
             # Update UI via icon buttons
             self._update_ui_state()
-            
-            # Just show status - no automatic transcription/summarization
+
             if session:
-                self._on_status_update(f"Session '{session.name}' saved. Use Transcribe button to process.")
-            
+                self._finalizing_session_ids.add(session.id)
+                self._on_status_update(f"Session '{session.name}' stopped. Finalizing…")
+
             # Reload sessions to show the new session
             self._refresh_session_completer()
-            self._refresh_session_completer()
-            
+
         except Exception as e:
             self._on_status_update(f'Failed to stop session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to stop session: {str(e)}')
@@ -4327,7 +3391,17 @@ Keywords: {keywords_str}"""
     
     def _on_take_screenshot(self):
         """Handle take screenshot button click."""
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
         try:
+            # Open screenshot viewers would end up inside the capture (BU110).
+            self._viewers_hidden_for_capture = [
+                v for v in self._screenshot_viewers.values() if v.isVisible()
+            ]
+            for viewer in self._viewers_hidden_for_capture:
+                viewer.hide()
+
             # Minimizar la ventana antes de tomar la captura
             self.showMinimized()
 
@@ -4340,6 +3414,7 @@ Keywords: {keywords_str}"""
             self.showNormal()
             self.activateWindow()
             self.raise_()
+            self._finish_capture()
 
             logger.error(f"Failed to take screenshot: {str(e)}")
             import traceback
@@ -4357,9 +3432,11 @@ Keywords: {keywords_str}"""
             self.showNormal()
             self.activateWindow()
             self.raise_()
+            self._finish_capture()
 
             if screenshot_path:
                 self._on_status_update('Screenshot Taken')
+                self._notify_screenshot_added()
             else:
                 self._on_status_update('Screenshot cancelled', is_error=False)
 
@@ -4368,13 +3445,91 @@ Keywords: {keywords_str}"""
             self.showNormal()
             self.activateWindow()
             self.raise_()
+            self._finish_capture()
 
             logger.error(f"Failed to take screenshot: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             self._on_status_update(f'Failed to take screenshot: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to take screenshot: {str(e)}')
-    
+
+    # ---- BU110: live screenshot viewing, capture hotkey, clipboard snips ----
+
+    def _finish_capture(self):
+        """Bring back the viewers hidden for the snip and allow a new capture."""
+        for viewer in self._viewers_hidden_for_capture:
+            try:
+                viewer.show()
+            except RuntimeError:
+                pass  # closed (and deleted) meanwhile
+        self._viewers_hidden_for_capture = []
+        self._capture_in_progress = False
+
+    def _notify_screenshot_added(self):
+        """Refresh the live session's open viewer after a new screenshot."""
+        live = self._live_session_state()
+        viewer = self._screenshot_viewers.get(live[0]) if live else None
+        if viewer is not None:
+            viewer.refresh_after_capture()
+
+    def _on_capture_hotkey(self):
+        """System-wide capture shortcut pressed (only held while live)."""
+        if self._live_session_state() is None:
+            return
+        self._on_take_screenshot()
+
+    def _sync_capture_hotkey(self, live: bool):
+        """Hold the capture hotkey only while a session is recording or
+        paused, so the key combination is free for other apps otherwise."""
+        spec = SCREENSHOT.get("global_hotkey") or ""
+        if not live or not spec:
+            self._capture_hotkey.unregister()
+            if self._capture_hotkey_fallback is not None:
+                self._capture_hotkey_fallback.setEnabled(False)
+            return
+        if self._capture_hotkey.register(spec):
+            return
+        # Could not grab it system-wide: keep it working inside Chronicle.
+        if self._capture_hotkey_failed_spec != spec:
+            self._capture_hotkey_failed_spec = spec
+            self._on_status_update(
+                f"Screenshot shortcut {spec} is not available system-wide; "
+                "it only works while Chronicle is focused.", is_error=True
+            )
+        if self._capture_hotkey_fallback is None:
+            self._capture_hotkey_fallback = QShortcut(QKeySequence(spec), self)
+            self._capture_hotkey_fallback.setContext(Qt.ApplicationShortcut)
+            self._capture_hotkey_fallback.activated.connect(self._on_capture_hotkey)
+        self._capture_hotkey_fallback.setEnabled(True)
+
+    def _on_clipboard_changed(self):
+        """Opt-in (SCREENSHOT["import_clipboard_snips"]): while a session is
+        live, save an image put on the clipboard - e.g. by Win+Shift+S - as a
+        session screenshot. One snip fires several notifications; repeats of
+        the same image within a few seconds are ignored."""
+        if self._live_session_state() is None or self._capture_in_progress:
+            return
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None or not mime.hasImage():
+            return
+        image = clipboard.image()
+        if image.isNull():
+            return
+        import hashlib
+        thumb = image.scaled(64, 36).convertToFormat(image.Format.Format_RGB32)
+        key = hashlib.md5(bytes(thumb.constBits())).hexdigest() + f"{image.width()}x{image.height()}"
+        if self._clipboard_deduper.is_duplicate(key):
+            return
+        try:
+            self.session_manager.import_clipboard_screenshot(image)
+        except Exception as e:
+            logger.error(f"Failed to import clipboard screenshot: {e}")
+            self._on_status_update(f"Failed to import clipboard screenshot: {e}", is_error=True)
+            return
+        self._on_status_update("Screenshot imported from clipboard")
+        self._notify_screenshot_added()
+
     def _on_play_stop_clicked(self):
         """Handle play/stop icon button click - toggles between start/pause/resume."""
         active_session = self.session_manager.get_active_session() if self.session_manager else None
@@ -4870,15 +4025,21 @@ Keywords: {keywords_str}"""
         # Connect signals to handlers
         self._assistant_thread.finished_signal.connect(self._on_assistant_query_finished)
         self._assistant_thread.error_signal.connect(self._on_assistant_query_error)
-        
+        # Drop the reference only once run() has fully returned: finished_signal
+        # fires before run()'s finally block, and a QThread garbage-collected
+        # while still running aborts the process.
+        thread = self._assistant_thread
+        thread.finished.connect(lambda t=thread: self._on_assistant_thread_done(t))
+
         # Start the thread
         self._assistant_thread.start()
     
+    def _on_assistant_thread_done(self, thread):
+        if self._assistant_thread is thread:
+            self._assistant_thread = None
+
     def _on_assistant_query_finished(self, response):
         """Handle the assistant query response."""
-        # Clear thread reference
-        self._assistant_thread = None
-        
         # Re-enable the Ask button
         self.ask_button.setEnabled(True)
         
@@ -4892,6 +4053,9 @@ Keywords: {keywords_str}"""
             answer_text = response.answer or ""
             # Replace "Thinking..." with the actual response
             self._replace_thinking_message(answer_text + self._scope_suffix())
+            # BU108/BU109: the answer points at screenshots -> "View" buttons.
+            if response.screenshot_refs:
+                self._add_screenshot_refs_to_conversation(response.screenshot_refs)
             # BU092/BU093: the answer points at a concrete meeting -> in-chat
             # prompt offering a scope switch (with a "choose another" path to
             # the full candidate list). No standalone auto-picker any more.
@@ -4930,9 +4094,6 @@ Keywords: {keywords_str}"""
     
     def _on_assistant_query_error(self, error_message: str):
         """Handle assistant query errors."""
-        # Clear thread reference
-        self._assistant_thread = None
-        
         # Re-enable the Ask button
         self.ask_button.setEnabled(True)
         
@@ -4943,6 +4104,49 @@ Keywords: {keywords_str}"""
         self._on_status_update(f"Assistant error: {error_message}", is_error=True)
         # Clear candidates on exception
         self._clear_candidates()
+
+    # ---- BU109: screenshot citations ----------------------------------------
+
+    def _add_screenshot_refs_to_conversation(self, screenshot_ids):
+        """Under the answer bubble, one button per screenshot the assistant
+        pointed to; each opens the viewer on it. Transient UI, like the scope
+        prompt - not rebuilt when a conversation is reloaded."""
+        ids = list(screenshot_ids)
+        if hasattr(self, '_answer_layout') and self._answer_layout:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            for screenshot_id in ids:
+                button = pixel_mini_button(
+                    f"View screenshot #{screenshot_id}",
+                    "Open this screenshot in the viewer",
+                    width=190, height=32,
+                )
+                button.clicked.connect(
+                    lambda _=False, sid=screenshot_id: self._open_screenshot_reference(sid)
+                )
+                row_layout.addWidget(button, 0, Qt.AlignLeft)
+            row_layout.addStretch(1)
+            self._answer_layout.insertWidget(self._answer_layout.count() - 1, row)
+            self._answer_scroll_area.verticalScrollBar().setValue(
+                self._answer_scroll_area.verticalScrollBar().maximum()
+            )
+
+        if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            for screenshot_id in ids:
+                button = QPushButton(f"View screenshot #{screenshot_id}")
+                button.clicked.connect(
+                    lambda _=False, sid=screenshot_id: self._open_screenshot_reference(sid)
+                )
+                row_layout.addWidget(button, 0, Qt.AlignLeft)
+            row_layout.addStretch(1)
+            self._detached_answer_layout.insertWidget(
+                self._detached_answer_layout.count() - 1, row
+            )
 
     # ---- BU093: in-chat scope switch prompt ---------------------------------
 
@@ -5157,10 +4361,14 @@ Keywords: {keywords_str}"""
         )
         self._rag_backfill_thread.finished_signal.connect(self._on_reindex_finished)
         self._rag_backfill_thread.error_signal.connect(self._on_reindex_error)
+        # Same as the assistant thread: release it only after run() returns.
+        self._rag_backfill_thread.finished.connect(self._on_reindex_thread_done)
         self._rag_backfill_thread.start()
 
-    def _on_reindex_finished(self, summary: dict):
+    def _on_reindex_thread_done(self):
         self._rag_backfill_thread = None
+
+    def _on_reindex_finished(self, summary: dict):
         self._reindex_action.setEnabled(True)
         note = "" if summary.get("embeddings") else " (lexical only - embedding model unavailable)"
         self._on_status_update(
@@ -5174,7 +4382,6 @@ Keywords: {keywords_str}"""
             pass
 
     def _on_reindex_error(self, message: str):
-        self._rag_backfill_thread = None
         self._reindex_action.setEnabled(True)
         self._on_status_update(f"Reindex failed: {message}", is_error=True)
 
@@ -5389,6 +4596,27 @@ Keywords: {keywords_str}"""
             font-weight: 700;
         }
         QLineEdit#AllSessionsFilter:focus { border: 2px solid #FFEFC1; }
+        QPushButton#AllSessionsUpload, QPushButton#AllSessionsClose {
+            border-radius: 5px;
+            padding: 0px 16px;
+            font-family: "Courier New";
+            font-size: 9.5pt;
+            font-weight: 700;
+        }
+        QPushButton#AllSessionsUpload {
+            color: #071846;
+            background: #E37C25;
+            border: 2px solid #F4A25C;
+        }
+        QPushButton#AllSessionsUpload:hover { background: #EE8C38; }
+        QPushButton#AllSessionsUpload:pressed { background: #C8661A; border-color: #E37C25; }
+        QPushButton#AllSessionsClose {
+            color: #FFF0BF;
+            background: transparent;
+            border: 2px solid #3A67C7;
+        }
+        QPushButton#AllSessionsClose:hover { background: #274F9B; }
+        QPushButton#AllSessionsClose:pressed { background: #1E3F82; }
     """
 
     # (key, label) for the segmented filter above the card list.
@@ -5413,19 +4641,19 @@ Keywords: {keywords_str}"""
 
     def _load_sessions_for_browser(self) -> list:
         """All sessions, newest first, with the stored status flags reconciled
-        against the transcripts / summaries that actually exist."""
-        db = self.session_manager.db
-        sessions = db.list_sessions()
+        against the transcripts / summaries that actually exist.
+
+        One EXISTS-based query for the whole list (list_sessions_with_flags)
+        instead of a get_transcripts()/get_summaries() round trip per
+        session - the previous version fetched every transcript row of every
+        session just to check whether the list was non-empty.
+        """
+        sessions = self.session_manager.db.list_sessions_with_flags()
         for session in sessions:
-            session_id = session['id']
-            trans_status = session.get('transcription_status', 'none')
-            sum_status = session.get('summary_status', 'none')
-            if trans_status == 'none' and db.get_transcripts(session_id):
-                trans_status = 'transcribed'
-            if sum_status == 'none' and db.get_summaries(session_id):
-                sum_status = 'summarized'
-            session['transcription_status'] = trans_status
-            session['summary_status'] = sum_status
+            if session.get('transcription_status', 'none') == 'none' and session['has_transcripts']:
+                session['transcription_status'] = 'transcribed'
+            if session.get('summary_status', 'none') == 'none' and session['has_summary']:
+                session['summary_status'] = 'summarized'
         return sessions
 
     @staticmethod
@@ -5500,6 +4728,7 @@ Keywords: {keywords_str}"""
         dialog.setSizeGripEnabled(True)
         dialog.setMinimumSize(700, 460)
         dialog.resize(getattr(self, '_all_sessions_window_size', None) or QSize(920, 640))
+        self._all_sessions_dialog = dialog
 
         outer = QVBoxLayout(dialog)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -5550,17 +4779,22 @@ Keywords: {keywords_str}"""
         scroll.setWidget(container)
         layout.addWidget(scroll, 1)
 
-        # Bottom bar: usage hint, then refresh / close.
+        # Bottom bar: usage hint, then upload / close. No Refresh: the list
+        # already reloads after every action and whenever recording changes.
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(8)
         hint = QLabel("Double-click a card or press Open to load a session")
         hint.setObjectName("AllSessionsMuted")
         bottom_row.addWidget(hint, 1)
-        refresh_btn = PixelButton("Refresh")
-        refresh_btn.setFixedWidth(120)
-        close_btn = PixelButton("Close")
-        close_btn.setFixedWidth(120)
-        bottom_row.addWidget(refresh_btn, 0)
+        upload_btn = QPushButton("Upload Audio")
+        upload_btn.setObjectName("AllSessionsUpload")
+        upload_btn.setToolTip("Add a WAV, iPhone (.m4a) or WhatsApp (.opus) recording as a new session and transcribe it")
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("AllSessionsClose")
+        for btn in (upload_btn, close_btn):
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(32)
+        bottom_row.addWidget(upload_btn, 0)
         bottom_row.addWidget(close_btn, 0)
         layout.addLayout(bottom_row)
 
@@ -5663,6 +4897,7 @@ Keywords: {keywords_str}"""
                         session['transcription_status'] == 'transcribed',
                         session['summary_status'] == 'summarized',
                         live_state=live_state,
+                        shot_count=session.get('screenshot_count', 0),
                     )
                     card.actions_button.setMenu(
                         self._build_session_actions_menu(session, card, dialog, live_state)
@@ -5697,6 +4932,21 @@ Keywords: {keywords_str}"""
             if session_id is not None:
                 open_session(session_id)
 
+        def focus_session(session_id):
+            # Clear search / filter so the card is listed, then select it and
+            # scroll it into view. New cards are shown and laid out over the
+            # next few event-loop passes, so the scroll waits for them.
+            search.clear()
+            for chip in filter_group.buttons():
+                chip.setChecked(chip.property("filterKey") == "all")
+            self._all_sessions_filter = "all"
+            reload()
+            select(session_id)
+            card = state['cards'].get(session_id)
+            if card is not None:
+                QTimer.singleShot(30, lambda: scroll.ensureWidgetVisible(card))
+            return card
+
         # Live indicator: blink the badge, advance the timer, and rebuild the
         # list if recording starts, stops, pauses or resumes meanwhile.
         def tick():
@@ -5721,15 +4971,19 @@ Keywords: {keywords_str}"""
         search.textChanged.connect(lambda _text: render())
         search.returnPressed.connect(open_selected)
         filter_group.buttonClicked.connect(on_filter_changed)
-        refresh_btn.clicked.connect(reload)
+        upload_btn.clicked.connect(lambda: self._upload_audio_from_all_sessions(dialog))
         close_btn.clicked.connect(dialog.close)
 
-        # Rename / delete / transcribe / summarize refresh the list in place.
+        # Rename / delete / transcribe / summarize refresh the list in place;
+        # an upload also brings its new card into view.
         dialog._reload_sessions = reload
+        dialog._focus_session = focus_session
 
         def on_finished(_result):
             live_timer.stop()
             self._all_sessions_window_size = dialog.size()
+            if self._all_sessions_dialog is dialog:
+                self._all_sessions_dialog = None
 
         dialog.finished.connect(on_finished)
 
@@ -5754,16 +5008,11 @@ Keywords: {keywords_str}"""
         menu.setStyleSheet(self._ALL_SESSIONS_MENU_QSS)
 
         def run_step(chip, busy_text, runner):
-            # Show progress on the card, then run the (blocking) step and
-            # refresh the list with its outcome.
+            # Show progress on the card. runner() submits a background job
+            # and returns at once; the chip stays busy until the job's own
+            # callback refreshes this dialog with the outcome.
             chip.set_state('busy', busy_text)
-            QApplication.processEvents()
-
-            def go():
-                runner(session_id, None)
-                self._refresh_all_sessions_window(dialog)
-
-            QTimer.singleShot(50, go)
+            runner(session_id, None, on_done=lambda: self._refresh_all_sessions_window(dialog))
 
         if not trans_ready:
             action = menu.addAction(
@@ -5784,6 +5033,20 @@ Keywords: {keywords_str}"""
                        lambda: self._show_screenshots_by_session_id(session_id, session_name))
         menu.addAction("Rename…",
                        lambda: self._rename_session_from_dialog(session_id, session_name, dialog))
+        # STATUS_PROCESSING: startup repair (SessionManager._recover_after_restart)
+        # now flips a session left mid-finalize back to 'stopped', but a
+        # session can still show 'processing' for a moment before that repair
+        # runs - kept resumable defensively, matching resume_stopped_session.
+        if not is_live and session.get('status') in (
+            Session.STATUS_STOPPED, Session.STATUS_PAUSED,
+            Session.STATUS_COMPLETED, Session.STATUS_PROCESSING,
+        ):
+            other_live = self._live_session_state()
+            resume_action = menu.addAction(
+                "Resume" if not other_live else "Resume (stop current session first)",
+                lambda: self._resume_session_from_all_sessions(session_id, dialog),
+            )
+            resume_action.setEnabled(other_live is None)
         menu.addSeparator()
         delete_action = menu.addAction(
             "Delete session" if not is_live else "Delete (stop recording first)",
@@ -5815,6 +5078,99 @@ Keywords: {keywords_str}"""
         """Delete a session from the All Sessions window and refresh it."""
         if self._delete_session_by_id(session_id):
             self._refresh_all_sessions_window(dialog)
+
+    def _resume_session_from_all_sessions(self, session_id: int, dialog: QDialog):
+        """Resume a stopped/paused session from its All Sessions card.
+
+        Continues recording into the same session_id (same start_time, name,
+        transcripts and screenshots) rather than creating a new session.
+        """
+        try:
+            session = self.session_manager.resume_stopped_session(session_id)
+            if not session:
+                return
+
+            self._clear_transcription_view()
+            self._selected_session_id = session.id
+            self.scope_combo.setCurrentIndex(0)  # "Specific Session"
+            self.session_search_input.setText(session.name)
+            self._search_input_shows_session = True
+            self._update_scope_label()
+            self._load_session_transcripts_for_current_session(allow_live=True)
+
+            self._update_ui_state()
+            self._on_status_update(f"Session '{session.name}' resumed")
+            self._refresh_all_sessions_window(dialog)
+            dialog.close()
+        except Exception as e:
+            logger.error(f"Failed to resume session: {e}")
+            self._on_status_update(f"Error resuming session: {e}", is_error=True)
+
+    def _upload_audio_from_all_sessions(self, dialog: QDialog):
+        """Import a WAV / iPhone recording as a new session and transcribe it (BU104).
+
+        Both decoding the file (PyAV, can take a while for a long recording)
+        and transcribing it run on SessionManager's background job thread, so
+        this dialog stays interactive throughout instead of freezing under a
+        wait cursor. The new card is brought into view with a busy Transcript
+        chip once the import completes; if transcription fails the session
+        stays listed as "Needs transcript" so it can be retried from its
+        "•••" menu.
+        """
+        start_dir = getattr(self, '_upload_audio_dir', None) or \
+            QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
+        patterns = ' '.join(f'*{ext}' for ext in UPLOAD_AUDIO_EXTENSIONS)
+        path, _ = QFileDialog.getOpenFileName(
+            dialog, "Upload Audio", start_dir,
+            f"Audio recordings ({patterns});;All files (*)",
+        )
+        if not path:
+            return
+        self._upload_audio_dir = os.path.dirname(path)
+        file_name = os.path.basename(path)
+
+        self._on_status_update(f"Importing {file_name}…")
+
+        def import_done(session, error):
+            def apply():
+                if error is not None:
+                    logger.error(f"Failed to import audio {path}: {error}")
+                    self._on_status_update(f"Could not import {file_name}: {error}", is_error=True)
+                    QMessageBox.warning(dialog, "Upload Audio", f"Could not import {file_name}.\n\n{error}")
+                    return
+                self._refresh_session_completer()
+                card = dialog._focus_session(session.id)
+                if card is not None:
+                    card.transcript_chip.set_state('busy', 'Transcribing')
+                self._transcribe_uploaded_session(session, dialog)
+            self._post_to_ui(apply)
+
+        self.session_manager.submit_job(
+            f'import {file_name}',
+            lambda: self.session_manager.import_audio_file(path),
+            import_done,
+        )
+
+    def _transcribe_uploaded_session(self, session: Session, dialog: QDialog):
+        """Transcribe a just-uploaded session and RAG-index it (background job)."""
+        self._on_status_update(f"Transcribing '{session.name}'…")
+
+        def done(outcome, error):
+            def apply():
+                if error is not None:
+                    logger.error(f"Failed to transcribe uploaded session {session.id}: {error}")
+                    self._on_status_update(f"Transcription failed: {error}", is_error=True)
+                    QMessageBox.warning(dialog, "Transcription Failed", str(error))
+                else:
+                    self._on_status_update(f"Uploaded '{session.name}' transcribed")
+                self._refresh_all_sessions_window(dialog)
+            self._post_to_ui(apply)
+
+        self.session_manager.submit_job(
+            f'transcribe uploaded session {session.id}',
+            lambda: self.session_manager.transcribe_session(session.id),
+            done,
+        )
 
     def _refresh_all_sessions_window(self, dialog):
         """Rebuild the All Sessions card list in place."""
@@ -6589,6 +5945,8 @@ Keywords: {keywords_str}"""
                 answer_text = response.answer or ""
                 # Add assistant's response to conversation view
                 self._add_message_to_conversation('assistant', answer_text + self._scope_suffix())
+                if response.screenshot_refs:
+                    self._add_screenshot_refs_to_conversation(response.screenshot_refs)
                 if response.scope_offer is not None:
                     self._add_scope_offer_to_conversation(
                         response.scope_offer, response.candidate_sessions
@@ -6710,17 +6068,23 @@ Keywords: {keywords_str}"""
             
             if reply == QMessageBox.Yes:
                 try:
-                    # Stop recording if active
-                    self.session_manager.stop_recording(label='main')
-                    # Stop session
-                    self.session_manager.stop_session()
+                    # finalize=False: stop capture and flag the session for
+                    # finalization, but don't transcribe/index/summarize here
+                    # - that used to re-transcribe every audio file on close
+                    # (loading a second copy of the model) and could block
+                    # quitting for minutes. finalize_pending_sessions() picks
+                    # this session up in the background on the next start.
+                    self.session_manager.stop_session(finalize=False)
                 except Exception:
                     pass  # Ignore errors during shutdown
                 event.accept()
             else:
                 event.ignore()
                 return
-        
+
+        # Closing for real: give the capture hotkey back to the system (BU110).
+        self._capture_hotkey.unregister()
+
         # Clean up session manager
         if self.session_manager:
             try:

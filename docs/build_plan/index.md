@@ -110,3 +110,47 @@ Transcript Download — user-requested UI feature
 | BU    | Name                                    | Status    | Depends On          | Next  |
 | ---   | ---                                     | ---       | ---                 | ---   |
 | BU101 | Transcript Download Button              | Completed | none                | none  |
+
+Resume Session — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU102 | Resume Stopped Session From All Sessions | Completed | BU060               | none  |
+
+Fluid Transcript Stream — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU103 | Grouped Live Transcript Bubbles         | Completed | none                | none  |
+
+Upload Audio — user-requested UI feature
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU104 | Upload Audio File As Session            | Completed | none                | none  |
+
+Performance, Memory, and Threading Rework — user-requested, informed by a walkthrough of the capture/transcribe/store pipeline and a read-only chronicle.db audit
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU105 | Performance, Memory, and Threading Rework | Completed | none              | none  |
+
+Screenshot Module Overhaul — user-requested: image-viewer UI in the summary theme, and a screenshot-aware Specific Session assistant (preview-first search, then full metadata)
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU106 | Screenshot Preliminary Description And Metadata Optimization | Completed | none | BU107 |
+| BU107 | Two-Tier Screenshot Search Engine       | Completed   | BU106               | BU108 |
+| BU108 | Screenshot-Aware Specific Session Answers | Completed | BU107               | BU109 |
+| BU109 | Screenshot Viewer Window                | Completed   | BU106, BU108        | BU110 |
+| BU110 | Screenshot Extras: Visible-Text Search, Live-Session Viewing, Capture Hotkey | Completed | BU109 | none |
+
+Live Q&A In The Transcripts Window — user-requested: manual chunk selection and auto question detection, informed by a measured detector bake-off on session 46 ("Class 1 - RM P2")
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU111 | Structured Transcript Records And Detached Bubble Grouping | Pending | none | BU112 |
+| BU112 | Detached Window Two-Column Layout And Transcript Polish | Pending | BU111 | BU113 |
+| BU113 | Manual Chunk Selection And Answer From Context Menu | Pending | BU111, BU112 | BU114 |
+| BU114 | Question Detection Service              | Pending   | BU111               | BU115 |
+| BU115 | Auto Mode Controls And Detected-Question Cards | Pending | BU113, BU114 | none |

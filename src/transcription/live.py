@@ -4,89 +4,101 @@ This module provides functions for transcribing audio chunks in real-time
 during a recording session.
 """
 
+import difflib
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Hashable, List
 
 from ..audio_capture.chunk import AudioChunk
-from .parakeet import ParakeetEngine, ModelLoadError, TranscriptionError
+from .parakeet import ParakeetEngine, ModelLoadError, TranscriptionError, get_shared_engine
 
 logger = logging.getLogger(__name__)
 
 
 class LiveTranscriber:
     """Handles real-time transcription of audio chunks.
-    
+
     This class wraps the ParakeetEngine for live transcription use cases,
-    maintaining state for context and deduplication.
+    maintaining state for context and deduplication. That state is kept per
+    *stream* - one per (session, source) - because overlap only exists
+    between consecutive chunks of the same recorder: comparing a mic chunk
+    with the last system chunk (or with the previous session) never finds the
+    real overlap and can strip words that merely look alike.
     """
-    
-    def __init__(self, model_path: Optional[str] = None):
+
+    def __init__(self, model_path: Optional[str] = None, engine: Optional[ParakeetEngine] = None):
         """Initialize the live transcriber.
-        
+
         Args:
-            model_path: Optional path to Parakeet model.
+            model_path: Optional Parakeet model; loads a dedicated engine.
+            engine: Engine to use. Defaults to the app-wide shared engine.
         """
-        self.engine = ParakeetEngine(model_path=model_path)
-        self._is_loaded = False
-        
-        # Context for improved transcription
-        self._context: list = []
-        self._last_text: Optional[str] = None
-    
+        if engine is not None:
+            self.engine = engine
+        elif model_path:
+            self.engine = ParakeetEngine(model_path=model_path)
+        else:
+            self.engine = get_shared_engine()
+
+        # Context / previous text for improved transcription, per stream
+        self._context: Dict[Hashable, List[str]] = {}
+        self._last_text: Dict[Hashable, str] = {}
+
     def load_model(self) -> None:
         """Load the transcription model.
-        
+
         Raises:
             ModelLoadError: If model cannot be loaded
         """
-        if self._is_loaded:
+        if self.engine.is_loaded():
             return
-        
         self.engine.load()
-        self._is_loaded = True
         logger.info("LiveTranscriber model loaded")
-    
-    def transcribe_chunk(self, chunk: AudioChunk) -> Optional[Dict[str, Any]]:
+
+    def transcribe_chunk(self, chunk: AudioChunk, stream: Hashable = None) -> Optional[Dict[str, Any]]:
         """Transcribe a single audio chunk.
-        
+
         Args:
             chunk: AudioChunk object containing audio file path and metadata
-            
+            stream: Key of the recording stream the chunk belongs to (e.g.
+                ``(session_id, source)``); defaults to the chunk's source
+
         Returns:
             Dict with transcription result, or None if transcription fails
         """
-        if not self._is_loaded:
-            self.load_model()
-        
+        if stream is None:
+            stream = chunk.source
         audio_path = chunk.file_path
-        
+
         if not audio_path or not Path(audio_path).exists():
             logger.warning(f"Audio file not found: {audio_path}")
             return None
-        
+
         try:
+            context = self._context.setdefault(stream, [])
             # Build initial_prompt from context for improved accuracy
-            initial_prompt = ' '.join(self._context) if self._context else None
-            
+            initial_prompt = ' '.join(context) if context else None
+
             # Transcribe the audio chunk
             text = self.engine.transcribe(audio_path, initial_prompt=initial_prompt)
-            
+
             if not text:
                 logger.debug(f"No text transcribed from chunk: {chunk.chunk_id}")
                 return None
-            
-            # Apply deduplication if we have previous text
-            if self._last_text:
-                text = self._deduplicate(text)
-            
+
+            # Apply deduplication against the previous chunk of this stream
+            previous = self._last_text.get(stream)
+            if previous:
+                text = self._deduplicate(text, previous)
+                if not text:
+                    return None
+
             # Update context
-            self._context.append(text)
-            if len(self._context) > 5:
-                self._context = self._context[-5:]
-            
-            self._last_text = text
-            
+            context.append(text)
+            del context[:-5]
+
+            self._last_text[stream] = text
+
             result = {
                 'text': text,
                 'source': chunk.source,
@@ -110,45 +122,91 @@ class LiveTranscriber:
             logger.error(f"Unexpected error in live transcription: {e}")
             return None
     
-    def _deduplicate(self, new_text: str) -> str:
-        """Remove overlapping text from new transcription.
-        
+    # Similarity bar for treating a phrase at the end of the previous chunk
+    # and a phrase at the start of the new one as "the same overlapping
+    # audio", for phrases long enough that a high character-similarity ratio
+    # can't be a coincidence (more characters already have to agree).
+    _DEDUP_FUZZY_THRESHOLDS = {8: 0.75, 6: 0.80, 4: 0.85}
+    # Short phrases (2-3 words) only dedup on an exact match: fuzzy-matching
+    # them risked false positives - "we can do" / "we can also" matched at
+    # ratio 0.80 in testing, which would have silently deleted real,
+    # non-duplicate text just because both started with "we can".
+    _DEDUP_EXACT_ONLY_LENGTHS = (3, 2)
+
+    def _deduplicate(self, new_text: str, previous_text: Optional[str]) -> str:
+        """Remove text at the start of ``new_text`` that duplicates the tail
+        of ``previous_text`` - the previous chunk of the same stream.
+
+        The chunk-to-chunk audio overlap means the same few seconds of audio
+        get transcribed twice; this strips the second copy. For phrases of 4+
+        words, matching is done by character-similarity ratio rather than
+        requiring exact equality, because the model doesn't reliably
+        transcribe the same overlapping audio identically both times - a
+        boundary word coming out slightly different each time (e.g. "its" vs
+        "it's", or a garbled attempt on one side and the correct word on the
+        other) previously slipped past the exact match and showed up as a
+        leftover invented/duplicate word. Shorter phrases (2-3 words) still
+        require an exact match, since fuzzy-matching them risks deleting real
+        text that just happens to start the same way.
+
         Args:
             new_text: Newly transcribed text
-            
+            previous_text: The stream's previous (already deduplicated) text
+
         Returns:
             Deduplicated text
         """
-        if not self._last_text or not new_text:
+        if not previous_text or not new_text:
             return new_text
-        
-        prev_words = self._last_text.lower().split()
-        new_words = new_text.lower().split()
-        
-        if len(prev_words) < 2 or len(new_words) < 2:
+
+        prev_words_lower = previous_text.lower().split()
+        new_words = new_text.split()  # original casing, used for the result
+        new_words_lower = new_text.lower().split()
+
+        if len(prev_words_lower) < 2 or len(new_words_lower) < 2:
             return new_text
-        
-        # Try to find overlapping phrases at the start
-        for num_words in [8, 6, 4, 3, 2]:
-            if num_words > len(prev_words) or num_words > len(new_words):
+
+        def _strip(num_words: int, ratio: float) -> str:
+            result = ' '.join(new_words[num_words:])
+            logger.debug(
+                f"Deduplicated {num_words} words from live transcription "
+                f"(similarity={ratio:.2f})"
+            )
+            return result
+
+        for num_words, min_ratio in self._DEDUP_FUZZY_THRESHOLDS.items():
+            if num_words > len(prev_words_lower) or num_words > len(new_words_lower):
                 continue
-            
-            prev_phrase = ' '.join(prev_words[-num_words:])
-            new_phrase_start = ' '.join(new_words[:num_words])
-            
+            prev_phrase = ' '.join(prev_words_lower[-num_words:])
+            new_phrase_start = ' '.join(new_words_lower[:num_words])
+            ratio = difflib.SequenceMatcher(None, prev_phrase, new_phrase_start).ratio()
+            if ratio >= min_ratio:
+                return _strip(num_words, ratio)
+
+        for num_words in self._DEDUP_EXACT_ONLY_LENGTHS:
+            if num_words > len(prev_words_lower) or num_words > len(new_words_lower):
+                continue
+            prev_phrase = ' '.join(prev_words_lower[-num_words:])
+            new_phrase_start = ' '.join(new_words_lower[:num_words])
             if prev_phrase == new_phrase_start:
-                # Found overlap - remove it
-                result = ' '.join(new_words[num_words:])
-                logger.debug(f"Deduplicated {num_words} words from live transcription")
-                return result
-        
+                return _strip(num_words, 1.0)
+
         return new_text
     
-    def reset(self) -> None:
-        """Reset context and state for a new session."""
-        self._context.clear()
-        self._last_text = None
+    def reset(self, stream: Hashable = None) -> None:
+        """Forget context for one stream, or for all streams if none given."""
+        if stream is None:
+            self._context.clear()
+            self._last_text.clear()
+        else:
+            self._context.pop(stream, None)
+            self._last_text.pop(stream, None)
         logger.info("LiveTranscriber state reset")
+
+    def forget_session(self, session_id: int) -> None:
+        """Drop the state of every ``(session_id, source)`` stream."""
+        for stream in [s for s in self._context if isinstance(s, tuple) and s[:1] == (session_id,)]:
+            self.reset(stream)
 
 
 def transcribe_audio_chunk(chunk: AudioChunk) -> Optional[Dict[str, Any]]:

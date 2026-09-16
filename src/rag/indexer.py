@@ -34,12 +34,11 @@ def _chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunks = []
     text = text.strip()
     start = 0
-    chunk_index = 0
-    
+
     while start < len(text):
         end = start + chunk_size
         chunk_text = text[start:end]
-        
+
         # Don't split in the middle of a word if possible
         if end < len(text) and ' ' in chunk_text[-(min(50, len(chunk_text))):]:
             # Find the last space to avoid cutting words
@@ -47,19 +46,17 @@ def _chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE,
             if last_space > chunk_size // 2:  # Only trim if not too close to chunk end
                 chunk_text = chunk_text[:last_space]
                 end = start + last_space
-        
+
         chunks.append({
             'content': chunk_text.strip(),
-            'chunk_index': chunk_index
+            'chunk_index': len(chunks)
         })
-        
-        chunk_index += 1
-        start = end - overlap
-        
-        # Prevent infinite loop for very small texts
-        if start <= chunks[-1]['chunk_index'] * chunk_size:
+
+        if end >= len(text):
             break
-    
+        # Always move forward, even if the overlap is as long as the chunk.
+        start = max(end - overlap, start + 1)
+
     return chunks
 
 
@@ -191,8 +188,9 @@ def _sync_document(
 ) -> bool:
     """Upsert one RAG document + its chunks + chunk embeddings, idempotently.
 
-    Returns ``True`` when anything was written (so the caller knows to rebuild
-    the FTS index), ``False`` when the document was already up to date.
+    Returns ``True`` when anything was written, ``False`` when the document
+    was already up to date. ``replace_rag_chunks`` keeps the document's FTS
+    rows in step.
     """
     content_hash = _compute_content_hash(content_text)
 
@@ -317,9 +315,8 @@ def index_session_content(db, session_id: int, force: bool = False) -> bool:
                 force=force,
             )
 
-        # Rebuild the FTS index only when chunk rows actually changed.
-        if changed:
-            db.rebuild_rag_fts()
+        # No FTS rebuild: replace_rag_chunks updated this session's FTS rows
+        # (a full rebuild re-indexed every session, slower as history grew).
 
         # Refresh the router profile (BU089). Best-effort: a profile failure must
         # not fail content indexing.

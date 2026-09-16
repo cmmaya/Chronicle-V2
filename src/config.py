@@ -67,6 +67,40 @@ SESSION = {
 }
 
 
+# Screenshot capture settings (BU110)
+SCREENSHOT = {
+    # System-wide capture shortcut, active only while a session is recording
+    # or paused. Win+Shift+S can't be used: Windows reserves it for the
+    # Snipping Tool (see import_clipboard_snips instead).
+    "global_hotkey": "Ctrl+Alt+S",
+    # While a session is live, save any image placed on the clipboard (such as
+    # a Win+Shift+S snip) as a session screenshot. Off by default because it
+    # also catches every other image you copy.
+    "import_clipboard_snips": False,
+}
+
+
+# Speech-to-text Settings (Parakeet through onnx-asr)
+TRANSCRIPTION = {
+    "model": "nemo-parakeet-tdt-0.6b-v3",
+    # None = full precision (~2.6 GB of RAM while loaded). "int8" needs only
+    # ~0.75 GB, but on the AMD Ryzen 7 4800H it was measured on its encoder
+    # changed ~50% of the words and returned empty text for whole sentences
+    # (dynamic int8 loses accuracy on CPUs without AVX-VNNI). Only switch it
+    # on after checking transcripts on the machine that will run it. If the
+    # int8 files can't be loaded the engine falls back to full precision.
+    "quantization": None,
+    # ONNX Runtime threads per inference. None = up to 4, leaving cores free
+    # for audio capture and the UI.
+    "intra_threads": None,
+    # The speech and embedding models are loaded when needed (a session
+    # starts, a job runs, the assistant searches) and unloaded after this many
+    # seconds with no recording and no work, returning their memory to the
+    # system. None = keep them loaded once used.
+    "idle_unload_seconds": 300,
+}
+
+
 # Audio Capture Resilience Settings
 # These govern how the system-audio (loopback) recorder recovers from a broken
 # capture stream - the classic failure being a default-output-device change when
@@ -92,6 +126,12 @@ AUDIO_CAPTURE = {
     # Safety rails so a permanently broken device can't restart-loop forever.
     "watchdog_max_restarts": 30,
     "watchdog_restart_cooldown_seconds": 20.0,
+
+    # Rate audio chunks are stored and transcribed at. Parakeet works at
+    # 16 kHz, so capturing at 44.1/48 kHz and storing that only triples the
+    # disk use. Resampling uses PyAV (FFmpeg); without it chunks are stored at
+    # the device rate. None = always store at the device rate.
+    "storage_sample_rate": 16000,
 }
 
 

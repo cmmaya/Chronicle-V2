@@ -50,21 +50,57 @@ class SummaryExcerpt:
         return f"[Summary - {self.summary_type}]: {self.content}"
 
 
+SCREENSHOT_SECTION_HEADER = "## Screenshots (index; full details only for the most relevant)"
+
+
 @dataclass
 class ScreenshotReference:
-    """References a local screenshot file."""
+    """A screenshot of the session, as the assistant sees it (BU108).
+
+    ``tier`` is 'preview' (one-line index card) or 'full' (card plus the AI
+    summary, visible text and keywords). ``filepath`` is kept for the UI and
+    is never rendered into the prompt.
+    """
     session_id: int
     session_name: str
     timestamp: int
     filepath: str
     description: Optional[str] = None
+    screenshot_id: Optional[int] = None
+    preview: str = ""
+    tier: str = "preview"
+    ai_summary: str = ""
+    visible_text: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
 
     def to_prompt_text(self) -> str:
         """Format screenshot reference for prompt inclusion."""
-        dt = datetime.fromtimestamp(self.timestamp)
-        time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-        desc = f" - {self.description}" if self.description else ""
-        return f"[Screenshot at {time_str}]{desc}: {self.filepath}"
+        handle = f"#{self.screenshot_id}" if self.screenshot_id is not None else "(no id)"
+        try:
+            time_str = datetime.fromtimestamp(self.timestamp).strftime("%H:%M:%S")
+        except (OverflowError, OSError, ValueError, TypeError):
+            time_str = "unknown time"
+        preview = self.preview or self.description or "(no description yet)"
+        lines = [f"[Screenshot {handle} · {time_str}] {preview}"]
+        note = (self.description or "").strip()
+        if note and note.lower() not in preview.lower():
+            lines.append(f"  User note: {note}")
+        if self.tier == "full":
+            if self.ai_summary:
+                lines.append(f"  Summary: {self.ai_summary}")
+            if self.visible_text:
+                lines.append(f"  Visible text: {' | '.join(self.visible_text)}")
+            if self.keywords:
+                lines.append(f"  Keywords: {', '.join(self.keywords)}")
+        return "\n".join(lines)
+
+
+def render_screenshot_section(screenshots: list[ScreenshotReference]) -> list[str]:
+    """Prompt lines for the screenshots section; full-detail cards first."""
+    if not screenshots:
+        return []
+    ordered = sorted(screenshots, key=lambda s: 0 if s.tier == "full" else 1)
+    return [SCREENSHOT_SECTION_HEADER] + [s.to_prompt_text() for s in ordered] + [""]
 
 
 @dataclass
@@ -117,11 +153,7 @@ class AssistantContext:
                 parts.append(s.to_prompt_text())
             parts.append("")
 
-        if self.screenshots:
-            parts.append("## Screenshots")
-            for sc in self.screenshots:
-                parts.append(sc.to_prompt_text())
-            parts.append("")
+        parts.extend(render_screenshot_section(self.screenshots))
 
         if not parts:
             return "(No context found)"

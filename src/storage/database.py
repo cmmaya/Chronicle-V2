@@ -1,9 +1,20 @@
 from pathlib import Path
+import logging
 import sqlite3
 import os
 import re
-from typing import Optional, List, Dict, Any
+import threading
+from typing import Optional, List, Dict, Any, Iterable, Set, Tuple
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+# Bump when a step is added to Database._migrate().
+SCHEMA_VERSION = 3
+
+# Session states that only exist while the app is running; finding one at
+# startup means the app was closed or crashed mid-session.
+_INTERRUPTED_STATUSES = ('active', 'paused', 'processing')
 
 
 class DatabaseError(Exception):
@@ -35,48 +46,152 @@ def sanitize_fts_query(query: str) -> str:
 
 
 class Database:
+    """SQLite access for Chronicle.
+
+    Every thread gets its own connection, opened on first use after
+    ``connect()``: the app writes from the UI thread, the live transcription
+    worker and background jobs, and one connection shared between them
+    interleaves their transactions. The file runs in WAL mode so readers never
+    block the writer. The schema is set up and migrated once per instance, not
+    once per connection.
+    """
+
     def __init__(self, db_path: str = 'chronicle.db'):
         self.db_path = db_path
-        self.connection: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
+        self._lock = threading.Lock()  # guards _connections
+        self._schema_lock = threading.Lock()
+        self._connections: List[Tuple[threading.Thread, sqlite3.Connection]] = []
+        self._shared_connection: Optional[sqlite3.Connection] = None
+        self._connected = False
+        self._schema_ready = False
+
+    @property
+    def _in_memory(self) -> bool:
+        path = str(self.db_path)
+        return path == ':memory:' or path.startswith('file::memory:')
+
+    @property
+    def connection(self) -> Optional[sqlite3.Connection]:
+        """The calling thread's connection, or None when disconnected."""
+        if not self._connected:
+            return None
+        if self._in_memory:
+            # Every connection to ':memory:' is its own empty database, so an
+            # in-memory Database keeps a single shared connection.
+            return self._shared_connection
+        conn = getattr(self._local, 'connection', None)
+        if conn is None:
+            conn = self._open_connection()
+            self._local.connection = conn
+        return conn
+
+    def _open_connection(self) -> sqlite3.Connection:
+        # check_same_thread=False only so disconnect() can close connections
+        # that other threads opened; each connection is used by one thread.
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA synchronous = NORMAL')  # durable enough under WAL
+        conn.execute('PRAGMA temp_store = MEMORY')
+        with self._lock:
+            self._close_connections_of_dead_threads()
+            self._connections.append((threading.current_thread(), conn))
+        return conn
+
+    def _close_connections_of_dead_threads(self) -> None:
+        """Close connections whose owning thread has exited. Caller holds _lock."""
+        alive = []
+        for thread, conn in self._connections:
+            if thread.is_alive():
+                alive.append((thread, conn))
+            else:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+        self._connections = alive
+
+    def release_thread_connection(self) -> None:
+        """Close the calling thread's connection.
+
+        Background threads call this when they finish so their connections
+        don't pile up; the thread gets a fresh one if it touches the DB again.
+        """
+        if self._in_memory:
+            return
+        conn = getattr(self._local, 'connection', None)
+        if conn is None:
+            return
+        self._local.connection = None
+        with self._lock:
+            self._connections = [(t, c) for t, c in self._connections if c is not conn]
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
     def connect(self) -> sqlite3.Connection:
         try:
-            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-            
-            self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-            self.connection.row_factory = sqlite3.Row
-            self._initialize_schema()
-            return self.connection
+            if not self._in_memory:
+                Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._connected = True
+            if self._in_memory and self._shared_connection is None:
+                self._shared_connection = self._open_connection()
+            conn = self.connection
+            with self._schema_lock:
+                if not self._schema_ready:
+                    self._initialize_schema(conn)
+                    self._schema_ready = True
+            return conn
         except sqlite3.Error as e:
             raise DatabaseError(f'Database connection failed: {str(e)}')
 
     def disconnect(self):
-        if self.connection:
-            self.connection.close()
-            self.connection = None
+        """Close every connection this instance opened, on any thread."""
+        with self._lock:
+            connections, self._connections = self._connections, []
+        for _thread, conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        self._local = threading.local()
+        self._shared_connection = None
+        self._connected = False
 
     def recreate_database(self) -> None:
         """Delete and recreate the database from scratch.
-        
+
         WARNING: This will delete ALL data. Use reset_database() to keep
         schema but delete data, or this method to start completely fresh.
-        
+
         Raises:
             DatabaseError: If recreation fails
         """
         # Close existing connection if any
         self.disconnect()
-        
-        # Delete existing database file
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-        
+
+        # Delete existing database file (and its WAL side files)
+        for suffix in ('', '-wal', '-shm'):
+            if os.path.exists(self.db_path + suffix):
+                os.remove(self.db_path + suffix)
+        self._schema_ready = False
+
         # Reconnect (which will create fresh schema)
         self.connect()
 
-    def _initialize_schema(self):
+    def _initialize_schema(self, conn: sqlite3.Connection):
         try:
-            cursor = self.connection.cursor()
+            cursor = conn.cursor()
+            had_schema = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+            ).fetchone() is not None
+            version = cursor.execute('PRAGMA user_version').fetchone()[0]
+            if not had_schema:
+                # Only takes effect before the first table is created; existing
+                # databases are switched over (with a VACUUM) in _migrate().
+                cursor.execute('PRAGMA auto_vacuum = INCREMENTAL')
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,18 +200,12 @@ class Database:
                     end_time INTEGER,
                     status TEXT NOT NULL,
                     transcription_status TEXT DEFAULT 'none',
-                    summary_status TEXT DEFAULT 'none'
+                    summary_status TEXT DEFAULT 'none',
+                    needs_finalize INTEGER NOT NULL DEFAULT 0
                 )
             ''')
-            # Add columns to existing tables if they don't exist
-            try:
-                cursor.execute('ALTER TABLE sessions ADD COLUMN transcription_status TEXT DEFAULT "none"')
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-            try:
-                cursor.execute('ALTER TABLE sessions ADD COLUMN summary_status TEXT DEFAULT "none"')
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+            # end_timestamp / audio_file: the chunk a line came from, so a batch
+            # pass can skip audio that already has a transcript.
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +213,8 @@ class Database:
                     timestamp INTEGER NOT NULL,
                     text TEXT NOT NULL,
                     source TEXT NOT NULL,
+                    end_timestamp INTEGER,
+                    audio_file TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 )
             ''')
@@ -114,6 +225,11 @@ class Database:
                     timestamp INTEGER NOT NULL,
                     filepath TEXT NOT NULL,
                     description TEXT,
+                    ai_summary TEXT,
+                    visible_text TEXT,
+                    keywords TEXT,
+                    preview_description TEXT,
+                    preview_source TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 )
             ''')
@@ -128,33 +244,7 @@ class Database:
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 )
             ''')
-            self.connection.commit()
-
-            # Migración: agregar columna description a screenshots si no existe
-            try:
-                cursor.execute("ALTER TABLE screenshots ADD COLUMN description TEXT")
-                self.connection.commit()
-            except sqlite3.OperationalError:
-                pass  # La columna ya existe
-
-            # Migración: agregar columnas para contexto estructurado de screenshots (nuevo formato)
-            try:
-                cursor.execute("ALTER TABLE screenshots ADD COLUMN ai_summary TEXT")
-                self.connection.commit()
-            except sqlite3.OperationalError:
-                pass  # La columna ya existe
-            
-            try:
-                cursor.execute("ALTER TABLE screenshots ADD COLUMN visible_text TEXT")
-                self.connection.commit()
-            except sqlite3.OperationalError:
-                pass  # La columna ya existe
-            
-            try:
-                cursor.execute("ALTER TABLE screenshots ADD COLUMN keywords TEXT")
-                self.connection.commit()
-            except sqlite3.OperationalError:
-                pass  # La columna ya existe
+            conn.commit()
 
             # Assistant conversations and messages tables
             cursor.execute('''
@@ -177,7 +267,7 @@ class Database:
                     FOREIGN KEY(conversation_id) REFERENCES assistant_conversations(id)
                 )
             ''')
-            self.connection.commit()
+            conn.commit()
 
             # RAG metadata tables
             cursor.execute('''
@@ -212,13 +302,6 @@ class Database:
                     FOREIGN KEY(document_id) REFERENCES rag_documents(id)
                 )
             ''')
-
-            # Migration: per-chunk audio source (microphone / system) for
-            # databases created before time-windowed transcript chunking.
-            try:
-                cursor.execute('ALTER TABLE rag_chunks ADD COLUMN source TEXT')
-            except sqlite3.OperationalError:
-                pass  # Column already exists
 
             # RAG indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_documents_source ON rag_documents(source_type, source_id)')
@@ -257,11 +340,110 @@ class Database:
                     session_id UNINDEXED
                 )
             ''')
+            conn.commit()
 
-            self.connection.commit()
+            if version < SCHEMA_VERSION:
+                can_prune = True
+                if had_schema:
+                    can_prune = self._backup_before_migration(conn, version)
+                self._migrate(conn, version, had_schema, can_prune)
+                cursor.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
+                conn.commit()
+
+            # Lookups by session / conversation. Created after _migrate() so the
+            # columns that migrations add already exist.
+            for statement in (
+                'CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time)',
+                'CREATE INDEX IF NOT EXISTS idx_transcripts_session_time ON transcripts(session_id, timestamp)',
+                'CREATE INDEX IF NOT EXISTS idx_screenshots_session_time ON screenshots(session_id, timestamp)',
+                'CREATE INDEX IF NOT EXISTS idx_screenshots_filepath ON screenshots(filepath)',
+                'CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, created_at)',
+                'CREATE INDEX IF NOT EXISTS idx_conversations_session ON assistant_conversations(session_id)',
+                'CREATE INDEX IF NOT EXISTS idx_conversations_updated ON assistant_conversations(updated_at)',
+                'CREATE INDEX IF NOT EXISTS idx_messages_conversation ON assistant_messages(conversation_id, timestamp)',
+            ):
+                cursor.execute(statement)
+            conn.commit()
+
+            if not self._in_memory:
+                # Persistent: readers stop blocking the writer (and vice versa).
+                cursor.execute('PRAGMA journal_mode = WAL')
 
         except sqlite3.Error as e:
             raise DatabaseError(f'Schema initialization failed: {str(e)}')
+
+    @staticmethod
+    def _add_column(cursor: sqlite3.Cursor, table: str, column_sql: str) -> None:
+        """``ALTER TABLE <table> ADD COLUMN <column_sql>`` unless it exists."""
+        column = column_sql.split()[0]
+        existing = {row[1] for row in cursor.execute(f'PRAGMA table_info({table})')}
+        if column not in existing:
+            cursor.execute(f'ALTER TABLE {table} ADD COLUMN {column_sql}')
+
+    def _backup_before_migration(self, conn: sqlite3.Connection, version: int) -> bool:
+        """Copy the database next to itself before a migration touches it.
+
+        Returns False when the copy failed, in which case the migration skips
+        its destructive steps.
+        """
+        if self._in_memory:
+            return True
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_path = f'{self.db_path}.bak-v{version}-{stamp}'
+        try:
+            backup = sqlite3.connect(backup_path)
+            try:
+                conn.backup(backup)
+            finally:
+                backup.close()
+            logger.info(f'Backed up database to {backup_path} before migrating from v{version}')
+            return True
+        except sqlite3.Error as e:
+            logger.warning(f'Could not back up database before migrating: {e}')
+            return False
+
+    def _migrate(self, conn: sqlite3.Connection, from_version: int,
+                 had_schema: bool, can_prune: bool) -> None:
+        """Bring a database from ``from_version`` up to SCHEMA_VERSION."""
+        cursor = conn.cursor()
+        if from_version < 1:
+            # Columns added before the schema was versioned.
+            for table, column_sql in (
+                ('sessions', "transcription_status TEXT DEFAULT 'none'"),
+                ('sessions', "summary_status TEXT DEFAULT 'none'"),
+                ('screenshots', 'description TEXT'),
+                ('screenshots', 'ai_summary TEXT'),
+                ('screenshots', 'visible_text TEXT'),
+                ('screenshots', 'keywords TEXT'),
+                ('rag_chunks', 'source TEXT'),
+            ):
+                self._add_column(cursor, table, column_sql)
+            conn.commit()
+
+        if from_version < 2:
+            self._add_column(cursor, 'transcripts', 'end_timestamp INTEGER')
+            self._add_column(cursor, 'transcripts', 'audio_file TEXT')
+            self._add_column(cursor, 'sessions', 'needs_finalize INTEGER NOT NULL DEFAULT 0')
+            conn.commit()
+            if had_schema and can_prune:
+                removed = self._purge_orphans(cursor)
+                conn.commit()
+                if any(removed.values()):
+                    logger.info(f'Removed rows left behind by deleted sessions: {removed}')
+            # FTS rows now use the chunk id as rowid, so one document's rows can
+            # be replaced without rebuilding the whole index.
+            self._rebuild_rag_fts(cursor)
+            conn.commit()
+            if had_schema:
+                cursor.execute('PRAGMA auto_vacuum = INCREMENTAL')
+                cursor.execute('VACUUM')  # applies auto_vacuum, drops free pages
+
+        if from_version < 3:
+            # BU106: short retrieval-oriented description per screenshot.
+            # preview_source is 'auto' (rebuilt from transcripts) or 'ai'.
+            self._add_column(cursor, 'screenshots', 'preview_description TEXT')
+            self._add_column(cursor, 'screenshots', 'preview_source TEXT')
+            conn.commit()
 
     def create_session(self, name: str, start_time: datetime, status: str = 'active', 
                        transcription_status: str = 'none', summary_status: str = 'none') -> int:
@@ -276,13 +458,82 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Session creation failed: {str(e)}')
 
-    def get_session(self, session_id: int) -> Dict[str, Any]:
+    def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Return one session row, or None if it doesn't exist."""
         try:
             cursor = self.connection.cursor()
             cursor.execute('SELECT * FROM sessions WHERE id = ?', (session_id,))
-            return dict(cursor.fetchone())
+            row = cursor.fetchone()
+            return dict(row) if row else None
         except sqlite3.Error as e:
             raise DatabaseError(f'Session retrieval failed: {str(e)}')
+
+    def list_sessions_with_flags(self) -> List[Dict[str, Any]]:
+        """All sessions, newest first, each with ``has_transcripts`` and
+        ``has_summary`` booleans and a ``screenshot_count``, computed in the
+        same query."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT s.*,
+                       EXISTS (SELECT 1 FROM transcripts t WHERE t.session_id = s.id) AS has_transcripts,
+                       EXISTS (SELECT 1 FROM summaries su WHERE su.session_id = s.id) AS has_summary,
+                       (SELECT COUNT(*) FROM screenshots sc WHERE sc.session_id = s.id) AS screenshot_count
+                FROM sessions s
+                ORDER BY s.start_time DESC
+            ''')
+            rows = []
+            for row in cursor.fetchall():
+                item = dict(row)
+                item['has_transcripts'] = bool(item['has_transcripts'])
+                item['has_summary'] = bool(item['has_summary'])
+                rows.append(item)
+            return rows
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session listing failed: {str(e)}')
+
+    def repair_interrupted_sessions(self) -> List[int]:
+        """Close out sessions the app didn't get to stop.
+
+        Call once at startup, before any session starts: a session still
+        ``active`` / ``paused`` / ``processing`` then belongs to a run that
+        was closed or crashed. It becomes ``stopped`` and is flagged for
+        finalization (transcribe leftovers, index, summarize).
+
+        Returns:
+            The repaired session ids
+        """
+        try:
+            cursor = self.connection.cursor()
+            placeholders = ','.join('?' * len(_INTERRUPTED_STATUSES))
+            ids = [row[0] for row in cursor.execute(
+                f'SELECT id FROM sessions WHERE status IN ({placeholders})', _INTERRUPTED_STATUSES
+            ).fetchall()]
+            if ids:
+                cursor.execute(f'''
+                    UPDATE sessions
+                    SET status = 'stopped', needs_finalize = 1,
+                        end_time = COALESCE(end_time, (
+                            SELECT MAX(COALESCE(t.end_timestamp, t.timestamp))
+                            FROM transcripts t WHERE t.session_id = sessions.id))
+                    WHERE status IN ({placeholders})
+                ''', _INTERRUPTED_STATUSES)
+                self.connection.commit()
+            return ids
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session repair failed: {str(e)}')
+
+    def list_sessions_needing_finalize(self) -> List[int]:
+        """Ids of stopped sessions whose post-processing never completed."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT id FROM sessions WHERE needs_finalize = 1 AND status NOT IN ('active', 'paused') "
+                'ORDER BY start_time'
+            )
+            return [row[0] for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session listing failed: {str(e)}')
 
     def update_session(self, session_id: int, **kwargs) -> None:
         try:
@@ -328,16 +579,21 @@ class Database:
         try:
             cursor = self.connection.cursor()
 
-            # RAG index. Grab document ids first so the denormalised FTS
-            # mirror can be cleared alongside the base tables.
+            # RAG index. FTS rows share their chunk's id as rowid, so they go
+            # by rowid; the session_id sweep catches rows written before that.
             doc_ids = [row[0] for row in cursor.execute(
                 'SELECT id FROM rag_documents WHERE session_id = ?', (session_id,)
             ).fetchall()]
+            chunk_ids = [row[0] for row in cursor.execute(
+                'SELECT id FROM rag_chunks WHERE session_id = ?', (session_id,)
+            ).fetchall()]
             if doc_ids:
                 placeholders = ','.join('?' * len(doc_ids))
-                cursor.execute(
-                    f'DELETE FROM rag_fts WHERE document_id IN ({placeholders})', doc_ids
-                )
+                chunk_ids += [row[0] for row in cursor.execute(
+                    f'SELECT id FROM rag_chunks WHERE document_id IN ({placeholders})', doc_ids
+                ).fetchall()]
+                cursor.execute(f'DELETE FROM rag_chunks WHERE document_id IN ({placeholders})', doc_ids)
+            self._delete_fts_rows(cursor, chunk_ids)
             cursor.execute('DELETE FROM rag_fts WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM rag_chunks WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM rag_documents WHERE session_id = ?', (session_id,))
@@ -368,6 +624,63 @@ class Database:
         except sqlite3.Error as e:
             self.connection.rollback()
             raise DatabaseError(f'Session purge failed: {str(e)}')
+        self._reclaim_free_pages()
+
+    def _reclaim_free_pages(self) -> None:
+        """Hand freed pages back to the OS (a no-op unless auto_vacuum is
+        INCREMENTAL, which new and migrated databases are)."""
+        try:
+            self.connection.execute('PRAGMA incremental_vacuum')
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.debug(f'incremental_vacuum skipped: {e}')
+
+    @staticmethod
+    def _purge_orphans(cursor: sqlite3.Cursor) -> Dict[str, int]:
+        """Delete rows whose session (or parent row) no longer exists.
+
+        Sessions deleted before ``purge_session`` existed left their search
+        index, router profile, chats and screenshot rows behind - and the
+        search index could still surface them. Returns rows removed per table.
+        """
+        orphan_docs = '''(SELECT id FROM rag_documents
+                          WHERE (session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions))
+                             OR (source_type = 'summary' AND source_id NOT IN (SELECT id FROM summaries)))'''
+        orphan_convs = '''(SELECT id FROM assistant_conversations
+                           WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions))'''
+        statements = (
+            ('rag_fts', f'''DELETE FROM rag_fts WHERE document_id IN {orphan_docs}
+                            OR document_id NOT IN (SELECT id FROM rag_documents)'''),
+            ('rag_chunks', f'''DELETE FROM rag_chunks WHERE document_id IN {orphan_docs}
+                               OR document_id NOT IN (SELECT id FROM rag_documents)'''),
+            ('rag_documents', f'DELETE FROM rag_documents WHERE id IN {orphan_docs}'),
+            ('session_profiles', 'DELETE FROM session_profiles WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('session_profiles_fts', 'DELETE FROM session_profiles_fts WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('assistant_messages', f'''DELETE FROM assistant_messages WHERE conversation_id IN {orphan_convs}
+                                       OR conversation_id NOT IN (SELECT id FROM assistant_conversations)'''),
+            ('assistant_conversations', f'DELETE FROM assistant_conversations WHERE id IN {orphan_convs}'),
+            ('transcripts', 'DELETE FROM transcripts WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('screenshots', 'DELETE FROM screenshots WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('summaries', 'DELETE FROM summaries WHERE session_id NOT IN (SELECT id FROM sessions)'),
+        )
+        removed = {}
+        for table, sql in statements:
+            cursor.execute(sql)
+            removed[table] = cursor.rowcount
+        return removed
+
+    def purge_orphans(self) -> Dict[str, int]:
+        """Remove rows left behind by deleted sessions. Safe to run any time."""
+        try:
+            cursor = self.connection.cursor()
+            removed = self._purge_orphans(cursor)
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
+            raise DatabaseError(f'Orphan cleanup failed: {str(e)}')
+        if any(removed.values()):
+            self._reclaim_free_pages()
+        return removed
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         try:
@@ -456,6 +769,83 @@ class Database:
         except sqlite3.Error as e:
             raise DatabaseError(f'Screenshot AI context update failed: {str(e)}')
 
+    def update_screenshot_preview(self, screenshot_id: int, text: str, source: str) -> None:
+        """Set a screenshot's preliminary description (BU106).
+
+        ``source`` is 'auto' (derived from transcripts) or 'ai' (vision model).
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'UPDATE screenshots SET preview_description = ?, preview_source = ? WHERE id = ?',
+                (text, source, screenshot_id)
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot preview update failed: {str(e)}')
+
+    def get_screenshot_previews(self, session_id: int) -> List[Dict[str, Any]]:
+        """Tier-1 read of a session's screenshots: the light fields only.
+
+        Leaves out ai_summary / visible_text so retrieval can rank screenshots
+        without loading their full metadata.
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('''
+                SELECT id, session_id, timestamp, filepath, description,
+                       preview_description, preview_source, keywords
+                FROM screenshots
+                WHERE session_id = ?
+                ORDER BY timestamp ASC
+            ''', (session_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot preview retrieval failed: {str(e)}')
+
+    def get_screenshot_details(self, ids: Iterable[int]) -> List[Dict[str, Any]]:
+        """Tier-2 read: full metadata for the given screenshot ids, one query."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return []
+        try:
+            cursor = self.connection.cursor()
+            placeholders = ','.join('?' * len(ids))
+            cursor.execute(f'''
+                SELECT id, session_id, timestamp, filepath, description,
+                       ai_summary, visible_text, keywords
+                FROM screenshots
+                WHERE id IN ({placeholders})
+            ''', ids)
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot detail retrieval failed: {str(e)}')
+
+    def get_searchable_screenshots(self, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Screenshots that have visible text to search, newest first, with
+        their session name (BU110 visible-text search).
+
+        Matching itself is done by the caller: stored JSON escapes accents,
+        so SQL LIKE can't match accent-insensitively.
+        """
+        where = "(sc.visible_text IS NOT NULL AND sc.visible_text NOT IN ('', '[]'))"
+        params: list = []
+        if session_id is not None:
+            where += ' AND sc.session_id = ?'
+            params.append(session_id)
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(f'''
+                SELECT sc.*, s.name AS session_name
+                FROM screenshots sc
+                JOIN sessions s ON s.id = sc.session_id
+                WHERE {where}
+                ORDER BY sc.timestamp DESC
+            ''', params)
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Screenshot search failed: {str(e)}')
+
     def get_screenshot(self, screenshot_id: int) -> Dict[str, Any]:
         """Get a specific screenshot by ID.
 
@@ -539,50 +929,96 @@ class Database:
             raise DatabaseError(f'Screenshot deletion failed: {str(e)}')
 
 
-    def add_transcript(self, session_id: int, timestamp: datetime, text: str, source: str) -> int:
+    def add_transcript(self, session_id: int, timestamp: datetime, text: str, source: str,
+                       end_timestamp: Optional[datetime] = None,
+                       audio_file: Optional[str] = None) -> int:
         """Add a transcript entry to the database.
-        
+
         Args:
             session_id: ID of the session this transcript belongs to
             timestamp: Timestamp when the audio was recorded
             text: Transcribed text
             source: Audio source ('microphone' or 'system')
-            
+            end_timestamp: When the transcribed audio ends, if known
+            audio_file: The chunk the text came from, as ``<source dir>/<file name>``
+                relative to the session's ``audio`` folder
+
         Returns:
             ID of the inserted transcript
-            
+
         Raises:
             DatabaseError: If insertion fails
         """
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
-                INSERT INTO transcripts (session_id, timestamp, text, source)
-                VALUES (?, ?, ?, ?)
-            ''', (session_id, int(timestamp.timestamp()), text, source))
+                INSERT INTO transcripts (session_id, timestamp, text, source, end_timestamp, audio_file)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                session_id,
+                int(timestamp.timestamp()),
+                text,
+                source,
+                int(end_timestamp.timestamp()) if end_timestamp else None,
+                audio_file,
+            ))
             self.connection.commit()
             return cursor.lastrowid
         except sqlite3.Error as e:
             raise DatabaseError(f'Transcript insertion failed: {str(e)}')
 
+    def has_transcripts(self, session_id: int) -> bool:
+        """True if the session has at least one transcript line."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('SELECT 1 FROM transcripts WHERE session_id = ? LIMIT 1', (session_id,))
+            return cursor.fetchone() is not None
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Transcript lookup failed: {str(e)}')
+
+    def get_transcribed_chunk_keys(self, session_id: int) -> Tuple[Set[str], Set[Tuple[str, int]]]:
+        """What audio of a session already has transcripts.
+
+        Returns ``(audio_files, legacy_keys)``: the ``audio_file`` of every row
+        that records one, and ``(source, timestamp)`` for older rows that
+        don't - a chunk's file name starts with its start time, so those still
+        identify the chunk.
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'SELECT source, timestamp, audio_file FROM transcripts WHERE session_id = ?',
+                (session_id,),
+            )
+            audio_files: Set[str] = set()
+            legacy_keys: Set[Tuple[str, int]] = set()
+            for source, timestamp, audio_file in cursor.fetchall():
+                if audio_file:
+                    audio_files.add(audio_file)
+                else:
+                    legacy_keys.add((source, int(timestamp)))
+            return audio_files, legacy_keys
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Transcript lookup failed: {str(e)}')
+
     def get_transcripts(self, session_id: int) -> List[Dict[str, Any]]:
         """Get all transcripts for a session.
-        
+
         Args:
             session_id: ID of the session
-            
+
         Returns:
             List of transcript dictionaries sorted by timestamp
-            
+
         Raises:
             DatabaseError: If retrieval fails
         """
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
-                SELECT * FROM transcripts 
+                SELECT * FROM transcripts
                 WHERE session_id = ?
-                ORDER BY timestamp ASC
+                ORDER BY timestamp ASC, id ASC
             ''', (session_id,))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
@@ -913,16 +1349,16 @@ class Database:
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
-                SELECT * FROM assistant_messages 
+                SELECT * FROM assistant_messages
                 WHERE conversation_id = ?
-                ORDER BY timestamp ASC
+                ORDER BY timestamp ASC, id ASC
             ''', (conversation_id,))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'Message retrieval failed: {str(e)}')
 
     def get_recent_messages(self, conversation_id: int, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get recent messages for a conversation in chronological order.
+        """Get the last ``limit`` messages of a conversation, oldest first.
 
         Args:
             conversation_id: ID of the conversation
@@ -937,10 +1373,12 @@ class Database:
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
-                SELECT * FROM assistant_messages 
-                WHERE conversation_id = ?
-                ORDER BY timestamp ASC
-                LIMIT ?
+                SELECT * FROM (
+                    SELECT * FROM assistant_messages
+                    WHERE conversation_id = ?
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ?
+                ) ORDER BY timestamp ASC, id ASC
             ''', (conversation_id, limit))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
@@ -1319,8 +1757,9 @@ class Database:
         """Replace all chunks for a document atomically.
 
         Deletes all existing chunks for the document and inserts the provided
-        chunks in a single transaction.
-        
+        chunks in a single transaction, keeping the document's FTS rows in
+        step (so indexing one session never rebuilds the whole FTS index).
+
         Args:
             document_id: ID of the document whose chunks to replace
             chunks: List of chunk dictionaries with keys:
@@ -1341,14 +1780,18 @@ class Database:
             now = int(datetime.now().timestamp())
             
             # Get session_id from the document for chunk insertion
-            cursor.execute('SELECT session_id FROM rag_documents WHERE id = ?', (document_id,))
+            cursor.execute('SELECT session_id, source_type FROM rag_documents WHERE id = ?', (document_id,))
             row = cursor.fetchone()
             if not row:
                 raise DatabaseError(f'Document {document_id} not found')
-            default_session_id = row[0]
-            
+            default_session_id, source_type = row[0], row[1]
+
+            old_chunk_ids = [r[0] for r in cursor.execute(
+                'SELECT id FROM rag_chunks WHERE document_id = ?', (document_id,)
+            ).fetchall()]
+            self._delete_fts_rows(cursor, old_chunk_ids)
             cursor.execute('DELETE FROM rag_chunks WHERE document_id = ?', (document_id,))
-            
+
             for chunk in chunks:
                 cursor.execute('''
                     INSERT INTO rag_chunks (document_id, session_id, chunk_index, content,
@@ -1371,10 +1814,38 @@ class Database:
                     now
                 ))
 
+            cursor.execute('''
+                INSERT INTO rag_fts (rowid, content, source_type, session_id, document_id, chunk_id)
+                SELECT rc.id, rc.content, ?, rc.session_id, rc.document_id, rc.id
+                FROM rag_chunks rc
+                WHERE rc.document_id = ?
+            ''', (source_type, document_id))
+
             self.connection.commit()
         except sqlite3.Error as e:
             self.connection.rollback()
             raise DatabaseError(f'Chunk replacement failed: {str(e)}')
+
+    @staticmethod
+    def _delete_fts_rows(cursor: sqlite3.Cursor, chunk_ids: Iterable[int]) -> None:
+        """Delete FTS rows by rowid (= chunk id), in batches under SQLite's
+        bound-parameter limit."""
+        ids = list(dict.fromkeys(chunk_ids))
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            cursor.execute(
+                f'DELETE FROM rag_fts WHERE rowid IN ({",".join("?" * len(batch))})', batch
+            )
+
+    @staticmethod
+    def _rebuild_rag_fts(cursor: sqlite3.Cursor) -> None:
+        cursor.execute('DELETE FROM rag_fts')
+        cursor.execute('''
+            INSERT INTO rag_fts (rowid, content, source_type, session_id, document_id, chunk_id)
+            SELECT rc.id, rc.content, rd.source_type, rc.session_id, rc.document_id, rc.id
+            FROM rag_chunks rc
+            JOIN rag_documents rd ON rc.document_id = rd.id
+        ''')
 
     def get_rag_document(self, source_type: str, source_id: int) -> Optional[Dict[str, Any]]:
         """Return one RAG document row by source identity, or ``None``.
@@ -1432,23 +1903,7 @@ class Database:
         """
         try:
             cursor = self.connection.cursor()
-
-            # Delete all existing FTS entries
-            cursor.execute("DELETE FROM rag_fts")
-
-            # Insert all rag_chunks joined with rag_documents
-            cursor.execute('''
-                INSERT INTO rag_fts (content, source_type, session_id, document_id, chunk_id)
-                SELECT 
-                    rc.content,
-                    rd.source_type,
-                    rc.session_id,
-                    rc.document_id,
-                    rc.id
-                FROM rag_chunks rc
-                JOIN rag_documents rd ON rc.document_id = rd.id
-            ''')
-
+            self._rebuild_rag_fts(cursor)
             self.connection.commit()
         except sqlite3.Error as e:
             self.connection.rollback()
@@ -1522,10 +1977,13 @@ class Database:
                 FROM rag_fts f
                 JOIN rag_documents rd ON f.document_id = rd.id
                 LEFT JOIN rag_chunks rc ON rc.id = f.chunk_id
+                LEFT JOIN sessions s ON s.id = rd.session_id
             ''']
 
             # MATCH is mandatory: without it every chunk is returned unranked.
-            where_clauses = ['f.content MATCH ?']
+            # Chunks of a deleted session never surface, even if a delete
+            # path left them behind.
+            where_clauses = ['f.content MATCH ?', '(rd.session_id IS NULL OR s.id IS NOT NULL)']
             params = [fts_query]
 
             # Add session_id filter if provided

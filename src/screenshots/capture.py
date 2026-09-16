@@ -3,8 +3,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Callable, Tuple
 
-from PySide6.QtGui import QShortcut, QKeySequence, QGuiApplication, QScreen, QCursor
-from PySide6.QtWidgets import QWidget, QInputDialog, QLineEdit
+from PySide6.QtGui import QGuiApplication, QScreen, QCursor
+from PySide6.QtWidgets import QInputDialog, QLineEdit
 from PySide6.QtCore import QRect
 
 from .snipping import SnippingOverlay
@@ -205,13 +205,19 @@ class ScreenshotCapture:
             return text.strip()
         return None
 
-    def register_shortcuts(self, parent: QWidget):
-        """Registra los atajos de teclado para capturar pantallas."""
-        # Usar lambda con valores por defecto para evitar problemas de scoping
-        QShortcut(QKeySequence('Ctrl+Shift+S'), parent,
-                  lambda: self.capture_fullscreen(session_name='screenshot'))
-        QShortcut(QKeySequence('Ctrl+Shift+R'), parent,
-                  lambda: self.capture_interactive_region(session_name='screenshot'))
+    def import_image(self, image, session_name: str = 'session', session_id: int = 1) -> str:
+        """Guarda una imagen externa (p. ej. un recorte de Win+Shift+S tomado
+        del portapapeles, BU110) como screenshot de la sesión."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_name = session_name.replace(' ', '_')
+        for char in ['/', '\\', ':', '-', '.', ',']:
+            safe_name = safe_name.replace(char, '_')
+        output_path = self.screenshots_path / f'{safe_name}_{timestamp}_clip.png'
+        if not image.save(str(output_path), "PNG"):
+            raise RuntimeError(f'Could not save clipboard image to {output_path}')
+        logger.info(f'Clipboard screenshot saved to {output_path}')
+        self._store_metadata(output_path, session_id)
+        return str(output_path)
 
     def _get_output_path(self, label: str) -> Path:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

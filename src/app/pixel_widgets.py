@@ -13,8 +13,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize, Signal, QTimer, QEvent
 import html as html_escape
 import re
+from .pixel_theme import asset_path
 from PySide6.QtGui import (
     QColor,
+    QIcon,
     QPainter,
     QPainterPath,
     QPen,
@@ -270,11 +272,27 @@ class PixelButton(QPushButton):
 
 
 class PixelToolButton(QToolButton):
-    def __init__(self, parent=None):
+    """Square icon button in the app's navy/gold palette.
+
+    ``compact=True`` (used by the transcripts toolbar, BU104) trims the
+    footprint down from the default 52px/28px icon to a slimmer 34px/18px
+    button with a thinner border - the default size reads oversized in a
+    ~300px-wide side panel that holds three of these side by side.
+    """
+
+    def __init__(self, parent=None, compact: bool = False):
         super().__init__(parent)
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumSize(QSize(52, 52))
-        self.setIconSize(QSize(28, 28))
+        self.compact = compact
+
+        size = QSize(34, 34) if compact else QSize(52, 52)
+        icon_size = QSize(18, 18) if compact else QSize(28, 28)
+        border_width = 1 if compact else 2
+        radius = 6 if compact else 7
+        padding = 4 if compact else 6
+
+        self.setMinimumSize(size)
+        self.setIconSize(icon_size)
         self.setObjectName("PixelToolButton")
 
         font = QFont("Courier New")
@@ -283,28 +301,29 @@ class PixelToolButton(QToolButton):
         self.setFont(font)
 
         self.setStyleSheet(
-            """
-            QToolButton#PixelToolButton {
+            f"""
+            QToolButton#PixelToolButton {{
                 color: #FFF0BF;
                 background: #274F9B;
-                border: 2px solid #3A67C7;
-                border-radius: 7px;
-                padding: 6px;
-            }
+                border: {border_width}px solid #3A67C7;
+                border-radius: {radius}px;
+                padding: {padding}px;
+            }}
 
-            QToolButton#PixelToolButton:hover {
+            QToolButton#PixelToolButton:hover {{
                 background: #315DB1;
-            }
+                border-color: #4A78D8;
+            }}
 
-            QToolButton#PixelToolButton:pressed {
+            QToolButton#PixelToolButton:pressed {{
                 background: #1E3F82;
-            }
+            }}
 
-            QToolButton#PixelToolButton:disabled {
+            QToolButton#PixelToolButton:disabled {{
                 color: #8090B8;
                 background: #18336F;
                 border: 2px solid #284B94;
-            }
+            }}
             """
         )
 
@@ -313,11 +332,11 @@ class PixelToolButton(QToolButton):
 # Chat bubbles
 # =========================
 
-# A footer such as "\n\n— via Any Session" appended by the assistant to mark
-# the scope an answer was drawn from. Rendered as a small, muted line instead
-# of inline with the answer text so it reads as a quiet attribution, not part
-# of the message.
-_SCOPE_FOOTER_RE = re.compile(r"\n\n(— via .+)$", re.DOTALL)
+# A footer such as "\n\n— via Any Session" (scope attribution) or "\n\n— 21:03"
+# (BU103 grouped-bubble timestamp) appended after the bubble text. Rendered as
+# a small, muted line instead of inline with the body so it reads as a quiet
+# annotation, not part of the message.
+_SCOPE_FOOTER_RE = re.compile(r"\n\n(— .+)$", re.DOTALL)
 
 
 class PixelBubble(QWidget):
@@ -437,6 +456,24 @@ class PixelBubble(QWidget):
             bg, fg = FIND_TERM_ON_CREAM if self.variant == "cream" else FIND_TERM_ON_BLUE
             self.label.setTextFormat(Qt.RichText)
             self.label.setText(highlight_terms_html(self._body_text, terms, bg, fg))
+        else:
+            self.label.setTextFormat(Qt.RichText)
+            self.label.setText(simple_markdown_to_html(self._body_text))
+
+    def append_text(self, text: str):
+        """Grow this bubble's body with more text (BU103 grouped live
+        transcript bubbles), re-rendering through the same path
+        ``set_match_terms`` uses so active find-highlighting keeps working.
+
+        Each appended chunk starts its own paragraph (a blank line) rather
+        than running on from a single space, so a viewer can tell where the
+        newly-arrived text starts inside a bubble that keeps growing.
+        """
+        self._body_text = f"{self._body_text}\n\n{text}"
+        if self._match_terms:
+            bg, fg = FIND_TERM_ON_CREAM if self.variant == "cream" else FIND_TERM_ON_BLUE
+            self.label.setTextFormat(Qt.RichText)
+            self.label.setText(highlight_terms_html(self._body_text, self._match_terms, bg, fg))
         else:
             self.label.setTextFormat(Qt.RichText)
             self.label.setText(simple_markdown_to_html(self._body_text))
@@ -665,6 +702,52 @@ def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_wi
         layout.addStretch(1)
 
     return row
+
+
+def aligned_bubble_with_time(
+    text: str,
+    variant: str = "blue",
+    align: str = "left",
+    max_width: int = 520,
+    time_text: str = "",
+) -> QWidget:
+    """Like ``aligned_bubble``, but with a small muted timestamp placed
+    *above* the bubble (BU104) instead of buried at the end of its text -
+    so the time reads before the message, the way a chat client shows it,
+    rather than as a trailing footer once the bubble has already appeared.
+    """
+    container = QWidget()
+    container.setAttribute(Qt.WA_StyledBackground, False)
+    container.setAutoFillBackground(False)
+
+    outer = QVBoxLayout(container)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(3)
+
+    if time_text:
+        time_label = QLabel(time_text)
+        time_font = QFont("Courier New")
+        time_font.setPointSize(9)
+        time_font.setBold(True)
+        time_font.setLetterSpacing(QFont.AbsoluteSpacing, 1)
+        time_label.setFont(time_font)
+        time_label.setStyleSheet(
+            "QLabel { color: #7E8FC2; background: transparent; border: none; }"
+        )
+
+        time_row = QHBoxLayout()
+        time_row.setContentsMargins(4, 0, 4, 0)
+        time_row.setSpacing(0)
+        if align == "right":
+            time_row.addStretch(1)
+            time_row.addWidget(time_label)
+        else:
+            time_row.addWidget(time_label)
+            time_row.addStretch(1)
+        outer.addLayout(time_row)
+
+    outer.addWidget(aligned_bubble(text, variant=variant, align=align, max_width=max_width))
+    return container
 
 
 def bubble_of_row(row) -> "PixelBubble | None":
@@ -1199,7 +1282,29 @@ class PixelCollapsibleSection(QWidget):
         layout.addWidget(self.body_panel)
 
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        # A word-wrapped label reports a size hint for an unwrapped width, so
+        # in a narrow column its later lines were clipped. Track the height
+        # the text really needs at the width it actually got.
+        self.body_label.installEventFilter(self)
         self.set_scale(1.0)
+
+    def eventFilter(self, obj, event):
+        if obj is self.body_label and event.type() == QEvent.Resize:
+            self._fit_body_height()
+        return super().eventFilter(obj, event)
+
+    def _fit_body_height(self):
+        label = self.body_label
+        width = label.width()
+        if width <= 0:
+            return
+        # QLabel.heightForWidth never reports less than the current minimum
+        # height, so measure with the minimum cleared - otherwise a value
+        # taken at a narrow in-between width during layout would stick.
+        previous = label.minimumHeight()
+        label.setMinimumHeight(0)
+        needed = label.heightForWidth(width)
+        label.setMinimumHeight(needed if needed > 0 else previous)
 
     def is_expanded(self) -> bool:
         return self._expanded
@@ -1216,6 +1321,28 @@ class PixelCollapsibleSection(QWidget):
     def toggle(self):
         self.set_expanded(not self._expanded)
 
+    def set_body(self, body: str, match_marks=None):
+        """Replace the section's content (used by the screenshot viewer, BU109).
+
+        ``match_marks`` is an optional ``(start, end)`` pair of marker
+        characters bracketing search matches in ``body``; each bracketed run
+        gets the find-bar highlight chip.
+        """
+        count = count_summary_items(body)
+        self.header.count.setText(str(count))
+        self.header.count.setVisible(count > 0)
+        html = format_summary_body_html(body)
+        if match_marks:
+            bg, fg = FIND_TERM_ON_BLUE
+            start, end = match_marks
+            html = html.replace(
+                start, f'<span style="background:{bg}; color:{fg};">'
+            ).replace(end, '</span>')
+        self.body_label.setText(html)
+        self._fit_body_height()
+        self.body_label.adjustSize()
+        self.adjustSize()
+
     def set_scale(self, scale: float):
         """Scale every font in the section. 1.0 is the base size."""
         self.header.apply_fonts(max(8.0, 11 * scale), max(7.0, 9 * scale))
@@ -1225,6 +1352,7 @@ class PixelCollapsibleSection(QWidget):
         )
         pad = max(8, round(12 * scale))
         self.body_panel.layout().setContentsMargins(pad + 4, pad, pad + 4, pad)
+        self._fit_body_height()
         self.body_label.adjustSize()
         self.adjustSize()
 
@@ -1416,6 +1544,48 @@ def pixel_group_header(text: str, count: int = 0) -> QWidget:
     return widget
 
 
+class PixelShotsChip(QWidget):
+    """How many screenshots a session has: the app's pixel camera icon and a
+    small number. Hidden when the session has none."""
+
+    ICON_SIZE = 18
+    COUNT_PT = 7.5
+
+    def __init__(self, count: int = 0, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PixelShotsChip")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QWidget#PixelShotsChip { background: #1E3F82; border: 1px solid #3A67C7;"
+            " border-radius: 4px; }"
+        )
+        self.icon_label = QLabel()
+        self.icon_label.setStyleSheet("QLabel { background: transparent; border: none; }")
+        self.icon_label.setPixmap(QIcon(asset_path("icon_camera.svg")).pixmap(
+            QSize(self.ICON_SIZE, self.ICON_SIZE)
+        ))
+        self.count_label = QLabel()
+        self.count_label.setStyleSheet(_label_qss("#FFE9A8", self.COUNT_PT, bold=True))
+        # Two digits' worth of room, so the chip is the same width on every card.
+        count_font = QFont("Courier New")
+        count_font.setPointSizeF(self.COUNT_PT)
+        count_font.setBold(True)
+        self.count_label.setMinimumWidth(QFontMetrics(count_font).horizontalAdvance("99"))
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 0, 7, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self.icon_label, 0, Qt.AlignVCenter)
+        layout.addWidget(self.count_label, 0, Qt.AlignVCenter)
+        self.set_count(count)
+
+    def set_count(self, count: int):
+        count = max(0, int(count or 0))
+        self.count_label.setText(str(count))
+        self.setToolTip(f"{count} screenshot{'s' if count != 1 else ''}")
+        self.setVisible(count > 0)
+
+
 class PixelSessionCard(QWidget):
     """One session in the All Sessions browser: name, time, processing chips,
     an Open button and a "•••" actions button (its menu is set by the owner).
@@ -1428,7 +1598,7 @@ class PixelSessionCard(QWidget):
     open_requested = Signal()
 
     def __init__(self, name: str, meta: str, trans_ready: bool, sum_ready: bool,
-                 live_state=None, parent=None):
+                 live_state=None, shot_count: int = 0, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_Hover, True)
         self.setAutoFillBackground(False)
@@ -1460,8 +1630,11 @@ class PixelSessionCard(QWidget):
         chip_font.setPointSizeF(8.5)
         chip_font.setBold(True)
         metrics = QFontMetrics(chip_font)
-        self.transcript_chip.setMinimumWidth(metrics.horizontalAdvance("… Transcribing") + 22)
-        self.summary_chip.setMinimumWidth(metrics.horizontalAdvance("… Summarizing") + 22)
+        # Room for the "busy" wording so a chip doesn't jump while it works.
+        self.transcript_chip.setMinimumWidth(metrics.horizontalAdvance("… Transcribing") + 18)
+        self.summary_chip.setMinimumWidth(metrics.horizontalAdvance("… Summarizing") + 18)
+        self.shots_chip = PixelShotsChip(shot_count)
+        self.shots_chip.setFixedHeight(self.transcript_chip.sizeHint().height())
 
         self.open_button = QToolButton()
         self.open_button.setText("Open")
@@ -1513,8 +1686,9 @@ class PixelSessionCard(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(22, 10, 14, 10)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         layout.addLayout(text_col, 1)
+        layout.addWidget(self.shots_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.transcript_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.summary_chip, 0, Qt.AlignVCenter)
         layout.addSpacing(6)
@@ -1531,6 +1705,9 @@ class PixelSessionCard(QWidget):
     def set_status(self, trans_ready: bool, sum_ready: bool):
         self.transcript_chip.set_state("ready" if trans_ready else "pending")
         self.summary_chip.set_state("ready" if sum_ready else "pending")
+
+    def set_shot_count(self, count: int):
+        self.shots_chip.set_count(count)
 
     def set_meta(self, text: str):
         if self.meta_label.text() != text:

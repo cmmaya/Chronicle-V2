@@ -1616,3 +1616,894 @@ narrowing to a single-cell apex, and a wide horizontal bar underneath
 representing the tray. Same `#FFE8AD` fill and `crispEdges` rendering as the
 rest of `assets/pixel/`, so it stays visually consistent with the other
 toolbar icons while looking distinctly like a download action.
+
+## BU102 - Resume Stopped Session From All Sessions
+
+Summary:
+Pause/resume (BU060/BU061) only covered the session currently loaded in
+memory - there was no way to pick a stopped session from the All Sessions
+window and continue recording into it. Added a "Resume" action to the
+session card menu that resumes recording into the same session_id, keeping
+its original start_time, name, transcripts and screenshots intact.
+
+Files Changed:
+
+- src/app/session_manager.py (added resume_stopped_session)
+- src/app/window.py (added Resume menu item and handler)
+- docs/build_plan/BU102.md (new file)
+- docs/build_plan/index.md
+- docs/current_state.md
+
+Implementation:
+
+- `SessionManager.resume_stopped_session(session_id)`: refuses if another
+  session is currently active or paused (must stop/pause it first, so no
+  second session is ever recorded concurrently). Loads the target session via
+  the existing `load_session` (which restores start_time, name and path from
+  the DB row unchanged), flips its in-memory and DB status back to `active`
+  without touching `start_time`, sets it as `current_session`, then calls
+  `start_recording('main')` to continue writing audio into the same session
+  folder.
+- `_build_session_actions_menu` (window.py) now adds a "Resume" item for any
+  non-live card whose stored status is `stopped`, `paused` or `completed`,
+  placed next to Rename. It is disabled with "Resume (stop current session
+  first)" when another session is currently live, mirroring how Delete is
+  disabled while a session is live.
+- New handler `_resume_session_from_all_sessions`: calls the manager method,
+  then reuses the same UI wiring `_on_start_session` uses to reflect a
+  session becoming active - sets `_selected_session_id`, switches
+  `scope_combo` to Specific Session, updates the search box and scope label,
+  reloads live transcripts - refreshes the All Sessions list and closes the
+  dialog.
+
+Important Decisions:
+
+- Did not reuse `Session.start()` for resuming, since it unconditionally
+  sets `start_time = datetime.now()` - that would have overwritten the
+  original session start time and broken the "same session metadata"
+  requirement. `resume_stopped_session` sets `status` directly instead.
+- Resuming into a session while another is live is refused rather than
+  auto-stopping the live one, so the user doesn't lose an unsaved recording
+  by clicking the wrong menu item.
+
+Validation:
+
+- `python -m py_compile src/app/window.py src/app/session_manager.py` -> OK.
+- PySide6 not installed in this env, so the menu click / recording resume
+  need a manual run in the app.
+
+Next:
+
+- none
+
+### BU101 follow-up - autoscroll landed one message short
+
+Reported: the transcripts panel's stick-to-bottom behavior would scroll to
+the second-to-last message instead of the newest one.
+
+Root cause: the original fix read `scroll_bar.maximum()` inside a
+`QTimer.singleShot(0, ...)` right after inserting the new bubble. That single
+deferred callback assumed one event-loop tick was enough for the scroll
+area's content height to finish settling, but a word-wrapped bubble can take
+an extra layout pass to reach its final height - so the captured `maximum()`
+was sometimes still the pre-final value, and the view snapped to a position
+just short of the true bottom.
+
+Fix: `src/app/window.py` now connects `verticalScrollBar().rangeChanged` to
+`_on_transcription_range_changed`, which sets the scrollbar to whatever
+`maximum` it's just been given whenever `_transcription_autoscroll` is `True`.
+`rangeChanged` fires every time the content height actually changes -
+including a second pass if one occurs - so the view keeps re-snapping to
+`maximum` until it reflects the bubble's real final height, instead of
+guessing after a single fixed delay. `add_transcription_to_view` no longer
+needs its own scroll-adjustment code; inserting the bubble is enough to
+trigger the range change.
+
+Validation: `python -m py_compile src/app/window.py` -> OK. PySide6 not
+installed in this env, so the actual snap-to-newest-message behavior needs a
+manual run.
+
+## BU103 - Grouped Live Transcript Bubbles
+
+Summary:
+The live transcript stream produced a new bubble per ~10s audio chunk
+(`ChunkedAudioRecorder.CHUNK_DURATION`), so a single continuous sentence
+spoken over several chunks got sliced into stacked bubbles with no visible
+time. Reworked the stream to group consecutive same-source chunks into one
+growing bubble, ending the group on a real pause, a source change or a ~60s
+cap, with one `HH:MM` timestamp per bubble and a brief fade-in on new/appended
+text.
+
+Files Changed:
+
+- src/app/pixel_widgets.py (`_SCOPE_FOOTER_RE`, `PixelBubble.append_text`)
+- src/app/window.py (grouping state, `add_transcription_to_view`,
+  `_play_transcript_fade`, thread-safe hop, historical reload path)
+- docs/build_plan/BU103.md (status)
+- docs/build_plan/index.md
+- docs/current_state.md
+
+Implementation:
+
+- `pixel_widgets._SCOPE_FOOTER_RE` relaxed from matching only
+  `"\n\n(— via .+)$"` to any `"\n\n(— .+)$"`, so the same muted italic footer
+  `PixelBubble` already renders for scope tags now also renders a timestamp
+  caption like `"— 21:03"`.
+- `PixelBubble.append_text(text)` appends `" " + text` to `_body_text` and
+  re-renders `self.label` through the same path `set_match_terms` uses, so
+  BU099 find-highlighting keeps matching text appended after the bubble was
+  created.
+- `window.py` tracks one "open group" per source (`mic`/`system`) in
+  `self._transcript_groups`: the row widget, its `PixelBubble`, the group's
+  `start_dt` and `last_end` datetime. Reset alongside `_transcription_history`
+  in `_clear_transcription_view`.
+- New module constants `TRANSCRIPT_PAUSE_GAP_SECONDS` (1.5x
+  `ChunkedAudioRecorder.CHUNK_DURATION`, ~15s) and
+  `TRANSCRIPT_MAX_GROUP_SECONDS` (60s).
+- `add_transcription_to_view(text, source, timestamp='', start_dt=None,
+  end_dt=None)` decides, per source: if there's an open group and the new
+  chunk's `start_dt` is within `TRANSCRIPT_PAUSE_GAP_SECONDS` of the group's
+  `last_end` *and* the group's total span stays under
+  `TRANSCRIPT_MAX_GROUP_SECONDS`, extend the open bubble
+  (`bubble.append_text`, merge `find_text`, bump `last_end`); otherwise start
+  a new bubble exactly as before, with a `"— HH:MM"` footer (the new group's
+  start time) appended via the relaxed footer regex. Mic and system never
+  merge - they're separate dict keys / separate open-group slots.
+- A pause is detected purely from the existing gap between one chunk's
+  `timestamp_end` and the next chunk's `timestamp_start` for the same source
+  - no new VAD plumbing. A chunk that fails the existing
+  `ChunkedAudioRecorder._check_vad` speech-ratio check never reaches the live
+  callback at all, so a gap bigger than ~1.5 chunks means that check silently
+  dropped a window, which *is* the pause (see BU103.md's Design decision).
+- `_play_transcript_fade(row)` plays a 200ms `QGraphicsOpacityEffect` +
+  `QPropertyAnimation` fade from 0.35 -> 1.0 opacity on a row, whether it was
+  just inserted or just extended. The effect/animation are cached on the row
+  via `setProperty`/`property` so repeated appends reuse (and restart) the
+  same objects instead of accumulating running animations.
+- The thread-safe live hop no longer collapses the result into one
+  pre-formatted string: `_on_live_transcription` now invokes
+  `_append_transcription(text, source, timestamp_start, timestamp_end)` (4
+  `Q_ARG(str, ...)`), so the real `timestamp_end` survives the
+  `QMetaObject.invokeMethod` round trip for the pause-gap check.
+  `_append_transcription` parses the ISO timestamps back to `datetime` and
+  calls `add_transcription_to_view` with `start_dt`/`end_dt`.
+- The historical reload loop (`_load_transcripts_for_session`) now computes
+  `start_dt` from the stored unix timestamp and approximates `end_dt` as
+  `start_dt + ChunkedAudioRecorder.CHUNK_DURATION` seconds, then calls the
+  same grouped `add_transcription_to_view`, so reloaded sessions render with
+  the same grouped bubbles instead of one bubble per stored row.
+  `_transcription_history` still logs one full `[HH:MM:SS] Source: text` line
+  per raw chunk regardless of visual grouping, so the BU101 transcript
+  download stays at full resolution.
+- `_add_transcription_to_detached` (the detached transcript window) is
+  untouched and keeps its flat per-chunk format, per BU103's Out of Scope.
+
+Validation:
+
+- `python -m py_compile src/app/window.py src/app/pixel_widgets.py` -> OK.
+- PySide6 not installed in this env, so the manual live-session grouping /
+  pause / mic-vs-system / find-bar / download checks from BU103.md's
+  Validation Requirements need a run in the actual app.
+
+Next:
+
+- none
+
+### BU103 follow-up - live transcripts never reached the UI
+
+Reported: after a manual run, live transcriptions showed up in the console
+(`[LIVE TRANSCRIPTION] mic: ...`) but never appeared in the transcript panel
+at all - not even ungrouped. The console showed:
+
+```
+QMetaObject::invokeMethod: No such method MainWindow::_append_transcription(QString,QString,QString)
+Candidates are:
+    _append_transcription(QString,QString,QString,QString)
+```
+
+Root cause: `_on_live_transcription` called
+`QMetaObject.invokeMethod(self, "_append_transcription", Qt.QueuedConnection,
+Q_ARG(str, ...), Q_ARG(str, ...), Q_ARG(str, ...), Q_ARG(str, ...))` with 4
+`Q_ARG`s to match the new 4-argument `_append_transcription(text, source,
+timestamp_start, timestamp_end)` slot added earlier in this BU. This PySide6
+build's `invokeMethod` binding silently truncated the call to 3 arguments
+before dispatch, so it could never find a matching registered slot (the
+4-argument one was correctly registered - the call just didn't carry 4 args)
+and the queued call failed every time, dropping every live transcript before
+it ever reached `add_transcription_to_view`.
+
+Fix: replaced the `QMetaObject.invokeMethod`/`Q_ARG` hop with a Qt signal.
+Added `MainWindow._live_transcription_ready = Signal(str, str, str, str)`,
+connected to `_append_transcription` with `Qt.QueuedConnection` in
+`__init__`, and `_on_live_transcription` now calls
+`self._live_transcription_ready.emit(text, source, str(timestamp_start),
+str(timestamp_end))` instead of invokeMethod. Qt's native signal/slot
+argument marshaling carries all 4 strings across the audio-thread ->
+UI-thread hop reliably, sidestepping whatever limitation truncates
+`invokeMethod`'s `Q_ARG` list in this environment. Removed the now-unused
+`QMetaObject`/`Q_ARG` imports.
+
+Files Changed:
+
+- src/app/window.py
+
+Validation:
+
+- `python -m py_compile src/app/window.py` -> OK.
+- PySide6 still not installed in this env; the user confirmed the original
+  failure via a manual run and will need to re-verify live transcripts now
+  reach the panel (grouped, with timestamp and fade) after this fix.
+
+### BU103 follow-up - fade glitch on scroll, and no separation between appended chunks
+
+Reported (after confirming live transcripts render): (1) scrolling up while a
+bubble is still growing "kind of bugs" - a screenshot showed garbled/corrupted
+text at the top of an in-progress bubble; (2) chunks appended to a growing
+bubble ran together with a single space, making it hard to tell where new
+text started.
+
+Root cause (1): `_play_transcript_fade` re-triggered the same
+`QGraphicsOpacityEffect` (left attached to the row after its first use) on
+every `append_text` call. Re-applying/animating a graphics effect on a widget
+whose content is *simultaneously* resizing (the label re-wrapping as text
+grows) is a known-fragile combination in Qt - the effect's cached source
+pixmap doesn't reliably track the new size, especially for a widget currently
+clipped/off-screen in a `QScrollArea` (scrolled away from the bottom), which
+matches exactly when the corruption was seen.
+
+Fix: `add_transcription_to_view`'s "extend" branch no longer calls
+`_play_transcript_fade` at all - only a freshly inserted bubble (whose size is
+already settled by the time the fade starts) gets the fade-in.
+`_play_transcript_fade` itself now creates the `QGraphicsOpacityEffect` fresh
+and removes it again (`row.setGraphicsEffect(None)`) once the animation
+finishes, instead of leaving it cached on the row - so any later resize from
+`append_text` always happens on a plain widget with no effect attached.
+
+Fix (2): `PixelBubble.append_text` now joins the new chunk onto
+`_body_text` with `"\n\n"` (a blank-line paragraph break) instead of a single
+space, so each appended chunk reads as its own paragraph inside the bubble.
+
+Files Changed:
+
+- src/app/window.py
+- src/app/pixel_widgets.py
+
+Validation:
+
+- `python -m py_compile src/app/window.py src/app/pixel_widgets.py` -> OK.
+- Manual re-verification in the running app still pending (PySide6 not
+  installed in this dev env).
+
+### BU103 follow-up - 2-second chunk duration
+
+Requested: bubbles should update roughly every 2 seconds instead of every
+10, for a more fluid live-captioning feel. Confirmed with the user this means
+lowering the actual audio chunk length (not a UI-only refresh), with the
+tradeoff spelled out first: ~5x more transcription calls for the same amount
+of speech, and touching a file (`src/audio_capture/core.py`) outside BU103's
+original Allowed Files list.
+
+Implementation:
+
+- `ChunkedAudioRecorder.CHUNK_DURATION` lowered from `10` to `2` seconds.
+- `ChunkedAudioRecorder.OVERLAP_DURATION` lowered from `1` to `0.3` seconds.
+  At the original 10s/1s chunk/overlap it was a 10% overlap ratio; keeping a
+  flat 1s overlap on a 2s chunk would have made it 50% - each chunk would
+  re-transcribe half of the previous chunk's audio, both compounding the
+  cost increase further and doubling down on the duplicate-word-at-boundary
+  artifact visible in the reported screenshot (repeated "it's it's" - a
+  pre-existing overlap-boundary effect that grouping into one bubble made
+  newly visible). 0.3s keeps roughly the original ~15% ratio.
+- `ChunkedAudioRecorder.__init__`'s `chunk_duration`/`overlap_duration`
+  parameter defaults now read `CHUNK_DURATION`/`OVERLAP_DURATION` off the
+  class instead of separately hardcoded literals (`10`/`1`), and
+  `DualSourceChunkedRecorder.__init__` plus the `create_chunked_recorder` /
+  `create_dual_source_recorder` factory functions now default from
+  `ChunkedAudioRecorder.CHUNK_DURATION`/`OVERLAP_DURATION` too - one source
+  of truth, so `window.py`'s `TRANSCRIPT_PAUSE_GAP_SECONDS` (already derived
+  from `ChunkedAudioRecorder.CHUNK_DURATION`) automatically tracks the new
+  2s cadence without a separate edit.
+- `SessionManager` calls `dual_recorder_factory(...)` without an explicit
+  `chunk_duration`, so both live sessions (`create_session` and
+  `load_session`) pick up the new 2s/0.3s default automatically.
+
+Files Changed:
+
+- src/audio_capture/core.py
+
+Out of scope / not done:
+
+- Any dedup of the overlap-boundary duplicate words themselves - flagged as
+  a pre-existing, separate concern, not fixed here.
+- `tests/test_capture_system_chunk.py` passes `chunk_duration=5` explicitly
+  and is unaffected.
+
+Validation:
+
+- `python -m py_compile src/audio_capture/core.py` -> OK.
+- Not run against real audio hardware in this env; the user will need to
+  verify live sessions still capture/transcribe correctly at the new
+  cadence, and that per-chunk transcription latency/cost at 2s chunks is
+  acceptable.
+
+### BU103 follow-up - 2s chunks hurt transcription quality, settled on 5s
+
+Reported: 2-second chunks update bubbles fast but give the transcription
+model too little audio per call, degrading quality; wants bubbles to still
+accumulate for up to a minute (already true - `TRANSCRIPT_MAX_GROUP_SECONDS`
+in `window.py` was untouched by the chunk-duration change) with a 5-second
+chunk duration as the compromise.
+
+Implementation:
+
+- `ChunkedAudioRecorder.CHUNK_DURATION` raised from `2` to `5` seconds.
+- `ChunkedAudioRecorder.OVERLAP_DURATION` raised from `0.3` to `0.5` seconds
+  (~10% of chunk duration, matching the original 10s/1s ratio).
+- No other changes needed: every other default (`DualSourceChunkedRecorder`,
+  the two factory functions) and `window.py`'s `TRANSCRIPT_PAUSE_GAP_SECONDS`
+  read off these two class attributes, so they all picked up 5s/0.5s
+  automatically from this one edit.
+
+Files Changed:
+
+- src/audio_capture/core.py
+
+Validation:
+
+- `python -m py_compile src/audio_capture/core.py` -> OK.
+- Not run against real audio hardware in this env.
+
+### BU103 follow-up - invented and missing words at chunk boundaries
+
+Reported: with shorter chunks, some words look "invented" (not actually
+said) and some real speech goes missing, both concentrated at chunk
+boundaries. Diagnosis: (1) `OVERLAP_DURATION` (0.5s) was thin enough that a
+word straddling a chunk edge could land right at the very start/end of a
+chunk's audio with little surrounding context, which is exactly when an ASR
+model is most likely to guess a plausible-sounding but wrong word, or to clip
+it entirely; (2) `LiveTranscriber._deduplicate` (src/transcription/live.py)
+only stripped the chunk-overlap re-transcription when the two chunks produced
+*exactly* the same words for that overlapping audio - Parakeet doesn't
+reliably transcribe the same audio identically twice, so a boundary word that
+came out differently each time (a garbled guess on one side, correct on the
+other) slipped past the exact match and both copies stayed in the text,
+reading as an invented duplicate.
+
+Implementation:
+
+- `ChunkedAudioRecorder.OVERLAP_DURATION` raised from 0.5s to 1.0s (20% of
+  the 5s `CHUNK_DURATION`) so a boundary word has a real chance of sitting
+  fully inside the overlap - with genuine audio context on both sides - in
+  at least one of the two chunks, rather than right at a hard edge.
+- `LiveTranscriber._deduplicate` reworked to match phrases of 4, 6 or 8 words
+  by `difflib.SequenceMatcher` character-similarity ratio (thresholds 0.85,
+  0.80, 0.75 respectively - shorter phrases need a higher bar since fewer
+  characters have to coincidentally agree) instead of requiring exact
+  equality, so a slightly-different second transcription of the same
+  overlapping audio still gets recognized and stripped.
+- Deliberately did NOT extend fuzzy matching to the 2-3 word phrase lengths:
+  tested `"we can do"` (previous chunk tail) against `"we can also"` (new
+  chunk head) - two clearly different, non-overlapping continuations - and
+  it matched at ratio 0.80 purely because both start with "we can". Fuzzy
+  matching at short lengths would have silently deleted real text on any
+  sentence that happens to restart with a common short phrase. Those lengths
+  still require an exact match, matching the original behavior.
+- Fixed a latent bug found while rewriting this: on a successful dedup match,
+  the method returned `' '.join(new_words[num_words:])` where `new_words`
+  was built from `new_text.lower().split()` - so any transcript that
+  actually triggered dedup lost its capitalization. Now `new_words` keeps
+  the original casing and only a separate lower-cased copy is used for
+  comparison.
+
+Files Changed:
+
+- src/audio_capture/core.py (`OVERLAP_DURATION`)
+- src/transcription/live.py (`_deduplicate`)
+
+Validation:
+
+- `python -m py_compile src/audio_capture/core.py src/transcription/live.py`
+  -> OK.
+- Exercised `LiveTranscriber._deduplicate` directly (parakeet/numpy/soundfile
+  stubbed out, since they're not installed in this dev env) against 7 cases:
+  exact short-phrase dup, unrelated text (no false positive), the "we can
+  do"/"we can also" short-phrase near-miss (correctly NOT matched), original
+  casing preserved through a dedup match, a minor punctuation variant at 4+
+  words (correctly matched and stripped, ratio 0.82), a longer 4-word
+  coincidental-prefix case (correctly NOT matched), and no-previous-text.
+  All passed as expected.
+- Not run against real audio/microphone input in this env.
+
+## BU104 - Upload Audio File As Session
+
+Summary:
+Sessions could only be created by recording live. Added an "Upload Audio"
+button to the All Sessions window (left of Close; the redundant Refresh
+button is gone) that imports a WAV or an iPhone Voice Memos `.m4a` as a new
+session and transcribes it with the existing batch pipeline.
+
+Files Changed:
+
+- src/audio/importer.py (new - decode, split at pauses, write chunks)
+- src/app/session_manager.py (added import_audio_file)
+- src/app/window.py (Upload Audio button, Refresh removed, upload handler)
+- src/transcription/processor.py (no overlap dedup for imported chunks)
+- requirements.txt (av)
+- docs/build_plan/BU104.md (new file)
+- docs/build_plan/index.md
+- docs/current_state.md
+
+Implementation:
+
+- `src/audio/importer.py`: `decode_audio_file` opens the file with PyAV,
+  decodes the first audio track and resamples it to 16 kHz mono int16
+  (Parakeet's native rate) with `av.AudioResampler`; one path covers WAV and
+  `.m4a` (AAC / Apple Lossless) alike. It also returns the container's
+  `creation_time` (UTC, converted to local; ignored if missing, pre-2000 or
+  in the future). `split_at_pauses` makes ~30 s chunks, cutting each at the
+  quietest 50 ms frame of its last 5 s, and stops once the remainder fits in
+  one chunk so the tail is never a sliver. `write_chunks` writes PCM_16 WAVs
+  named `<start>_<end>_import.wav` - the live recorder's layout plus a
+  suffix - so `TranscriptionProcessor` sorts and timestamps them unchanged.
+- `SessionManager.import_audio_file`: decodes before touching the DB, so an
+  unreadable file creates nothing. Creates a `stopped` session named after
+  the file stem, dated from the embedded creation time or else the file's
+  mtime minus its duration, with `end_time` = start + duration. Writes the
+  chunks into `audio/mic`, rolling back the row and folder on failure (ids
+  are AUTOINCREMENT, so the folder is always fresh). Returns the Session with
+  a transcription processor attached, ready for `process_transcriptions`.
+- `TranscriptionProcessor._transcribe_and_store` skips
+  `_deduplicate_transcription` for `_import` chunks.
+- `window.py`: the bottom bar is [hint] [Upload Audio] [Close].
+  `_upload_audio_from_all_sessions` opens a file picker (last folder, else
+  Downloads) and imports under a wait cursor. It then calls the dialog's new
+  `_focus_session` hook (clears search / filter, reloads, selects and
+  scrolls to the card), marks the Transcript chip busy, and defers
+  `_transcribe_uploaded_session` by 50 ms - the same idiom as the card's
+  Transcribe action - which runs `SessionManager.process_transcriptions`
+  (sets `transcription_status`, RAG-indexes) and reloads the list.
+
+Important Decisions:
+
+- Bypassing the batch dedup was required, not optional: its
+  `_try_fuzzy_match` removes any 2+ word phrase from the previous chunk
+  found anywhere in the new one (substring match, lower-casing the result).
+  Built for the recorder's overlapping chunks; on pause-cut, non-overlapping
+  upload chunks it only deletes real words. Replayed on the test upload, it
+  cut words from 2 of 3 chunks. Keyed off the filename suffix (like
+  `_get_source_from_filename`'s `_system` check), so a retry through
+  "•••" → Transcribe also skips it.
+- Uses `SessionManager.process_transcriptions(session)` rather than
+  `_run_transcription`: the latter goes through `load_session`, which
+  replaces `current_timeline` even while another session is recording, and
+  it doesn't RAG-index.
+- PyAV rather than soundfile: libsndfile can't read AAC / ALAC `.m4a`. PyAV
+  was already in the venv (pulled by the old faster-whisper) and its wheels
+  bundle FFmpeg; now an explicit requirement.
+- Auto-transcribe on upload, blocking the UI like the existing Transcribe
+  action. A worker thread would need its own DB connection and Parakeet
+  instance; left out of scope.
+- Scroll-into-view is deferred (30 ms timer): new cards are shown and laid
+  out over several event-loop passes, and an immediate
+  `ensureWidgetVisible` after one `processEvents()` scrolled only partway.
+
+Validation:
+
+- `python -m py_compile` on the changed sources -> OK.
+- TTS fixtures (WAV 22 kHz, AAC `.m4a` 48 kHz with `creation_time`, stereo
+  ALAC `.m4a`): identical 67.8 s decodes, chunks 27.9 / 25.7 / 14.3 s cut in
+  silence, 16 kHz mono PCM_16 output, correct start/end times; a non-audio
+  file raises a readable error and leaves nothing behind.
+- Real Parakeet run on the imported AAC session: 3 accurate timestamped
+  transcripts, `transcribed`, RAG-indexed; stored text == raw model output.
+- Headless MainWindow against a temp DB: buttons are [Upload Audio]
+  [Close]; busy -> ready chip; past-dated upload scrolled into view under
+  its day group; simulated transcription failure leaves the card pending.
+- `pytest` (hardware / network tests excluded): 366 passed; 18 unrelated
+  OpenRouter HTTP 401 failures.
+
+Next:
+
+- none
+
+## BU105 - Performance, Memory, and Threading Rework
+
+Summary:
+Requested by the user after a walkthrough of the capture -> transcribe ->
+store -> UI pipeline (2.5-3.5 GB RAM, Stop/Pause/Close freezing the UI) and
+a read-only audit of `chronicle.db`. Moved live transcription off the audio
+capture callback and onto a background queue; collapsed live/batch
+transcription onto one shared, unloadable Parakeet model instead of up to
+three ~2.6 GB copies; made Stop/Close return immediately and finish
+transcribing/indexing/summarizing in the background; reworked
+`chronicle.db` (per-thread connections, WAL, versioned migrations,
+indexes, incremental FTS, orphan cleanup, startup session repair).
+
+Files Changed:
+
+- src/storage/database.py
+- src/transcription/parakeet.py, live.py, processor.py
+- src/transcription/worker.py (new)
+- src/audio_capture/core.py, system_recorder.py
+- src/rag/embeddings.py, indexer.py
+- src/app/session_manager.py (rewritten)
+- src/app/window.py
+- src/config.py
+- requirements.txt
+- tests/test_rag_indexer.py (+2 regression tests)
+- tests/test_database_perf.py, test_live_transcriber.py,
+  test_transcription_worker.py, test_transcription_no_duplicate.py,
+  test_session_manager_lifecycle.py (new, 37 tests total)
+
+Implementation:
+
+See `docs/build_plan/BU105.md` for the full task breakdown (database,
+speech model, live transcription, session lifecycle, UI). The short version:
+
+- `TranscriptionWorker` (new): one background thread + queue.
+  `submit()` never blocks; `LiveTranscriber`'s dedup/context state moved
+  from one shared `_last_text` to a dict keyed by `(session_id, source)`
+  stream - the old shared state compared a mic chunk against the previous
+  *system* chunk (or, once a shared engine existed, a previous session),
+  which can never find a real overlap.
+- `get_shared_engine()` (parakeet.py): one process-wide model instance,
+  thread-safe, used by both live and batch transcription, replacing a
+  separate `ParakeetEngine` per `LiveTranscriber`/`TranscriptionProcessor`.
+  `enable_cpu_mem_arena=False` on both the Parakeet and e5-embedding ONNX
+  sessions so memory returns after use instead of staying at its
+  high-water mark; idle-unload after 5 minutes via
+  `TRANSCRIPTION['idle_unload_seconds']`.
+- `ChunkedAudioRecorder`'s mic callback now only copies the incoming
+  buffer; resampling (new `_StreamResampler`, PyAV), VAD and the WAV write
+  moved to the recorder's own loop. Chunks store at 16 kHz (Parakeet's
+  native rate) instead of the device rate when PyAV is available.
+- `TranscriptionProcessor._already_transcribed`: skips any audio file a
+  transcript row (`transcripts.audio_file`, or a `(source, timestamp)`
+  fallback for older rows) already covers - batch transcription used to
+  unconditionally re-transcribe and re-insert every chunk.
+- `SessionManager` rewritten: a `_JobRunner` background thread for
+  finalize/transcribe/summarize; `stop_session(background=True)` returns
+  at once and reports completion via `session_finalized_callback`;
+  `close()` skips finalizing entirely (picked up by
+  `finalize_pending_sessions()` on the next start) and only disconnects
+  the database once the job runner is idle.
+- `database.py`: per-thread connections + WAL; `SCHEMA_VERSION`-driven
+  migration with an automatic pre-migration backup; indexes on every hot
+  lookup; `rag_fts` rows keyed by their chunk's rowid so one session's
+  re-index updates only its own FTS rows instead of rebuilding the whole
+  table; `purge_orphans()` / `repair_interrupted_sessions()` run at every
+  startup.
+- `window.py`: `_status_ready` / `_session_finalized_ready` /
+  `_ui_callback_ready` Qt signals (`Qt.QueuedConnection`) since
+  `SessionManager` now calls its callbacks from worker/job threads, not
+  just the UI thread; Transcribe/Summarize/Upload Audio moved off the UI
+  thread via `SessionManager.submit_job`; a live result is dropped if it
+  doesn't match the session actually on screen; screenshot thumbnails
+  decode via `QImageReader.setScaledSize` instead of loading the full
+  image first; each `QThread` releases its DB connection before exiting.
+
+Important Decisions:
+
+- int8 Parakeet quantization was implemented and measured (~750 MB vs
+  ~2.6 GB) but left off by default: on this machine (no AVX-VNNI) it
+  changed 26-46% of words versus fp32 on real session audio, including
+  several sentences returned empty. `config.TRANSCRIPTION['quantization']`
+  documents the trade-off for revisiting on different hardware.
+- `close()` doesn't wait for finalization (transcribe/index/summarize) at
+  all, even bounded - it flags the session (`needs_finalize=1`) and lets
+  the next start's `finalize_pending_sessions()` do it in the background.
+  Waiting even briefly on close would reintroduce the "quitting hangs"
+  problem for exactly the case (closing mid-session) where the user is
+  most likely to expect an instant exit.
+- Two real bugs were caught by the new end-to-end lifecycle tests before
+  landing, not found any other way: `close()` could disconnect the
+  database while a background finalize job was still using it (fixed by
+  giving `_JobRunner` a `wait()` the same way `TranscriptionWorker` already
+  had one); and, while writing those tests, the first fake speech engine
+  used a text template ~93% character-identical between any two chunks
+  (only a few timestamp digits differed), which the real fuzzy dedup
+  correctly - if confusingly - treated as a duplicate. Not a product bug,
+  but worth recording: a canned test double's output needs the same
+  "genuinely distinct between chunks" property real speech has, once
+  cross-chunk dedup is in the code path being exercised.
+- The auto-summary step in `finalize_session` calls the real OpenRouter
+  API when `config.SESSION['auto_summary_after_stop']` is on (the
+  default), which every new lifecycle test's session (real transcript
+  text, no summary yet) triggers exactly like a real one would. Caught
+  after a debug run had already made ~3 real calls against the user's key;
+  all further lifecycle tests monkeypatch that setting off.
+
+Validation:
+
+- Full existing suite (hardware/interactive-audio and non-pytest script
+  files excluded, matching prior runs): 409 passed (403 pre-existing + 6
+  new), same 18 pre-existing OpenRouter-401 failures. Confirmed via `git
+  stash` that those 18 are identical with and without this BU's changes -
+  a pre-existing test-isolation issue, spawned as a separate follow-up
+  task rather than fixed here.
+- 37 new unit tests (worker, per-stream dedup, no-duplicate-transcription,
+  migration, per-thread connections, chunk_text truncation regression)
+  plus 6 end-to-end lifecycle tests against a fake audio backend and fake
+  speech engine (no devices, no model, no network).
+- Migration exercised against a copy of the user's real 7-session
+  `chronicle.db` (2.93 MB -> 1.66 MB, 0 orphans, integrity ok) and,
+  separately, live via a headless `MainWindow` construction against the
+  actual file (backed up first). The automatic pre-migration backup
+  independently showed 3 sessions present at the start of this work had
+  already been deleted through the still-running old-code app instance
+  during this session - unrelated to this BU, confirmed by timestamp.
+- Memory (isolated subprocess measurements): fp32 Parakeet loaded+idle
+  2593 MB -> 83 MB after `unload()`, reload ~5s; e5 embedder batched vs.
+  unbatched peak 1167 MB vs. 1963 MB on a 138-chunk session.
+- Not done: real hardware validation (actual mic/system-audio devices at
+  16 kHz) - needs the user's machine.
+
+Next:
+
+- none
+
+### BU104 follow-up - WhatsApp voice notes (.opus)
+
+Asked whether Upload Audio accepts WhatsApp voice notes. It didn't: WhatsApp
+saves voice notes as `.opus` (Ogg container, Opus codec), which PyAV already
+decodes fine - the container format is detected from the file's content, not
+its extension - but `src/audio/importer.py`'s `SUPPORTED_EXTENSIONS` (used
+only for the upload file picker's filter) didn't list it, so the file picker
+hid `.opus` files by default (still reachable via the picker's "All files"
+option, but not the intended path).
+
+Implementation:
+
+- `SUPPORTED_EXTENSIONS` gained `.opus` and `.oga` (the alternate extension
+  Ogg audio sometimes carries, e.g. from other export paths).
+
+Validation:
+
+- Synthesized a mono Opus-in-Ogg file from the existing TTS fixture and
+  confirmed `decode_audio_file` returns the same 16 kHz mono int16 output as
+  the WAV/AAC/ALAC fixtures; also confirmed a copy renamed to `.ogg` decodes
+  identically (PyAV sniffs content, doesn't trust the extension).
+- `python -m py_compile src/audio/importer.py src/app/window.py` -> OK.
+
+Files Changed:
+
+- src/audio/importer.py (`SUPPORTED_EXTENSIONS`)
+- src/app/window.py (upload tooltip wording)
+- docs/current_state.md
+
+Next:
+
+- none
+
+### BU106-BU110 - Screenshot module overhaul
+
+Asked for a friendlier screenshot module (an image-viewer layout in the
+Summary window's theme), a Specific Session assistant that can locate a
+screenshot and point the user to it ("The information you asked might be
+contained in the screenshot: <ID>"), a preview-first search that only loads
+full metadata when needed, plus visible-text search, viewing screenshots
+during a live session, and a capture shortcut.
+
+What was there: the assistant got `[Screenshot at <epoch>]: <filepath>` only
+for screenshots within 60 s of a retrieved transcript - no content, no id.
+`description` was usually NULL, AI context existed only after a manual click
+gated on a summary, and the vision model's transcript excerpt was the 2
+nearest rows × 200 chars while its prompt claimed ~40 s. The UI was two
+~450-line near-duplicate grid dialogs plus a third full-image dialog.
+`ScreenshotCapture.register_shortcuts` was never called.
+
+Implementation:
+
+- BU106: `screenshots.preview_description` / `preview_source` (schema v3,
+  migration via `_add_column`). `src/screenshots/metadata.py`:
+  `transcript_window` (±20 s, nearest-2 fallback), `build_preliminary_description`
+  (≤240 chars: note · "Discussed: …" · HH:MM:SS (+offset)), `ensure_previews`
+  (rebuilds 'auto' previews only when changed, never touches 'ai'). The context
+  generator asks for `short_description`, normalizes its JSON output, and
+  stores the short description as the 'ai' preview. DB: `update_screenshot_preview`,
+  `get_screenshot_previews`, `get_screenshot_details`.
+- `src/screenshots/__init__.py` now loads the Qt classes lazily so the
+  Qt-free modules can be imported (and tested) without PySide6 - outside the
+  BU106 allowed files, needed for BU107/108 to be importable from the
+  assistant package.
+- BU107: `src/screenshots/search.py` - Tier 1 `rank_previews` (weighted token
+  overlap with keywords 1.5 / preview+note 1.0, temporal boost within 60 s
+  decaying to 0 at 180 s, explicit `#42` / "captura 42" references, deictic
+  fallback), Tier 2 `promote` (≤3, score ≥ 0.4, one `get_screenshot_details`
+  query), `search_session_screenshots` (full cards first, then index in
+  capture order, capped at 12).
+- BU108: `ScreenshotReference` gained id/preview/tier/details and one renderer
+  (`render_screenshot_section`) used by both prompt paths - no file paths.
+  `src/assistant/screenshot_contract.py` (`SCREENSHOT_CONTRACT`,
+  `parse_screenshot_refs`); the service tracks `_last_screenshot_ids`, appends
+  the contract only in Specific Session with screenshots, validates cited ids
+  before persisting, and returns `AnswerResponse.screenshot_refs`.
+- BU109: `src/app/screenshot_viewer.py` (`ScreenshotViewer`, `_ImageStage`
+  QGraphicsView, context threads moved here from window.py, `load_thumbnail`
+  moved here). Pure helpers in `src/screenshots/viewer_logic.py` (src/app
+  imports the audio stack at package level, so it can't host Qt-free code).
+  `PixelCollapsibleSection.set_body`. window.py: `_open_screenshot_viewer`,
+  `_open_screenshot_reference`, "View screenshot #ID" buttons under answers;
+  deleted both grid dialogs, `_show_full_image`, `_toggle_fullscreen`, the
+  dead `_edit_screenshot_description` and its eventFilter branch (~1,200
+  lines). No new SVG icons were needed (text glyphs on pixel buttons).
+- BU110: viewer search row (Ctrl+F, Enter/F3, This session | All sessions,
+  "+ description & summary"), terms emphasized as `**bold**` in the details
+  panel, hint + "Generate missing" when screenshots lack visible text.
+  Cross-session candidates come from `Database.get_searchable_screenshots`
+  and are matched in Python (`viewer_logic.filter_screenshots`) instead of a
+  `search_screenshots_text` SQL query as planned: `json.dumps` escapes
+  accents, so SQL LIKE can't match accent-insensitively. Viewer is non-modal,
+  one per session (`_screenshot_viewers`), `refresh_after_capture` after
+  every capture, hidden during the snip. `src/app/global_hotkey.py`
+  (RegisterHotKey + QAbstractNativeEventFilter), `src/screenshots/hotkeys.py`
+  (`parse_hotkey`, Win+Shift+S reserved check, `ClipboardDeduper`),
+  `config.SCREENSHOT`, hotkey synced in `_update_ui_state` (held only while
+  live, window-local QShortcut fallback), released on close. Opt-in clipboard
+  import via `SessionManager.import_clipboard_screenshot` /
+  `ScreenshotCapture.import_image`. Removed dead `register_shortcuts`.
+
+Validation:
+
+- New tests: test_bu106 (17), test_bu107 (12), test_bu108 (12), test_bu109
+  (9), test_bu110 (14); updated screenshot assertions in
+  test_context_models / test_context_retriever. Full suite: 440 passed,
+  22 failed - the same 22 pre-existing failures in test_assistant_service /
+  test_openrouter_client as a clean HEAD worktree (confirmed), 14 collection
+  errors from files needing PySide6/audio deps in the system Python.
+- test_bu108 patches the service module object directly: test_openrouter_client
+  purges `src.*` from sys.modules at import, so dotted-name patches hit a
+  fresh module copy when the suites run together.
+- Offscreen smoke tests (.venv, PySide6 6.6): viewer navigation, zoom,
+  description edit (preview refreshed), delete (file + sidecar removed,
+  neighbor selected), empty session, search in both scopes, live refresh,
+  focus-through-search; rendered the window to PNG to check the theme.
+- Real Win32: `RegisterHotKey` succeeds on a native window, and a posted
+  `WM_HOTKEY` reaches `GlobalHotkey.activated` through the native event
+  filter (other ids ignored).
+- Not done (needs the real app): hotkey pressed from another app during a
+  session, Win+Shift+S clipboard import, AI context generation through
+  OpenRouter, and asking the assistant about a screenshot end to end.
+
+Files Changed:
+
+- src/storage/database.py
+- src/screenshots/__init__.py, metadata.py (new), search.py (new),
+  viewer_logic.py (new), hotkeys.py (new), context_generator.py, capture.py
+- src/assistant/context.py, context_models.py, tools.py, service.py,
+  screenshot_contract.py (new)
+- src/app/screenshot_viewer.py (new), global_hotkey.py (new), window.py,
+  pixel_widgets.py, session_manager.py
+- src/config.py
+- tests/test_bu106.py ... test_bu110.py (new), test_context_models.py,
+  test_context_retriever.py
+- docs/build_plan/BU106-BU110.md, index.md, docs/current_state.md
+
+Next:
+
+- none
+
+### BU109/BU110 follow-up - window stacking, full screen on double-click, help
+
+User feedback after the first manual run:
+
+1. The Summary window covered the screenshot viewer and had to be closed to
+   use it. Cause: the Summary opened modal (`exec()`), so it stayed on top and
+   blocked the now non-modal viewer (the same happened when the viewer was
+   opened from the modal All Sessions dialog - it landed behind it). Fix:
+   the Summary is non-modal and one per session (`_summary_windows`), and
+   both windows go through `MainWindow._present_window`: non-modal normally,
+   but made application-modal when another modal dialog is already up, so
+   they always stack on top and accept input.
+2. Double-clicking the image (or a thumbnail, or pressing F / F11) opens the
+   screenshot alone in full screen (`_FullscreenImage`, a child window of the
+   viewer). Esc or another double-click closes it; arrows keep browsing and
+   zoom keys work. The old "whole viewer full screen" toggle was removed.
+3. A "?" button (and F1) opens a help window explaining every button, key
+   and label, in collapsible sections (`viewer_logic.help_sections`; the
+   capture hotkey is read from `SCREENSHOT["global_hotkey"]`). Help text is
+   in English, like the rest of the UI.
+
+Validation:
+
+- Offscreen smoke test: double-click opens full screen, Esc closes it,
+  navigation inside full screen syncs the viewer; help window renders;
+  `_present_window` stays non-modal normally and becomes modal on top of an
+  open modal dialog.
+- New HelpTest in tests/test_bu109.py; full suite 441 passed, same 22
+  pre-existing failures.
+- Not yet checked in the real app: open the viewer, then the Summary, and
+  switch between them.
+
+Files Changed:
+
+- src/app/window.py (`_open_summary_window`, `_present_window`, viewer entry)
+- src/app/screenshot_viewer.py (`_FullscreenImage`, help, double-click)
+- src/screenshots/viewer_logic.py (`help_sections`)
+- tests/test_bu109.py
+
+Next:
+
+- none
+
+### BU110 follow-up - highlight search matches
+
+The viewer's search only made matches bold, which was easy to miss. Matches
+are now bracketed with private-use marker characters
+(`viewer_logic.mark_terms`, `MATCH_START` / `MATCH_END`, replacing
+`emphasize_terms`), which survive HTML escaping; `PixelCollapsibleSection.set_body`
+swaps them for the find bar's highlight chip (`FIND_TERM_ON_BLUE`, cream on
+navy). Sections holding a match are re-expanded and the details panel scrolls
+to the first one. Also fixed two labels: "+ description & summary" rendered
+as "+ description _summary" (a lone "&" is a Qt mnemonic; now "&&"), and the
+"Generate missing" hint button was too narrow.
+
+Validation: tests/test_bu110.py updated (marker output, every occurrence,
+accent-insensitive); offscreen smoke test checks the highlight span in the
+rendered HTML, no leftover markers, and re-expansion of a collapsed section.
+
+Files Changed:
+
+- src/screenshots/viewer_logic.py, src/app/pixel_widgets.py,
+  src/app/screenshot_viewer.py, tests/test_bu110.py
+
+### BU110 follow-up - slide to the match
+
+The details panel used to scroll only to the top of the section holding a
+match, so a hit deep in a long Visible Text list stayed off-screen.
+`ScreenshotViewer._scroll_to_first_match` lays the section's rich text out in
+a `QTextDocument` at the label's width, finds the first fragment with the find
+highlight background (`FIND_TERM_ON_BLUE`, the same cream-on-navy chip the
+Ctrl+F find bar uses) and scrolls so that line sits in the upper third of the
+view. Offscreen check: 40-line list, match on line 35 -> panel scrolls from 0
+to the match, which lands inside the viewport.
+
+Files Changed:
+
+- src/app/screenshot_viewer.py
+
+### BU110 follow-up - long sections clipped; search limited to visible text
+
+- Long section bodies (Visible Text, AI Summary) were cut off in the narrow
+  details panel: e.g. a 30-line list needed 1640 px but got 1176, the rest
+  hidden, so the panel couldn't scroll to it. A word-wrapped QLabel's size
+  hint ignores the width it really gets. `PixelCollapsibleSection` now tracks
+  the label's resize and sets its minimum height to `heightForWidth` at the
+  actual width, measuring with the minimum cleared first - QLabel never reports
+  less than its current minimum, so a value taken at a narrow in-between width
+  would otherwise stick. Shared widget, so the Summary window gets the fix too.
+- Removed the "+ description & summary" chip at the user's request: the search
+  matches visible text only (`match_screenshot` / `filter_screenshots` /
+  `Database.get_searchable_screenshots` lost their `include_context`
+  option), and only the Visible Text section is highlighted, so the panel
+  slides to the real match. Help text updated.
+
+Validation: offscreen repro (30 wrapped lines + long summary) - every section
+label height == needed height, last line visible, panel scrolls; smoke tests
+for viewer / search / scroll-to-match pass; tests/test_bu110.py updated; full
+suite 441 passed, same 22 pre-existing failures.
+
+Files Changed:
+
+- src/app/pixel_widgets.py, src/app/screenshot_viewer.py,
+  src/screenshots/viewer_logic.py, src/storage/database.py, tests/test_bu110.py
+
+### All Sessions - screenshot count on session cards
+
+Each All Sessions card shows how many screenshots the session has: a new
+`PixelShotsChip` (the app's own pixel `icon_camera.svg` + the number, no word)
+before the Transcript / Summary chips. Solid blue with cream digits when there
+are screenshots; dashed and muted (like a pending chip) at 0; tooltip says
+"N screenshots". The count comes from the same single
+`list_sessions_with_flags` query (`screenshot_count` subquery, indexed on
+session_id). To keep the row from looking crowded, card spacing went from 10 to 8 px and
+the status chips' reserved padding from +22 to +18 px; the shots chip reserves two
+digits so the chip columns line up across cards. Rendered at 1095 px and 760 px
+(long names elide first). Full suite unchanged (441 passed, same 22 pre-existing
+failures).
+
+Files Changed:
+
+- src/storage/database.py, src/app/pixel_widgets.py, src/app/window.py
+
+- Follow-up: the camera chip only shows when the session has screenshots (hidden at 0); icon 14 -> 18 px, count 8.5 -> 7.5 pt; fixed two-digit width so it keeps the same size on every card.

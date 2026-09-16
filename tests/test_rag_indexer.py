@@ -52,6 +52,38 @@ class TestChunkText(unittest.TestCase):
         self.assertGreater(len(chunks_no_overlap), 0)
         self.assertGreater(len(chunks_with_overlap), 0)
 
+    def test_chunk_text_covers_the_whole_input(self):
+        """Regression: the old loop's infinite-loop guard
+        (`if start <= chunks[-1]['chunk_index'] * chunk_size: break`) could
+        fire long before the text was exhausted once overlap made `start`
+        advance more slowly than `chunk_index * chunk_size` grew - a 26k-char
+        summary was measured stopping after indexing only ~35% of it, with no
+        error or warning. Every chunk boundary must now reach the end."""
+        words = ["reunion", "proyecto", "decision", "cliente", "entrega",
+                 "presupuesto", "equipo", "revisar"]
+        text = " ".join(words[i % len(words)] for i in range(3000))  # ~26k chars
+
+        chunks = _chunk_text(text)
+
+        self.assertGreater(len(chunks), 1)
+        last_content = chunks[-1]['content']
+        covered_to = text.rfind(last_content) + len(last_content)
+        self.assertGreaterEqual(
+            covered_to, len(text) - 1,  # allow a trailing-whitespace trim
+            f"only indexed {covered_to}/{len(text)} chars of the input",
+        )
+        # No duplicate or out-of-order chunk_index values.
+        self.assertEqual([c['chunk_index'] for c in chunks], list(range(len(chunks))))
+
+    def test_chunk_text_terminates_when_overlap_covers_the_whole_chunk(self):
+        """overlap >= chunk_size must not spin forever or stall (start must
+        always move forward by at least one character)."""
+        text = "x" * 50
+        chunks = _chunk_text(text, chunk_size=10, overlap=10)
+        self.assertGreater(len(chunks), 0)
+        last_content = chunks[-1]['content']
+        self.assertEqual(text.rfind(last_content) + len(last_content), len(text))
+
 
 class TestChunkTranscripts(unittest.TestCase):
     """Tests for the time-windowed transcript chunker."""

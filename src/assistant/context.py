@@ -11,6 +11,7 @@ from .context_models import (
     ConversationTurn,
 )
 from .rag_models import RetrievedChunk, SourceType
+from ..screenshots.search import search_session_screenshots
 
 
 class DatabaseProtocol(Protocol):
@@ -93,9 +94,9 @@ class AssistantContextRetriever:
             session_id, session_name, question
         )
 
-        # Get screenshots near relevant transcript timestamps
-        screenshots = self._get_screenshots_near_transcripts(
-            session_id, session_name, transcripts
+        # Screenshot index, with full details for the relevant ones
+        screenshots = self._get_screenshots(
+            session_id, session_name, question, transcripts
         )
 
         # Get conversation history
@@ -326,55 +327,46 @@ class AssistantContextRetriever:
         keywords = [w for w in words if len(w) > 3 and w not in stop_words]
         return keywords
 
-    def _get_screenshots_near_transcripts(
+    def _get_screenshots(
         self,
         session_id: int,
         session_name: str,
+        question: str,
         transcripts: List[TranscriptExcerpt],
     ) -> List[ScreenshotReference]:
-        """Get screenshots near relevant transcript timestamps.
+        """Screenshot index for the session, with full details for the few
+        relevant ones (BU107 two-tier search).
 
-        Args:
-            session_id: ID of the session.
-            session_name: Name of the session for context.
-            transcripts: List of relevant transcript excerpts.
-
-        Returns:
-            List of ScreenshotReference objects near transcript times.
+        The transcripts retrieved for the question anchor the search in time:
+        a screenshot taken while the relevant topic was discussed ranks higher.
         """
         try:
-            screenshot_rows = self._db.get_screenshots(session_id)
+            hits = search_session_screenshots(
+                self._db,
+                session_id,
+                question,
+                anchor_timestamps=[t.timestamp for t in transcripts],
+            )
         except Exception:
             return []
 
-        if not transcripts or not screenshot_rows:
-            return []
-
-        # Get transcript timestamps
-        transcript_times = {t.timestamp for t in transcripts}
-
-        # Find screenshots within 60 seconds of any transcript timestamp
-        nearby_screenshots = []
-        time_window = 60  # seconds
-
-        for row in screenshot_rows:
-            screenshot_time = row.get("timestamp", 0)
-
-            # Check if screenshot is near any transcript timestamp
-            for trans_time in transcript_times:
-                if abs(screenshot_time - trans_time) <= time_window:
-                    nearby_screenshots.append(
-                        ScreenshotReference(
-                            session_id=session_id,
-                            session_name=session_name,
-                            timestamp=screenshot_time,
-                            filepath=row.get("filepath", ""),
-                            description=row.get("description"),
-                        )
-                    )
-                    break  # Only include each screenshot once
-
-        return nearby_screenshots
+        references = []
+        for hit in hits:
+            details = hit.details or {}
+            references.append(ScreenshotReference(
+                session_id=session_id,
+                session_name=session_name,
+                timestamp=hit.timestamp,
+                filepath=hit.filepath,
+                description=hit.description or None,
+                screenshot_id=hit.screenshot_id,
+                preview=hit.preview,
+                tier=hit.tier,
+                ai_summary=details.get("ai_summary", ""),
+                visible_text=list(details.get("visible_text", [])),
+                keywords=list(details.get("keywords", [])),
+            ))
+        return references
 
     def _get_conversation_history(
         self,

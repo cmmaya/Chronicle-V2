@@ -123,14 +123,14 @@ class TestAssistantContextRetriever(unittest.TestCase):
         # Since 1000 > 500, it gets truncated to 500 + 3 = 503
         self.assertLessEqual(len(context.transcripts[0].text), MAX_TRANSCRIPT_LENGTH + 3)
 
-    def test_screenshots_near_transcripts(self):
-        """Test screenshots near relevant transcript timestamps."""
+    def test_screenshot_index_lists_every_screenshot(self):
+        """BU108: every screenshot is indexed by id, in capture order."""
         db = MockDatabase(
             transcripts={1: [{"timestamp": 1000, "source": "microphone", "text": "test"}]},
             screenshots={
                 1: [
-                    {"timestamp": 1010, "filepath": "/screen1.png"},  # Within 60s
-                    {"timestamp": 5000, "filepath": "/screen2.png"},  # Not within 60s
+                    {"id": 1, "timestamp": 1010, "filepath": "/screen1.png"},
+                    {"id": 2, "timestamp": 5000, "filepath": "/screen2.png"},
                 ]
             },
         )
@@ -138,22 +138,44 @@ class TestAssistantContextRetriever(unittest.TestCase):
 
         context = retriever.build_session_context(1, "test")
 
-        # Should include screenshot near transcript (within 60s)
-        self.assertEqual(len(context.screenshots), 1)
+        self.assertEqual([s.screenshot_id for s in context.screenshots], [1, 2])
         self.assertEqual(context.screenshots[0].filepath, "/screen1.png")
+        self.assertTrue(all(s.tier == "preview" for s in context.screenshots))
 
-    def test_no_transcripts_means_no_screenshot_filtering(self):
-        """Test that no transcripts means no nearby screenshots."""
+    def test_relevant_screenshot_gets_full_details(self):
+        """BU108: a screenshot matching the question carries its AI metadata."""
+        db = MockDatabase(
+            screenshots={
+                1: [
+                    {"id": 1, "timestamp": 1000, "filepath": "/a.png",
+                     "preview_description": "Invoice table for March",
+                     "ai_summary": "March invoices total 12k",
+                     "visible_text": '["Total: 12,000"]', "keywords": '["invoice"]'},
+                    {"id": 2, "timestamp": 2000, "filepath": "/b.png",
+                     "preview_description": "Team photo"},
+                ]
+            },
+        )
+        retriever = AssistantContextRetriever(db)
+
+        context = retriever.build_session_context(1, "what was the invoice total?")
+
+        first = context.screenshots[0]
+        self.assertEqual((first.screenshot_id, first.tier), (1, "full"))
+        self.assertEqual(first.visible_text, ["Total: 12,000"])
+        self.assertEqual(context.screenshots[1].tier, "preview")
+
+    def test_screenshots_listed_without_transcripts(self):
+        """Screenshots are indexed even when no transcript matched."""
         db = MockDatabase(
             transcripts={1: []},
-            screenshots={1: [{"timestamp": 1000, "filepath": "/screen1.png"}]},
+            screenshots={1: [{"id": 5, "timestamp": 1000, "filepath": "/screen1.png"}]},
         )
         retriever = AssistantContextRetriever(db)
 
         context = retriever.build_session_context(1, "test")
 
-        # No screenshots without transcripts to match against
-        self.assertEqual(len(context.screenshots), 0)
+        self.assertEqual([s.screenshot_id for s in context.screenshots], [5])
 
     def test_session_not_found_uses_default_name(self):
         """Test that missing session uses default name."""

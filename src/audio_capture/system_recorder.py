@@ -305,6 +305,16 @@ class SystemAudioRecorder:
         with self._buffer_lock:
             self._data_buffer = []
 
+    def drain_buffer(self) -> list:
+        """Take everything captured so far and empty the buffer, atomically.
+
+        Reading with get_audio_data() and then calling clear_buffer() lost
+        any block the capture thread appended in between.
+        """
+        with self._buffer_lock:
+            data, self._data_buffer = self._data_buffer, []
+        return data
+
     def seconds_since_last_data(self) -> float:
         """Seconds since the loopback stream last delivered frames.
 

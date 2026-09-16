@@ -2,8 +2,10 @@
 
 import threading
 import time
+from collections import deque
+from fractions import Fraction
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Callable, Tuple
 import logging
 import numpy as np
@@ -32,30 +34,98 @@ except Exception:  # pragma: no cover - config should always import
 logger = logging.getLogger(__name__)
 
 
+class _StreamResampler:
+    """Stateful mono float32 resampler (FFmpeg's swresample through PyAV).
+
+    Fed the capture stream block by block, so no filter edge lands on a chunk
+    boundary. One instance per recording run; ``flush()`` ends it.
+    """
+
+    _av = None
+
+    @classmethod
+    def available(cls) -> bool:
+        if cls._av is None:
+            try:
+                import av
+                cls._av = av
+            except Exception:  # noqa: BLE001 - PyAV is optional
+                cls._av = False
+        return bool(cls._av)
+
+    def __init__(self, in_rate: int, out_rate: int):
+        if not self.available():
+            raise RuntimeError("PyAV is not installed")
+        self._in_rate = in_rate
+        self._resampler = self._av.AudioResampler(format='flt', layout='mono', rate=out_rate)
+        self._pts = 0
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        if not len(samples):
+            return np.zeros(0, dtype=np.float32)
+        frame = self._av.AudioFrame.from_ndarray(
+            np.ascontiguousarray(samples, dtype=np.float32).reshape(1, -1),
+            format='flt', layout='mono',
+        )
+        frame.sample_rate = self._in_rate
+        frame.pts = self._pts
+        frame.time_base = Fraction(1, self._in_rate)
+        self._pts += len(samples)
+        return self._collect(self._resampler.resample(frame))
+
+    def flush(self) -> np.ndarray:
+        return self._collect(self._resampler.resample(None))
+
+    @staticmethod
+    def _collect(frames) -> np.ndarray:
+        parts = [f.to_ndarray().reshape(-1) for f in frames]
+        if not parts:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(parts).astype(np.float32, copy=False)
+
+
+def _storage_rate(capture_rate: int) -> int:
+    """Rate chunks are stored at: AUDIO_CAPTURE['storage_sample_rate'] when
+    it is lower than the device rate and PyAV can resample, else the device rate."""
+    target = _AUDIO_CAPTURE.get("storage_sample_rate", 16000)
+    if not target or target >= capture_rate:
+        return capture_rate
+    if not _StreamResampler.available():
+        logger.warning("PyAV not installed - storing audio at the device rate (%s Hz)", capture_rate)
+        return capture_rate
+    return int(target)
+
+
 class ChunkedAudioRecorder:
     """Audio recorder that saves audio in fixed-duration chunks.
     
     This recorder captures audio continuously but saves it in discrete
-    chunks of a specified duration (default 10 seconds), along with
+    chunks of a specified duration (default 5 seconds), along with
     metadata for each chunk. Supports overlapping chunks to prevent
     word loss at chunk boundaries.
-    
+
     Attributes:
         CHUNK_DURATION: Default duration of each chunk in seconds.
         OVERLAP_DURATION: Default overlap between consecutive chunks.
     """
-    
-    CHUNK_DURATION = 10  # seconds
-    OVERLAP_DURATION = 1  # seconds
+
+    CHUNK_DURATION = 5  # seconds - balances live-bubble update speed against
+    # transcription quality (2s chunks gave the model too little audio per call)
+    OVERLAP_DURATION = 1.0  # seconds - a boundary word needs to sit fully
+    # inside the overlap window (with real audio context on both sides) for
+    # Parakeet to transcribe it cleanly; too little overlap here is what let
+    # words get hallucinated/invented or dropped right at chunk edges. Paired
+    # with LiveTranscriber._deduplicate's fuzzy matching (src/transcription/
+    # live.py) so the resulting duplicated text still gets stripped.
     VAD_SAMPLE_RATE = 16000  # Required by WebRTC VAD
     VAD_FRAME_DURATION = 30  # ms (10, 20, or 30 supported)
-    
+
     def __init__(
         self,
         session_path: str = '/tmp/sessions/session_001',
         source: str = 'mic',
-        chunk_duration: int = 10,
-        overlap_duration: int = 1,
+        chunk_duration: int = CHUNK_DURATION,
+        overlap_duration: float = OVERLAP_DURATION,
         callback: Optional[Callable[[AudioChunk], None]] = None,
         vad_aggressiveness: int = 2,  # 0-3, higher = more aggressive filtering
         vad_threshold: float = 0.30,  # Minimum speech ratio to save chunk
@@ -101,17 +171,22 @@ class ChunkedAudioRecorder:
             )
             # Expose needed attributes from system recorder
             self._recorder = self._system_recorder
-            self.sample_rate = self._system_recorder.sample_rate
-            self.channels = 1  # Force mono recording
+            self.capture_rate = self._system_recorder.sample_rate
+            self._capture_channels = 1  # Force mono recording
         else:
             # Use AudioRecorder for microphone
             self._recorder = AudioRecorder(
                 session_path=str(session_path),
                 source=source
             )
-            self.sample_rate = self._recorder.sample_rate
-            self.channels = self._recorder.channels
+            self.capture_rate = self._recorder.sample_rate
+            self._capture_channels = self._recorder.channels
             self._system_recorder = None
+
+        # Chunks are mono, at the storage rate (16 kHz when PyAV can resample:
+        # what Parakeet uses, and a third of the disk space of 48 kHz).
+        self.sample_rate = _storage_rate(self.capture_rate)
+        self.channels = 1
 
         # Track recorded chunks
         self.chunks: List[AudioChunk] = []
@@ -123,6 +198,15 @@ class ChunkedAudioRecorder:
         self._started_at: float = 0.0
         self._last_chunk_time: float = 0.0
         self._restart_count: int = 0
+
+        # Per-run stream state (see _reset_stream_state)
+        self._raw: deque = deque()
+        self._overflows = 0
+        self._resampler: Optional[_StreamResampler] = None
+        self._pending: List[np.ndarray] = []
+        self._pending_len = 0
+        self._pending_start: Optional[datetime] = None
+        self._first_window = True
 
         # Overlap configuration
         self._overlap_samples = int(self.overlap_duration * self.sample_rate)
@@ -183,120 +267,49 @@ class ChunkedAudioRecorder:
         speech_ratio = speech_frames / num_frames if num_frames > 0 else 0
         has_speech = speech_ratio >= self.vad_threshold
         
-        logger.warning(f"VAD check: {speech_frames}/{num_frames} frames ({speech_ratio:.1%}) - {'speech detected' if has_speech else 'silent'}")
+        logger.debug(f"VAD check: {speech_frames}/{num_frames} frames ({speech_ratio:.1%}) - {'speech detected' if has_speech else 'silent'}")
         
         return has_speech
     
-    def _save_chunk(self, frames: List, start_time: datetime) -> Optional[AudioChunk]:
-        """Save audio frames as a chunk file with metadata.
-        
-        Args:
-            frames: List of audio frames to save.
-            start_time: Start time of the chunk.
-            
-        Returns:
-            AudioChunk with metadata, or None if no speech detected.
-        """
-        # Convert frames to audio data
-        if not frames:
-            logger.warning("No frames for chunk")
-            return None
-        
-        audio_data = np.concatenate(frames, axis=0)
-        
-        # Run VAD check - skip if no speech detected
-        if not self._check_vad(audio_data):
-            logger.debug("Skipping silent chunk")
-            return None
-        
-        # Calculate end time
-        timestamp_start = start_time
-        timestamp_end = datetime.now()
-        
-        # Generate chunk ID and filename
-        chunk_id = generate_chunk_id(self.source, timestamp_start)
-        filename = generate_filename(timestamp_start, timestamp_end)
-        file_path = self.audio_path / filename
-        
-        # Convert frames to audio data
-        if frames:
-            audio_data = np.concatenate(frames, axis=0)
-            # Convert float32 to int16
-            int16_data = (audio_data * 32767).astype(np.int16)
-            bytes_data = int16_data.tobytes()
-        else:
-            logger.warning(f"No frames for chunk {chunk_id}")
-            bytes_data = b''
-        
-        # Save audio file
-        with wave.open(str(file_path), 'wb') as wf:
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(bytes_data)
-        
-        # Create metadata
-        chunk = AudioChunk(
-            source=self.source,
-            chunk_id=chunk_id,
-            timestamp_start=timestamp_start.isoformat(),
-            timestamp_end=timestamp_end.isoformat(),
-            file_path=str(file_path)
-        )
-        
-        # Save metadata file
-        chunk.save_metadata()
-        self._last_chunk_time = time.time()
-
-        logger.info(f"Saved chunk: {chunk_id} ({chunk.duration:.2f}s)")
-        
-        # Call live transcription callback if provided
-        if self.live_transcription_callback:
-            print(f"[DEBUG] Live transcription callback triggered for chunk: {chunk.chunk_id} (source: {self.source})")
-            try:
-                self.live_transcription_callback(chunk)
-            except Exception as e:
-                logger.error(f"Error in live_transcription_callback: {e}")
-        
-        return chunk
-
-    def _save_chunk_from_array(self, audio_data: np.ndarray, start_time: datetime) -> Optional[AudioChunk]:
+    def _save_chunk_from_array(self, audio_data: np.ndarray, start_time: datetime,
+                               end_time: Optional[datetime] = None) -> Optional[AudioChunk]:
         """Save numpy audio array as a chunk file with metadata.
-        
+
         Args:
-            audio_data: Numpy array of audio data.
+            audio_data: Mono float32 audio at ``self.sample_rate``.
             start_time: Start time of the chunk.
-            
+            end_time: End time of the chunk (defaults to now).
+
         Returns:
             AudioChunk with metadata, or None if no speech detected.
         """
         if len(audio_data) == 0:
             logger.warning("Empty audio data for chunk")
             return None
-        
+
         # Run VAD check - skip if no speech detected
         if not self._check_vad(audio_data):
             logger.debug("Skipping silent chunk")
             return None
-        
+
         timestamp_start = start_time
-        timestamp_end = datetime.now()
-        
+        timestamp_end = end_time or datetime.now()
+
         chunk_id = generate_chunk_id(self.source, timestamp_start)
         filename = generate_filename(timestamp_start, timestamp_end)
         file_path = self.audio_path / filename
-        
+
         # Convert float32 to int16
-        int16_data = (audio_data * 32767).astype(np.int16)
+        int16_data = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
         bytes_data = int16_data.tobytes()
-        
+
         # Save audio file
         with wave.open(str(file_path), 'wb') as wf:
             wf.setnchannels(self.channels)
             wf.setsampwidth(2)
             wf.setframerate(self.sample_rate)
             wf.writeframes(bytes_data)
-        
+
         chunk = AudioChunk(
             source=self.source,
             chunk_id=chunk_id,
@@ -304,188 +317,198 @@ class ChunkedAudioRecorder:
             timestamp_end=timestamp_end.isoformat(),
             file_path=str(file_path)
         )
-        
+
         chunk.save_metadata()
         self._last_chunk_time = time.time()
 
         logger.info(f"Saved chunk: {chunk_id} ({chunk.duration:.2f}s)")
-        
-        # Call live transcription callback if provided
+
+        # Hand the chunk to live transcription. The callback only queues it
+        # (see SessionManager.handle_live_transcription) and returns at once.
         if self.live_transcription_callback:
-            print(f"[DEBUG] Live transcription callback triggered for chunk: {chunk.chunk_id} (source: {self.source})")
             try:
                 self.live_transcription_callback(chunk)
             except Exception as e:
                 logger.error(f"Error in live_transcription_callback: {e}")
-        
+
         return chunk
-    
+
+    # -- stream -> chunks ------------------------------------------------------
+    #
+    # Capture delivers audio in small blocks. _feed() downmixes and resamples
+    # them into self._pending, and _emit_ready_chunks() cuts CHUNK_DURATION
+    # windows from its front, advancing by (chunk - overlap) each time, so
+    # consecutive chunks share OVERLAP_DURATION seconds and no audio is ever
+    # skipped - however late a block arrives. Timestamps come from the sample
+    # count, not from when a block happened to be processed.
+
+    def _reset_stream_state(self) -> None:
+        """Fresh state for one recording run (start or restart)."""
+        self._raw = deque()
+        self._overflows = 0
+        self._pending = []
+        self._pending_len = 0
+        self._pending_start = None
+        self._first_window = True
+        self._resampler = None
+        if self.sample_rate != self.capture_rate:
+            try:
+                self._resampler = _StreamResampler(self.capture_rate, self.sample_rate)
+            except Exception as e:
+                # Can't resample after all: store at the device rate.
+                logger.error(f"Resampler unavailable ({e}); storing {self.source} audio at {self.capture_rate} Hz")
+                self._set_sample_rate(self.capture_rate)
+
+    def _set_sample_rate(self, rate: int) -> None:
+        self.sample_rate = rate
+        self._overlap_samples = int(self.overlap_duration * rate)
+        self._samples_per_chunk = int(self.chunk_duration * rate)
+        self._samples_per_save = self._samples_per_chunk - self._overlap_samples
+
+    @staticmethod
+    def _to_mono(block: np.ndarray) -> np.ndarray:
+        block = np.asarray(block, dtype=np.float32)
+        if block.ndim > 1:
+            block = block[:, 0] if block.shape[1] == 1 else block.mean(axis=1)
+        return block
+
+    def _feed(self, blocks: List[np.ndarray]) -> None:
+        """Append captured blocks to the pending stream and emit full chunks."""
+        if not blocks:
+            return
+        audio = np.concatenate([self._to_mono(b) for b in blocks])
+        if self._resampler is not None:
+            audio = self._resampler.process(audio)
+        if not len(audio):
+            return
+        if self._pending_start is None:
+            # Wall time of the first pending sample.
+            self._pending_start = datetime.now() - timedelta(seconds=len(audio) / self.sample_rate)
+        self._pending.append(audio)
+        self._pending_len += len(audio)
+        self._emit_ready_chunks()
+
+    def _pending_audio(self) -> np.ndarray:
+        if len(self._pending) != 1:
+            self._pending = [np.concatenate(self._pending)] if self._pending else []
+        return self._pending[0] if self._pending else np.zeros(0, dtype=np.float32)
+
+    def _emit_ready_chunks(self) -> None:
+        while self._pending_len >= self._samples_per_chunk:
+            audio = self._pending_audio()
+            self._save_window(audio[:self._samples_per_chunk], self._pending_start)
+            rest = audio[self._samples_per_save:]
+            self._pending = [rest]
+            self._pending_len = len(rest)
+            self._pending_start += timedelta(seconds=self._samples_per_save / self.sample_rate)
+            self._first_window = False
+
+    def _save_window(self, audio: np.ndarray, window_start: datetime) -> None:
+        """Save one window of the stream as a chunk.
+
+        The chunk's start timestamp is where its *new* audio begins - after
+        the overlap it shares with the previous window - which is what its
+        (deduplicated) transcript covers.
+        """
+        lead = 0.0 if self._first_window else self.overlap_duration
+        chunk_start = window_start + timedelta(seconds=lead)
+        chunk_end = window_start + timedelta(seconds=len(audio) / self.sample_rate)
+        try:
+            chunk = self._save_chunk_from_array(audio, chunk_start, chunk_end)
+        except Exception as e:
+            logger.error(f"Failed to save {self.source} chunk: {e}")
+            return
+        if chunk is not None:
+            self.chunks.append(chunk)
+            if self.callback:
+                self.callback(chunk)
+
+    def _flush_final(self) -> None:
+        """Save what is left of the stream when a run ends."""
+        if self._resampler is not None:
+            try:
+                tail = self._resampler.flush()
+            except Exception:
+                tail = np.zeros(0, dtype=np.float32)
+            if len(tail) and self._pending_start is not None:
+                self._pending.append(tail)
+                self._pending_len += len(tail)
+        if self._pending_start is None or not self._pending_len:
+            return
+        new_samples = self._pending_len - (0 if self._first_window else self._overlap_samples)
+        if new_samples >= int(0.5 * self.sample_rate):
+            self._save_window(self._pending_audio(), self._pending_start)
+        self._pending = []
+        self._pending_len = 0
+
+    def _drain_raw(self) -> None:
+        blocks = []
+        while self._raw:
+            blocks.append(self._raw.popleft())
+        try:
+            self._feed(blocks)
+        except Exception as e:
+            logger.error(f"Error processing {self.source} audio: {e}")
+
     def _recording_loop(self) -> None:
-        """Main recording loop that saves chunks with overlapping."""
+        """Microphone recording loop."""
         import sounddevice as sd
-        
-        # Use a continuous buffer approach for overlapping chunks
-        all_frames = []
-        chunk_start_time = None
-        
+
+        self._reset_stream_state()
+        raw = self._raw
+
         def callback(indata, frames, time_info, status):
-            nonlocal all_frames, chunk_start_time
-            
-            if not self._is_running:
-                return
-            
-            if chunk_start_time is None:
-                chunk_start_time = datetime.now()
-            
-            # Append audio data to buffer
-            all_frames.append(indata.copy())
-            
-            # Calculate total samples
-            total_samples = sum(len(f) for f in all_frames)
-            
-            # Check if we have enough new samples to save a chunk
-            # Save every (chunk_duration - overlap_duration) seconds of NEW audio
-            if total_samples >= self._samples_per_save and total_samples >= self._samples_per_chunk:
-                # Get the last chunk_duration seconds (includes overlap from previous)
-                audio_data = np.concatenate(all_frames, axis=0)
-                chunk_data = audio_data[-self._samples_per_chunk:]
-                
-                # Save the chunk
-                chunk = self._save_chunk_from_array(chunk_data, chunk_start_time)
-                if chunk is not None:
-                    self.chunks.append(chunk)
-                    if self.callback:
-                        self.callback(chunk)
-                
-                # Keep only the overlap for the next chunk
-                if total_samples > self._overlap_samples:
-                    audio_data = np.concatenate(all_frames, axis=0)
-                    overlap_data = audio_data[-self._overlap_samples:]
-                    
-                    # Split back into frames (sounddevice typically gives ~1024 frames per callback)
-                    all_frames = []
-                    frame_size = 1024
-                    pos = 0
-                    while pos < len(overlap_data):
-                        chunk_size = min(frame_size, len(overlap_data) - pos)
-                        all_frames.append(overlap_data[pos:pos + chunk_size])
-                        pos += chunk_size
-                else:
-                    all_frames = []
-                
-                # Update chunk start time for next chunk
-                chunk_start_time = datetime.now()
-        
+            # PortAudio's own thread: copy the block and return. Anything slow
+            # here (VAD, file writes, transcription) makes the device drop audio.
+            if status:
+                self._overflows += 1
+            raw.append(indata.copy())
+
         # Create stream using instance attributes
         self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
+            samplerate=self.capture_rate,
+            channels=self._capture_channels,
             device=self._recorder.device_index,
             dtype='float32',
             callback=callback
         )
         self._stream.start()
-        
-        # Run until stopped
-        while not self._stop_event.is_set():
-            time.sleep(0.1)
-        
-        # Stop stream
-        self._stream.stop()
-        self._stream.close()
-        
-        # Save remaining frames as final chunk
-        if all_frames and chunk_start_time:
-            audio_data = np.concatenate(all_frames, axis=0)
-            if len(audio_data) > 0:
-                chunk = self._save_chunk_from_array(audio_data, chunk_start_time)
-                if chunk is not None:
-                    self.chunks.append(chunk)
-                    if self.callback:
-                        self.callback(chunk)
-    
+        try:
+            # Run until stopped
+            while not self._stop_event.wait(0.1):
+                self._drain_raw()
+        finally:
+            self._stream.stop()
+            self._stream.close()
+            self._drain_raw()
+            self._flush_final()
+            if self._overflows:
+                logger.warning(f"Microphone input overflowed {self._overflows} times this run")
+
     def _system_recording_loop(self) -> None:
-        """Recording loop for system audio with overlapping chunks."""
+        """Recording loop for system audio (loopback)."""
         if self._system_recorder is None:
             logger.error("System recorder not initialized")
             return
-        
-        # Use the same buffer approach as _recording_loop
-        all_frames = []
-        chunk_start_time = None
-        
-        # Start the system recorder
+
+        self._reset_stream_state()
         self._system_recorder.start()
-        poll_interval = 0.5  # Poll every 500ms for new data
-        
-        while not self._stop_event.is_set():
-            time.sleep(poll_interval)
-            
-            if not self._is_running:
-                break
-            
-            # Get accumulated audio data
-            audio_data_list = self._system_recorder.get_audio_data()
-            
-            if audio_data_list:
-                if chunk_start_time is None:
-                    chunk_start_time = datetime.now()
-                
-                # Add all new data to buffer
-                for data in audio_data_list:
-                    all_frames.append(data)
-                
-                # Clear the buffer after reading
-                self._system_recorder.clear_buffer()
-                
-                # Calculate total samples
-                total_samples = sum(len(f) for f in all_frames)
-                
-                # Check if we have enough for a chunk with overlap
-                if total_samples >= self._samples_per_save and total_samples >= self._samples_per_chunk:
-                    # Get the last chunk_duration seconds
-                    audio_data = np.concatenate(all_frames, axis=0)
-                    chunk_data = audio_data[-self._samples_per_chunk:]
-                    
-                    # Save the chunk
-                    chunk = self._save_chunk_from_array(chunk_data, chunk_start_time)
-                    if chunk is not None:
-                        self.chunks.append(chunk)
-                        if self.callback:
-                            self.callback(chunk)
-                    
-                    # Keep only the overlap for next chunk
-                    if total_samples > self._overlap_samples:
-                        audio_data = np.concatenate(all_frames, axis=0)
-                        overlap_data = audio_data[-self._overlap_samples:]
-                        
-                        # Split back into frames
-                        all_frames = []
-                        frame_size = 1024
-                        pos = 0
-                        while pos < len(overlap_data):
-                            chunk_size = min(frame_size, len(overlap_data) - pos)
-                            all_frames.append(overlap_data[pos:pos + chunk_size])
-                            pos += chunk_size
-                    else:
-                        all_frames = []
-                    
-                    # Update chunk start time
-                    chunk_start_time = datetime.now()
-        
-        # Stop the system recorder
-        self._system_recorder.stop()
-        
-        # Save remaining frames as final chunk
-        if all_frames and chunk_start_time:
-            audio_data = np.concatenate(all_frames, axis=0)
-            if len(audio_data) > 0:
-                chunk = self._save_chunk_from_array(audio_data, chunk_start_time)
-                if chunk is not None:
-                    self.chunks.append(chunk)
-                    if self.callback:
-                        self.callback(chunk)
-    
+        try:
+            while not self._stop_event.wait(0.25):
+                if not self._is_running:
+                    break
+                try:
+                    self._feed(self._system_recorder.drain_buffer())
+                except Exception as e:
+                    logger.error(f"Error processing system audio: {e}")
+        finally:
+            self._system_recorder.stop()
+            try:
+                self._feed(self._system_recorder.drain_buffer())
+            except Exception as e:
+                logger.error(f"Error processing system audio: {e}")
+            self._flush_final()
+
     def start(self) -> None:
         """Start chunked recording."""
         if self._is_running:
@@ -660,8 +683,8 @@ class DualSourceChunkedRecorder:
     def __init__(
         self,
         session_path: str = '/tmp/sessions/session_001',
-        chunk_duration: int = 10,
-        overlap_duration: int = 1,
+        chunk_duration: int = ChunkedAudioRecorder.CHUNK_DURATION,
+        overlap_duration: float = ChunkedAudioRecorder.OVERLAP_DURATION,
         callback: Optional[Callable[[str, AudioChunk], None]] = None,
         vad_aggressiveness: int = 2,
         vad_threshold: float = 0.30,
@@ -866,8 +889,8 @@ class DualSourceChunkedRecorder:
 def create_chunked_recorder(
     session_path: str,
     source: str = 'mic',
-    chunk_duration: int = 10,
-    overlap_duration: int = 1,
+    chunk_duration: int = ChunkedAudioRecorder.CHUNK_DURATION,
+    overlap_duration: float = ChunkedAudioRecorder.OVERLAP_DURATION,
     live_transcription_callback: Optional[Callable[[AudioChunk], None]] = None
 ) -> ChunkedAudioRecorder:
     """Factory function to create a chunked audio recorder.
@@ -893,8 +916,8 @@ def create_chunked_recorder(
 
 def create_dual_source_recorder(
     session_path: str,
-    chunk_duration: int = 10,
-    overlap_duration: int = 1,
+    chunk_duration: int = ChunkedAudioRecorder.CHUNK_DURATION,
+    overlap_duration: float = ChunkedAudioRecorder.OVERLAP_DURATION,
     live_transcription_callback: Optional[Callable[[str, AudioChunk], None]] = None,
     on_status: Optional[Callable[[str, str, bool], None]] = None
 ) -> DualSourceChunkedRecorder:

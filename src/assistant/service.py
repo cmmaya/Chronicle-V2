@@ -1,13 +1,15 @@
 """Assistant answer service - coordinates session resolution, context retrieval, and answering."""
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass, fields
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .context_models import ScreenshotReference, render_screenshot_section
 from .openrouter_client import OpenRouterClient
 from .rag_context_builder import build_any_session_context, build_routed_session_context
 from .response_contract import RESPONSE_CONTRACT, parse_answer
 from .scope_offer import ScopeOffer, build_scope_offer
+from .screenshot_contract import SCREENSHOT_CONTRACT, parse_screenshot_refs
 from ..rag.router import route_sessions
 from .session_resolver import (
     AssistantSessionResolver,
@@ -52,8 +54,12 @@ class AnswerResponse:
     # Single dominant session to offer a direct scope switch for (BU092);
     # None whenever the field is ambiguous, so candidate_sessions still applies.
     scope_offer: Optional[ScopeOffer] = None
+    # Screenshot ids the Specific Session answer points the user to (BU108).
+    screenshot_refs: List[int] = None
 
     def __post_init__(self):
+        if self.screenshot_refs is None:
+            self.screenshot_refs = []
         if self.candidates is None:
             self.candidates = []
         if self.routed_sessions is None:
@@ -90,6 +96,9 @@ class AssistantAnswerService:
         self._agents = ASSISTANT_AGENTS.get("agents", {})
         # Populated by _get_all_sessions_context; surfaced on AnswerResponse.
         self._last_routed_sessions: List[Dict[str, Any]] = []
+        # Screenshot ids placed in the last Specific Session context (BU108);
+        # the only ids an answer may cite.
+        self._last_screenshot_ids: Set[int] = set()
         # Scope offers the user declined, per conversation (BU092). In-memory
         # only - not persisted, and cleared with the process.
         self._declined_offers: Dict[Optional[int], Set[int]] = {}
@@ -123,6 +132,7 @@ class AssistantAnswerService:
         # Reset per-request router state so a stale list never leaks into a
         # non-Any-Session response.
         self._last_routed_sessions = []
+        self._last_screenshot_ids = set()
 
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
@@ -187,28 +197,16 @@ class AssistantAnswerService:
         needs_session_context = self._needs_session_context(agent_id, question, resolution.scope)
 
         # Step 5: Retrieve context based on scope
-        context_text = ""
+        background, context_text = self._retrieve_context(
+            needs_session_context, resolution, question, conversation_id
+        )
         session_ids = resolution.session_ids
         is_any_session = resolution.scope == ScopeResolution.ALL_SESSIONS
 
-        if needs_session_context:
-            if is_any_session:
-                # Cross-session: use search tools
-                context_text = self._get_all_sessions_context(question)
-            else:
-                # Single session: use bounded context
-                if session_ids:
-                    context_text = self._get_single_session_context(
-                        session_ids[0], question, conversation_id
-                    )
-        else:
-            # For research_helper with general knowledge questions, use minimal context
-            # Just include conversation history, no session data needed
-            context_text = ""
-
         # Step 6: Build messages for OpenRouter
         messages = self._build_messages(
-            agent, context_text, question, conversation_id, is_any_session
+            agent, context_text, question, conversation_id, is_any_session,
+            background=background,
         )
 
         # Step 6: Call OpenRouter API
@@ -260,6 +258,7 @@ class AssistantAnswerService:
         # Reset per-request router state so a stale list never leaks into a
         # non-Any-Session response.
         self._last_routed_sessions = []
+        self._last_screenshot_ids = set()
 
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
@@ -324,28 +323,16 @@ class AssistantAnswerService:
         needs_session_context = self._needs_session_context(agent_id, question, resolution.scope)
 
         # Step 5: Retrieve context based on scope
-        context_text = ""
+        background, context_text = self._retrieve_context(
+            needs_session_context, resolution, question, conversation_id
+        )
         session_ids = resolution.session_ids
         is_any_session = resolution.scope == ScopeResolution.ALL_SESSIONS
 
-        if needs_session_context:
-            if is_any_session:
-                # Cross-session: use search tools
-                context_text = self._get_all_sessions_context(question)
-            else:
-                # Single session: use bounded context
-                if session_ids:
-                    context_text = self._get_single_session_context(
-                        session_ids[0], question, conversation_id
-                    )
-        else:
-            # For research_helper with general knowledge questions, use minimal context
-            # Just include conversation history, no session data needed
-            context_text = ""
-
         # Step 6: Build messages for OpenRouter
         messages = self._build_messages(
-            agent, context_text, question, conversation_id, is_any_session
+            agent, context_text, question, conversation_id, is_any_session,
+            background=background,
         )
 
         # Step 6: Call OpenRouter API
@@ -382,7 +369,15 @@ class AssistantAnswerService:
         intent = evidence = None
         candidate_sessions: List[Dict[str, Any]] = []
         scope_offer: Optional[ScopeOffer] = None
+        screenshot_refs: List[int] = []
         answer = raw_answer
+
+        if not is_any_session and self._last_screenshot_ids:
+            # BU108: validate the screenshot pointer line before persisting, so
+            # a hallucinated id never reaches the chat or the history.
+            answer, screenshot_refs = parse_screenshot_refs(
+                raw_answer, self._last_screenshot_ids
+            )
 
         if is_any_session:
             parsed = parse_answer(raw_answer)
@@ -427,6 +422,7 @@ class AssistantAnswerService:
             scope_used="any_session" if is_any_session else "current_session",
             candidate_sessions=candidate_sessions,
             scope_offer=scope_offer,
+            screenshot_refs=screenshot_refs,
         )
 
     def decline_scope_offer(
@@ -485,21 +481,56 @@ class AssistantAnswerService:
         # But still include any available context from conversation history
         return False
 
+    def _retrieve_context(
+        self,
+        needs_session_context: bool,
+        resolution: ResolutionResult,
+        question: str,
+        conversation_id: Optional[int],
+    ) -> Tuple[str, str]:
+        """Return ``(background, evidence)`` prompt text for the question.
+
+        ``background`` is the part that stays the same for every question in
+        a Specific Session conversation (session name and summary); it goes
+        into the system message so the provider can cache it. ``evidence`` is
+        retrieved for this question and goes next to the question. Any Session
+        context is routed per question, so it is all evidence.
+        """
+        if not needs_session_context:
+            # research_helper general-knowledge question: history only.
+            return "", ""
+        if resolution.scope == ScopeResolution.ALL_SESSIONS:
+            return "", self._get_all_sessions_context(question)
+        if resolution.session_ids:
+            return self._get_single_session_context(
+                resolution.session_ids[0], question, conversation_id
+            )
+        return "", ""
+
     def _get_single_session_context(
         self, session_id: int, question: str, conversation_id: Optional[int] = None
-    ) -> str:
-        """Get bounded context for a single session."""
+    ) -> Tuple[str, str]:
+        """Get bounded context for a single session as ``(background, evidence)``."""
         try:
             context = self._tools.get_session_context(
                 session_id, question, conversation_id=conversation_id
             )
             if "error" in context:
-                return f"Error retrieving context: {context['error']}"
-            
-            # Convert to prompt text
-            return self._dict_to_context_prompt(context)
+                return "", f"Error retrieving context: {context['error']}"
+
+            self._last_screenshot_ids = {
+                sc["screenshot_id"]
+                for sc in context.get("screenshots", [])
+                if sc.get("screenshot_id") is not None
+            }
+
+            background = self._session_background_prompt(context)
+            evidence = self._question_evidence_prompt(context)
+            if not background and not evidence:
+                evidence = "(No context found)"
+            return background, evidence
         except Exception as e:
-            return f"Context retrieval failed: {str(e)}"
+            return "", f"Context retrieval failed: {str(e)}"
 
     def _get_all_sessions_context(self, question: str) -> str:
         """Route to the relevant sessions, then build context from those only.
@@ -595,8 +626,12 @@ class AssistantAnswerService:
 
         return "\n".join(parts)
 
-    def _dict_to_context_prompt(self, context: Dict[str, Any]) -> str:
-        """Convert context dict to prompt-friendly text."""
+    def _session_background_prompt(self, context: Dict[str, Any]) -> str:
+        """Session name and summary: identical for every question in a session.
+
+        Kept apart from the per-question evidence so it can sit at the start of
+        the prompt, where the provider's prompt cache can reuse it.
+        """
         parts = []
 
         # Conversation history is deliberately not rendered here: _build_messages
@@ -621,6 +656,12 @@ class AssistantAnswerService:
                 parts.append(f"[{summary_type}]: {content[:MAX_SUMMARY_CHARS]}")
             parts.append("")
 
+        return "\n".join(parts)
+
+    def _question_evidence_prompt(self, context: Dict[str, Any]) -> str:
+        """Transcript excerpts and screenshots retrieved for this question."""
+        parts = []
+
         if context.get("transcripts"):
             parts.append("## Transcripts")
             for t in context["transcripts"]:
@@ -628,13 +669,11 @@ class AssistantAnswerService:
             parts.append("")
 
         if context.get("screenshots"):
-            parts.append("## Screenshots")
-            for sc in context["screenshots"]:
-                parts.append(f"[Screenshot at {sc.get('timestamp', 0)}]: {sc.get('filepath', '')}")
-            parts.append("")
-
-        if not parts:
-            return "(No context found)"
+            known = {f.name for f in fields(ScreenshotReference)}
+            parts.extend(render_screenshot_section([
+                ScreenshotReference(**{k: v for k, v in sc.items() if k in known})
+                for sc in context["screenshots"]
+            ]))
 
         return "\n".join(parts)
 
@@ -645,16 +684,33 @@ class AssistantAnswerService:
         question: str,
         conversation_id: Optional[int],
         is_any_session: bool = False,
+        background: str = "",
     ) -> List[Dict[str, str]]:
-        """Build OpenRouter messages with system prompt, context, and history."""
+        """Build OpenRouter messages, with the text that repeats across a
+        conversation's questions first.
+
+        Providers such as Gemini bill a prompt prefix they have seen recently
+        at a fraction of the input price, but only up to the first character
+        that differs. So the system message holds only what stays the same for
+        every question (instructions, session ``background``, answer contract),
+        the history follows, and ``context`` - retrieved for this question -
+        is sent last, together with the question.
+        """
         messages = []
 
-        # System message with context
-        system_content = f"{agent['system_instruction']}\n\nContext:\n{context}"
+        system_content = agent['system_instruction']
+        if background:
+            system_content = f"{system_content}\n\nContext:\n{background}"
         # Any Session mode only: ask the model to self-classify its answer via
         # the metadata trailer. Specific Session prompts are left untouched.
         if is_any_session:
             system_content = f"{system_content}\n\n{RESPONSE_CONTRACT}"
+        elif self._last_screenshot_ids:
+            # Specific Session with screenshots in context: let the model point
+            # the user at the screenshot that holds the answer (BU108). Every
+            # question of a session that has screenshots lists them, so this
+            # does not change between questions.
+            system_content = f"{system_content}\n\n{SCREENSHOT_CONTRACT}"
         messages.append({"role": "system", "content": system_content})
 
         # Add conversation history if continuing, capped to the most recent
@@ -671,8 +727,12 @@ class AssistantAnswerService:
                 # Ignore history errors - start fresh
                 pass
 
-        # Add current question
-        messages.append({"role": "user", "content": question})
+        # Current question, preceded by the context retrieved for it. Only the
+        # bare question is persisted, so history never carries old context.
+        user_content = question
+        if context:
+            user_content = f"Context for this question:\n{context}\n\nQuestion: {question}"
+        messages.append({"role": "user", "content": user_content})
 
         return messages
 
