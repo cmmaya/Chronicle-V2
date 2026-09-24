@@ -1,16 +1,11 @@
-import os
+from .. import paths
+from . import theme
 
 
 def asset_path(filename: str) -> str:
-    """
-    Devuelve la ruta a los SVG pixel-art.
-    Espera esta estructura:
-        assets/pixel/<filename>
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    src_dir = os.path.dirname(here)
-    project_dir = os.path.dirname(src_dir)
-    return os.path.join(project_dir, "assets", "pixel", filename)
+    """Path to a pixel-art SVG shipped in ``assets/pixel/<filename>``,
+    recoloured for the active theme (BU129)."""
+    return theme.themed_svg(paths.asset_path("pixel", filename))
 
 
 def app_qss() -> str:
@@ -230,6 +225,35 @@ def app_qss() -> str:
         font-weight: 700;
     }
 
+    QComboBox#AgentCombo {
+        background: transparent;
+        color: #071846;
+        border: none;
+        padding: 2px 4px 2px 6px;
+        min-height: 0px;
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    QComboBox#AgentCombo:hover,
+    QComboBox#AgentCombo:on {
+        background: transparent;
+        color: #274F9B;
+    }
+
+    QComboBox#AgentCombo::drop-down {
+        border: none;
+        width: 16px;
+    }
+
+    QComboBox#AgentCombo::down-arrow {
+        image: url(__CHEVRON__);
+        width: 10px;
+        height: 6px;
+        border: none;
+        margin-right: 6px;
+    }
+
     QTextEdit#QuestionInput {
         background: transparent;
         color: #071846;
@@ -258,4 +282,6 @@ def app_qss() -> str:
         text-align: center;
         border-radius: 7px;
     }
-    """
+    """.replace(
+        "__CHEVRON__", asset_path("icon_chevron_down_dark.svg").replace("\\", "/")
+    ) + theme.extra_qss()

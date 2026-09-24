@@ -43,8 +43,9 @@ class ParakeetEngine:
     """Wrapper for NVIDIA Parakeet TDT v3 through the onnx-asr package.
 
     The default model name follows onnx-asr's public quickstart:
-    ``nemo-parakeet-tdt-0.6b-v3``. It loads from Hugging Face on first use and
-    then uses the local cache.
+    ``nemo-parakeet-tdt-0.6b-v3``. It loads only from the files installed by
+    ``src/model_manager.py`` for the configured quantization - never a download
+    at runtime (BU123).
 
     Parakeet does not support Whisper-style ``initial_prompt``. The method
     accepts that parameter only to remain compatible with the existing
@@ -165,48 +166,53 @@ class ParakeetEngine:
         options.enable_cpu_mem_arena = False
         return options
 
-    def _load_onnx_asr_model(self, onnx_asr: Any) -> Any:
-        """Load the model with the configured quantization and thread counts.
+    def _model_dir(self) -> str:
+        """Local folder holding exactly the files for ``self.quantization``.
 
-        Falls back to full precision if the quantized weights can't be loaded
-        (e.g. offline before their first download), and to the bare
-        ``load_model(name)`` call on onnx-asr versions without these options.
+        ``model_path`` may itself be a model directory; otherwise it must be
+        the model the model manager installs.
         """
+        if os.path.isdir(self.model_path):
+            return self.model_path
+        from .. import model_manager
+
+        if self.model_path != self.DEFAULT_MODEL:
+            raise ModelLoadError(
+                f"'{self.model_path}' is not a model directory, and only "
+                f"'{self.DEFAULT_MODEL}' is installed by setup."
+            )
+        parakeet = next(
+            m for m in model_manager.required_models(self.quantization)
+            if m.name == model_manager.PARAKEET
+        )
+        if not model_manager.is_installed(models=[parakeet]):
+            raise ModelLoadError(
+                f"The speech-to-text model (Parakeet, "
+                f"{self.quantization or 'full precision'}) is not installed. "
+                f"{model_manager.SETUP_HINT}"
+            )
+        return str(model_manager.snapshot_dir(parakeet))
+
+    def _load_onnx_asr_model(self, onnx_asr: Any) -> Any:
+        """Load the configured quantization, with our thread counts, from disk.
+
+        There is no fallback to another variant: that would mean a multi-GB
+        download in the middle of a session.
+        """
+        model_dir = self._model_dir()
         try:
             options = self._session_options()
         except Exception as exc:  # noqa: BLE001 - thread tuning is optional
             logger.warning("Could not build ONNX Runtime session options: %s", exc)
             options = None
 
-        variants = []
-        if self.quantization:
-            variants.append({"quantization": self.quantization})
-        variants.append({})
-
-        last_exc: Optional[Exception] = None
-        for extra in variants:
-            kwargs = dict(extra)
-            if options is not None:
-                kwargs["sess_options"] = options
-            try:
-                model = onnx_asr.load_model(self.model_path, **kwargs)
-            except TypeError as exc:
-                # onnx-asr predating quantization / sess_options.
-                logger.warning("onnx-asr rejected %s (%s); loading with defaults", list(kwargs), exc)
-                self._loaded_quantization = None
-                return onnx_asr.load_model(self.model_path)
-            except Exception as exc:  # noqa: BLE001 - try the next variant
-                last_exc = exc
-                if extra:
-                    logger.warning(
-                        "Could not load %s weights for '%s' (%s); falling back to full precision",
-                        self.quantization, self.model_path, exc,
-                    )
-                continue
-            self._loaded_quantization = extra.get("quantization")
-            return model
-
-        raise last_exc if last_exc else ModelLoadError("No model variant could be loaded")
+        kwargs: Dict[str, Any] = {"quantization": self.quantization}
+        if options is not None:
+            kwargs["sess_options"] = options
+        # An existing local directory makes onnx-asr resolve files offline.
+        model = onnx_asr.load_model(self.DEFAULT_MODEL, model_dir, **kwargs)
+        self._loaded_quantization = self.quantization
+        return model
 
     def is_loaded(self) -> bool:
         """Check if model is loaded."""

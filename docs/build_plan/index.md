@@ -149,8 +149,56 @@ Live Q&A In The Transcripts Window — user-requested: manual chunk selection an
 
 | BU    | Name                                    | Status    | Depends On          | Next  |
 | ---   | ---                                     | ---       | ---                 | ---   |
-| BU111 | Structured Transcript Records And Detached Bubble Grouping | Pending | none | BU112 |
-| BU112 | Detached Window Two-Column Layout And Transcript Polish | Pending | BU111 | BU113 |
-| BU113 | Manual Chunk Selection And Answer From Context Menu | Pending | BU111, BU112 | BU114 |
-| BU114 | Question Detection Service              | Pending   | BU111               | BU115 |
-| BU115 | Auto Mode Controls And Detected-Question Cards | Pending | BU113, BU114 | none |
+| BU111 | Structured Transcript Records And Detached Bubble Grouping | Completed | none | BU112 |
+| BU112 | Detached Window Two-Column Layout And Transcript Polish | Completed | BU111 | BU113 |
+| BU113 | Manual Chunk Selection And Answer From Context Menu | Completed | BU111, BU112 | BU114 |
+| BU114 | Question Detection Service              | Completed | BU111               | BU115 |
+| BU115 | Auto Mode Controls And Detected-Question Cards | Completed | BU113, BU114 | BU116 |
+
+Live Q&A Answer Quality — user-requested after using BU115: auto-mode answers were built from the transcript window without the detected question, and answers were too long
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU116 | Concise Answers And Two Answer Modes    | Completed | BU115               | BU117 |
+| BU117 | Reference .txt File As An Answer Source | Completed | BU116               | none  |
+
+Audio Mute Controls — user-requested: mute the mic or the system audio mid-session from the chat section
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU118 | Mic And System Audio Mute Toggles       | Completed | none                | none  |
+
+Persisted UI State — user-requested after BU118, informed by an audit of preferences.json
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU119 | Persisted UI State And A Safe Preferences File | Completed | BU118        | none  |
+
+Installable Windows App — user-requested: install to any folder, with models downloaded by a setup wizard before the app window first appears; informed by a dependency audit of every import
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU120 | Dependency Audit And Clean Requirements | Completed | none                | BU121 |
+| BU121 | App Paths: Separate Install Folder From User Data | Completed | none      | BU122 |
+| BU122 | API Key In The Windows Credential Store | Completed | BU121               | BU123 |
+| BU123 | Model Manager: Check, Download And Verify Models | Completed | BU121      | BU124 |
+| BU124 | First-Run Setup Wizard Before The Main Window | Completed | BU121, BU122, BU123 | BU125 |
+| BU125 | Windowed-App Hardening: Log File, Crash Dialog, Single Instance | Completed | BU121 | BU126 |
+| BU126 | PyInstaller Build Of A Standalone App Folder | Completed | BU120, BU121, BU125 | BU127 |
+| BU127 | Windows Installer With A Choosable Install Folder | Completed | BU124, BU126 | none |
+
+Settings Pop-Up — user-requested: replace the menu bar the Settings button reveals with a pixel-art pop-up window
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU128 | Settings Pop-Up Window                  | Completed | BU119, BU122        | none  |
+
+Send Due Dates To Google Calendar — user-requested: a per-entry "Send to Calendar" button in the summary's Due Dates, an editable event dialog (all-day when no time is given), and Google sign-in configured from Settings
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU129 | Machine-Readable Calendar Date In Due Dates Entries | Completed | none      | BU130 |
+| BU130 | Google Account Sign-In (OAuth Desktop Flow) | Completed | BU121, BU122      | BU131 |
+| BU131 | Calendar Page In The Settings Pop-Up    | Completed | BU128, BU130        | BU132 |
+| BU132 | Calendar Event Service And Sent-Event Tracking | Completed | BU129, BU130 | BU133 |
+| BU133 | "Send To Calendar" Button And Event Dialog | Completed | BU129, BU131, BU132 | none |

@@ -17,7 +17,8 @@ class TestOpenRouterClient:
     def test_missing_api_key_raises_error(self):
         """Test that missing API key raises MissingAPIKeyError."""
         # Clear the environment variable if it exists
-        with patch.dict(os.environ, {}, clear=True):
+        # BU122: no key in the environment and none in the credential store.
+        with patch.dict(os.environ, {}, clear=True),                 patch('src.secrets._from_keyring', return_value=None):
             with patch.dict('sys.modules', {'dotenv': MagicMock()}):
                 # Force reload to avoid cached imports
                 if 'src.assistant.openrouter_client' in sys.modules:
@@ -28,7 +29,7 @@ class TestOpenRouterClient:
                 with pytest.raises(MissingAPIKeyError) as exc_info:
                     OpenRouterClient(api_key=None)
                 
-                assert "API key required" in str(exc_info.value)
+                assert "Settings > API Key" in str(exc_info.value)
     
     def test_missing_model_raises_error(self):
         """Test that missing model raises InvalidResponseError."""

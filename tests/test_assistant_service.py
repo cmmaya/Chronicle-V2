@@ -517,11 +517,12 @@ class TestAnswerContractAndHandoff:
 
     @patch("src.assistant.service.get_selected_model")
     @patch("src.assistant.service.OpenRouterClient")
-    def test_specific_session_keeps_client_default_temperature(self, mock_client_class, mock_get_model):
+    def test_specific_session_uses_answer_temperature(self, mock_client_class, mock_get_model):
         from src.assistant.session_resolver import ScopeResolution
+        from src.config import ANSWER_TEMPERATURE
 
         self._run(mock_client_class, mock_get_model, ScopeResolution.SELECTED_SESSION, "answer")
-        assert mock_client_class.call_args.kwargs.get("temperature") is None
+        assert mock_client_class.call_args.kwargs.get("temperature") == ANSWER_TEMPERATURE
 
     @patch("src.assistant.service.get_selected_model")
     @patch("src.assistant.service.OpenRouterClient")

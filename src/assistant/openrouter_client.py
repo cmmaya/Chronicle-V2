@@ -4,6 +4,7 @@ import os
 from typing import List, Dict, Optional
 
 from ..config import get_selected_model
+from ..secrets import MISSING_KEY_MESSAGE, get_api_key, redact
 
 logger = logging.getLogger(__name__)
 
@@ -48,22 +49,16 @@ class OpenRouterClient:
         """Initialize the OpenRouter client.
         
         Args:
-            api_key: OpenRouter API key (defaults to OPENROUTER_API_KEY env var)
+            api_key: OpenRouter API key (defaults to secrets.get_api_key())
             model: Model ID to use (e.g., "google/gemini-2.5-flash")
             temperature: Sampling temperature (0.0-2.0), defaults to 0.7
             api_url: API endpoint URL (defaults to OpenRouter standard URL)
         """
-        # Load API key from environment if not provided
         if api_key is None:
-            from dotenv import load_dotenv
-            load_dotenv()
-            api_key = os.getenv("OPENROUTER_API_KEY")
-        
+            api_key = get_api_key()
+
         if not api_key:
-            raise MissingAPIKeyError(
-                "OpenRouter API key required. Set OPENROUTER_API_KEY environment variable "
-                "or pass api_key parameter."
-            )
+            raise MissingAPIKeyError(MISSING_KEY_MESSAGE)
         
         self.api_key = api_key
         self.model = model
@@ -137,10 +132,10 @@ class OpenRouterClient:
                 error_data = e.response.json()
                 error_msg += f": {error_data.get('error', {}).get('message', '')}"
             except Exception:
-                error_msg += f": {str(e)}"
+                error_msg += f": {redact(e, self.api_key)}"
             raise APIRequestError(error_msg)
         except httpx.RequestError as e:
-            raise APIRequestError(f"API request failed: {str(e)}")
+            raise APIRequestError(f"API request failed: {redact(e, self.api_key)}")
         except ValueError as e:
             raise InvalidResponseError(f"Failed to parse API response: {str(e)}")
 
@@ -209,10 +204,10 @@ class OpenRouterClient:
                 error_data = e.response.json()
                 error_msg += f": {error_data.get('error', {}).get('message', '')}"
             except Exception:
-                error_msg += f": {str(e)}"
+                error_msg += f": {redact(e, self.api_key)}"
             raise APIRequestError(error_msg)
         except httpx.RequestError as e:
-            raise APIRequestError(f"API request failed: {str(e)}")
+            raise APIRequestError(f"API request failed: {redact(e, self.api_key)}")
         except ValueError as e:
             raise InvalidResponseError(f"Failed to parse API response: {str(e)}")
 

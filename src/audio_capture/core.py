@@ -199,6 +199,15 @@ class ChunkedAudioRecorder:
         self._last_chunk_time: float = 0.0
         self._restart_count: int = 0
 
+        # Mute state (BU118). Muting does not stop the stream - the device
+        # stays open and the capture thread keeps running - it drops captured
+        # audio at _feed, so nothing is chunked, saved or transcribed. The flag
+        # is set from the UI thread and read on the recording thread;
+        # _mute_dirty hands the transition itself to the recording thread so
+        # buffer surgery never races with _feed.
+        self._muted = False
+        self._mute_dirty = threading.Event()
+
         # Per-run stream state (see _reset_stream_state)
         self._raw: deque = deque()
         self._overflows = 0
@@ -346,6 +355,16 @@ class ChunkedAudioRecorder:
         """Fresh state for one recording run (start or restart)."""
         self._raw = deque()
         self._overflows = 0
+        self._reset_pending_state()
+
+    def _reset_pending_state(self) -> None:
+        """Fresh chunk-window state, leaving the raw queue alone.
+
+        Deliberately does not replace ``self._raw``: the microphone callback
+        closes over that deque, so swapping it mid-run would leave the capture
+        thread draining a queue nothing writes to. A mute transition only needs
+        the pending window and the resampler reset.
+        """
         self._pending = []
         self._pending_len = 0
         self._pending_start = None
@@ -372,9 +391,48 @@ class ChunkedAudioRecorder:
             block = block[:, 0] if block.shape[1] == 1 else block.mean(axis=1)
         return block
 
+    @property
+    def is_muted(self) -> bool:
+        """True while captured audio is being dropped instead of chunked."""
+        return self._muted
+
+    def set_muted(self, muted: bool) -> None:
+        """Mute or unmute this source (BU118).
+
+        Safe to call from any thread and at any point in the lifecycle,
+        including before ``start()``. The stream is untouched; the transition
+        itself is applied on the recording thread by _apply_mute_transition.
+        """
+        muted = bool(muted)
+        if muted == self._muted:
+            return
+        self._muted = muted
+        self._mute_dirty.set()
+        logger.info(f"{self.source} capture {'muted' if muted else 'unmuted'}")
+
+    def _apply_mute_transition(self) -> None:
+        """Handle a pending mute/unmute. Recording thread only."""
+        if not self._mute_dirty.is_set():
+            return
+        self._mute_dirty.clear()
+        if self._muted:
+            # Flush the partial window rather than discarding it: the audio in
+            # it was captured *before* the user muted, and throwing it away
+            # would silently lose up to one chunk of speech they never asked to
+            # drop. The flushed chunk ends where the mute began, so no muted
+            # audio is ever saved or transcribed.
+            self._flush_final()
+        # Either way the next chunk starts from a clean window, so pre-mute and
+        # post-mute audio can never be spliced into one chunk with a timestamp
+        # that covers the muted gap.
+        self._reset_pending_state()
+
     def _feed(self, blocks: List[np.ndarray]) -> None:
         """Append captured blocks to the pending stream and emit full chunks."""
-        if not blocks:
+        self._apply_mute_transition()
+        if self._muted or not blocks:
+            # Muted: the blocks are dropped here, before VAD, chunk saving,
+            # the save callback and live transcription.
             return
         audio = np.concatenate([self._to_mono(b) for b in blocks])
         if self._resampler is not None:
@@ -569,6 +627,12 @@ class ChunkedAudioRecorder:
         """
         if not self._is_running:
             return True, "not running"
+
+        # A muted source emits no chunks by design (BU118). Without this the
+        # watchdog would read the silence as a stall and restart the recorder
+        # every watchdog_stall_seconds for as long as the user stays muted.
+        if self._muted:
+            return True, "muted"
 
         if stall_seconds is None:
             stall_seconds = float(
@@ -866,6 +930,26 @@ class DualSourceChunkedRecorder:
         self._is_running = False
         logger.info("Stopped dual-source chunked recording")
         return mic_chunks, system_chunks
+
+    def _recorder_for(self, source: str) -> ChunkedAudioRecorder:
+        if source == 'mic':
+            return self.mic_recorder
+        if source == 'system':
+            return self.system_recorder
+        raise ValueError(f"Unknown audio source: {source!r} (expected 'mic' or 'system')")
+
+    def set_source_muted(self, source: str, muted: bool) -> None:
+        """Mute or unmute one source, leaving the other recording (BU118).
+
+        The mute lives on the recorder, so it survives a watchdog restart:
+        ChunkedAudioRecorder.restart() rebuilds the stream in place and keeps
+        the flag.
+        """
+        self._recorder_for(source).set_muted(muted)
+
+    def is_source_muted(self, source: str) -> bool:
+        """True if that source is currently muted."""
+        return self._recorder_for(source).is_muted
 
     @property
     def is_running(self) -> bool:

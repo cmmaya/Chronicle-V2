@@ -5,6 +5,8 @@ import os
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
+from ..secrets import MISSING_KEY_MESSAGE, get_api_key, redact
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,7 +69,7 @@ class SummaryGenerator:
         """Initialize summary generator.
         
         Args:
-            api_key: OpenRouter API key (defaults to OPENROUTER_API_KEY env var)
+            api_key: OpenRouter API key (defaults to secrets.get_api_key())
             db: Database instance for storing summaries (optional)
             model: AI model to use (defaults to Gemini 3.8 Flash)
             max_tokens: Maximum tokens in response
@@ -76,12 +78,9 @@ class SummaryGenerator:
             api_url: OpenRouter API URL (defaults to env var or standard URL)
             custom_instructions: Custom instructions to prepend to prompts
         """
-        # Load API key from .env if not provided
         if api_key is None:
-            from dotenv import load_dotenv
-            load_dotenv()
-            api_key = os.getenv("OPENROUTER_API_KEY")
-        
+            api_key = get_api_key()
+
         self.api_key = api_key
         
         # Load API URL from .env or use default
@@ -200,9 +199,9 @@ class SummaryGenerator:
             raise SummaryError(error_msg)
         except self.requests.exceptions.RequestException as e:
             if not use_fallback:
-                logger.warning(f"Primary model failed ({str(e)}), trying fallback...")
+                logger.warning(f"Primary model failed ({redact(e, self.api_key)}), trying fallback...")
                 return self._call_api(messages, use_fallback=True)
-            raise SummaryError(f"API request failed: {str(e)}")
+            raise SummaryError(f"API request failed: {redact(e, self.api_key)}")
         except json.JSONDecodeError:
             raise SummaryError("Invalid JSON response from API")
     
@@ -227,7 +226,7 @@ class SummaryGenerator:
             raise SummaryError("Transcript cannot be empty")
         
         if not self.api_key:
-            raise SummaryError("API key required for summary generation")
+            raise SummaryError(MISSING_KEY_MESSAGE)
         
         # Combine custom instructions with template system prompt
         system_prompt = template.system_prompt

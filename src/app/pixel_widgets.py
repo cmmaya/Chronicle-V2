@@ -1,3 +1,5 @@
+from PySide6.QtWidgets import QDialog
+from PySide6.QtCore import QObject, QAbstractNativeEventFilter
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -9,20 +11,27 @@ from PySide6.QtWidgets import (
     QStyleOptionButton,
     QStyle,
     QLineEdit,
+    QTextEdit,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QApplication,
 )
-from PySide6.QtCore import Qt, QSize, Signal, QTimer, QEvent
+from PySide6.QtCore import Qt, QSize, Signal, QTimer, QEvent, QMargins
 import html as html_escape
 import re
 from .pixel_theme import asset_path
+from . import theme
 from PySide6.QtGui import (
     QColor,
     QIcon,
+    QPixmap,
     QPainter,
     QPainterPath,
     QPen,
     QBrush,
     QFont,
     QFontMetrics,
+    QCursor,
 )
 
 
@@ -30,32 +39,49 @@ from PySide6.QtGui import (
 # Palette
 # =========================
 
-NAVY = QColor("#061946")
-NAVY_INNER = QColor("#071D52")
+NAVY = theme.qcolor("#061946")
+NAVY_INNER = theme.qcolor("#071D52")
 
-BORDER_BLUE = QColor("#254D9C")
-BORDER_BLUE_LIGHT = QColor("#3A67C7")
-BORDER_BLUE_ACTIVE = QColor("#4A78D8")
+BORDER_BLUE = theme.qcolor("#254D9C")
+BORDER_BLUE_LIGHT = theme.qcolor("#3A67C7")
+BORDER_BLUE_ACTIVE = theme.qcolor("#4A78D8")
 
-BUTTON_BLUE = QColor("#274F9B")
-BUTTON_BLUE_HOVER = QColor("#315DB1")
-BUTTON_BLUE_PRESSED = QColor("#1E3F82")
+BUTTON_BLUE = theme.qcolor("#274F9B")
+BUTTON_BLUE_HOVER = theme.qcolor("#315DB1")
+BUTTON_BLUE_PRESSED = theme.qcolor("#1E3F82")
 
-CREAM = QColor("#F6E0A6")
-CREAM_BORDER = QColor("#FFEFC1")
+CREAM = theme.qcolor("#F6E0A6")
+CREAM_BORDER = theme.qcolor("#FFEFC1")
 
-BUBBLE_BLUE = QColor("#294F9D")
-BUBBLE_BLUE_BORDER = QColor("#3765BD")
+BUBBLE_BLUE = theme.qcolor("#294F9D")
+BUBBLE_BLUE_BORDER = theme.qcolor("#3765BD")
 
-TEXT_LIGHT = QColor("#FFF0BF")
-TEXT_DARK = QColor("#071846")
+TEXT_LIGHT = theme.qcolor("#FFF0BF")
+TEXT_DARK = theme.qcolor("#071846")
+
+# Role colours that a theme may split off from the palette above (BU129).
+PANEL_BORDER_INNER = theme.role_color("panel_border_inner")
+PANEL_GLOW = theme.role("panel_glow")  # "" = no halo around panels
 
 # In-text find highlight (BU099 follow-up): a chip behind the matched word(s).
 # Two pairs, one per bubble fill, so the chip always contrasts with the
 # bubble it's drawn on (a cream-on-cream chip over a "cream" bubble would be
 # invisible - CREAM bubbles use the dark-on-light BUBBLE_BLUE pair instead).
-FIND_TERM_ON_CREAM = ("#294F9D", "#FFF0BF")  # over CREAM / cream-variant bubbles
-FIND_TERM_ON_BLUE = ("#FFEFC1", "#071846")   # over BUBBLE_BLUE / blue-variant bubbles
+FIND_TERM_ON_CREAM = (theme.hex("#294F9D"), theme.hex("#FFF0BF"))  # over CREAM / cream-variant bubbles
+FIND_TERM_ON_BLUE = (theme.hex("#FFEFC1"), theme.hex("#071846"))   # over BUBBLE_BLUE / blue-variant bubbles
+
+# Selected transcript bubble (BU113). Deliberately not cream: the find
+# highlight already owns CREAM_BORDER, and a selection has to stay legible
+# next to one. A saturated cyan reads as "picked by the user" against both
+# bubble fills and is nothing else in the theme.
+SELECTED_BORDER = theme.qcolor("#6FD3FF")
+
+# Fill behind a selected chunk inside a segmented bubble. One per bubble
+# variant, because a single tint cannot read against both a cream and a blue
+# fill. The cyan left edge is what the two have in common, so a selection
+# still scans as one thing down a mixed column.
+SEGMENT_SELECTED_ON_CREAM = theme.hex("#E0C079")
+SEGMENT_SELECTED_ON_BLUE = theme.hex("#3C6FCB")
 
 
 # =========================
@@ -110,15 +136,130 @@ def highlight_terms_html(text: str, terms, bg: str, fg: str) -> str:
 # the same well-tested one PixelCollapsibleSection already relies on.
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", re.DOTALL)
+_CODE_RE = re.compile(r"`([^`]+)`")
+
+# Block-level markdown the models actually emit in answers: ATX headings,
+# thematic breaks, and bullet/numbered lists. They are rendered as inline
+# HTML on a single line (a sized bold span, a rule, a bullet glyph plus
+# non-breaking-space indent) rather than as <h1>/<ul>/<li> blocks, because
+# QLabel's word-wrap sizeHint is only reliable for the flat, <br>-joined
+# markup the bubbles already use.
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_RULE_RE = re.compile(r"^\s*(?:-\s*-\s*-[-\s]*|\*\s*\*\s*\*[\*\s]*|_\s*_\s*_[_\s]*)$")
+_BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_NUMBER_RE = re.compile(r"^(\s*)(\d{1,3})[.)]\s+(.*)$")
+
+# Base bubble/answer text is 12pt; headings step up from there and stop
+# growing after level 3 so a stray "#####" cannot dwarf the answer.
+_HEADING_SIZES = {1: 16, 2: 14, 3: 13, 4: 12, 5: 12, 6: 12}
+
+# A real rule rather than a run of dashes, so the separator spans the card
+# instead of sitting as a short stub at whatever the em-dash count happens to
+# measure. Qt's rich-text subset renders <hr> as a full-width block, so it is
+# emitted on its own and not wrapped in the surrounding <br> joins.
+_RULE_HTML = '<hr>'
+
+
+def _inline_markdown_to_html(text: str) -> str:
+    """Escape ``text`` and convert the inline span markers only."""
+    escaped = html_escape.escape(text)
+    coded = _CODE_RE.sub(
+        lambda m: ('<span style="background:rgba(0,0,0,0.12);">'
+                   f'{m.group(1)}</span>'),
+        escaped,
+    )
+    bolded = _BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", coded)
+    return _ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", bolded)
+
+
+def _indent_html(spaces: str) -> str:
+    """Two source spaces (or one tab) of list nesting -> one indent step."""
+    width = len(spaces.expandtabs(2))
+    return "&nbsp;" * (4 * (width // 2))
+
+
+def _markdown_line_to_html(raw: str) -> str:
+    """Convert a single markdown line to inline HTML."""
+    line = raw.rstrip()
+    if not line.strip():
+        return ""
+
+    if _RULE_RE.match(line):
+        return _RULE_HTML
+
+    heading = _HEADING_RE.match(line.lstrip())
+    if heading is not None:
+        level = len(heading.group(1))
+        size = _HEADING_SIZES[level]
+        body = _inline_markdown_to_html(heading.group(2))
+        return f'<b><span style="font-size:{size}pt;">{body}</span></b>'
+
+    bullet = _BULLET_RE.match(line)
+    if bullet is not None:
+        return (f'{_indent_html(bullet.group(1))}&#8226;&nbsp;'
+                f'{_inline_markdown_to_html(bullet.group(2))}')
+
+    numbered = _NUMBER_RE.match(line)
+    if numbered is not None:
+        return (f'{_indent_html(numbered.group(1))}{numbered.group(2)}.&nbsp;'
+                f'{_inline_markdown_to_html(numbered.group(3))}')
+
+    return _inline_markdown_to_html(line)
+
+
+def _join_markdown_lines(parts) -> str:
+    """Join rendered lines with <br>, except around a rule - <hr> is already a
+    block of its own, so a <br> on either side would leave a blank line."""
+    out = ""
+    for index, part in enumerate(parts):
+        if index and part != _RULE_HTML and not out.endswith(_RULE_HTML):
+            out += "<br>"
+        out += part
+    return out
 
 
 def simple_markdown_to_html(text: str) -> str:
-    """Escape ``text`` and convert ``**bold**`` / ``*italic*`` and newlines
-    to HTML, without pulling in a full markdown parser."""
-    escaped = html_escape.escape(text)
-    bolded = _BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", escaped)
-    emphasized = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", bolded)
-    return emphasized.replace("\n", "<br>")
+    """Escape ``text`` and convert the markdown subset answers actually use
+    (bold, italics, inline code, headings, rules, lists) plus newlines to
+    HTML, without pulling in a full markdown parser."""
+    lines = (text or "").splitlines() or [""]
+    return _join_markdown_lines(
+        _markdown_line_to_html(line) for line in lines
+    )
+
+
+# BU116/BU117: the evidence label is what tells the user how far to trust the
+# answer, so it must not dissolve into the body prose. Deliberately narrow -
+# the three labels the answer prompts emit, plus "From <name>.txt:" for an
+# attached reference document - so an ordinary sentence opening with "From the
+# slides the answer is:" is not mistaken for one.
+_ANSWER_LABEL_RE = re.compile(
+    r"^(From transcripts|General knowledge|From\s+\S[^:\n]{0,80}\.txt)\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def format_answer_html(text: str) -> str:
+    """Render a live answer, giving each evidence label its own opening line.
+
+    Everything else goes through ``simple_markdown_to_html`` unchanged, so an
+    answer with no labels renders exactly as it did before.
+    """
+    rendered = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        match = _ANSWER_LABEL_RE.match(line.lstrip())
+        if match is None:
+            rendered.append(_markdown_line_to_html(line))
+            continue
+        label = html_escape.escape(match.group(1).strip())
+        body = _markdown_line_to_html(line.lstrip()[match.end():].strip())
+        rendered.append(
+            f'<b><span style="color:#FFE9A8;">{label}:</span></b> {body}'
+        )
+    return theme.remap(_join_markdown_lines(rendered))
 
 
 # =========================
@@ -137,8 +278,38 @@ class PixelPanel(QWidget):
         super().__init__(parent)
         self.inner = inner
         self._active = False
+        self._backdrop = None  # QPixmap painted inside the border (BU129)
+        self._backdrop_sky = None
+        self._backdrop_cache = None  # (size, scaled pixmap)
         self.setAttribute(Qt.WA_StyledBackground, False)
         self.setAutoFillBackground(False)
+
+    def set_backdrop(self, image_path):
+        """Paint ``image_path`` inside the panel instead of the flat fill.
+
+        The image spans the panel's width and sits on its bottom edge; any
+        height it leaves free above is filled with the image's top-row
+        colour, so a tall panel reads as more sky. ``None`` clears it.
+        """
+        self._backdrop = None
+        self._backdrop_cache = None
+        if image_path:
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                self._backdrop = pixmap
+                self._backdrop_sky = pixmap.toImage().pixelColor(pixmap.width() // 2, 0)
+        self.update()
+
+    def _scaled_backdrop(self, width: int, height: int) -> QPixmap:
+        # Slightly wider than the panel, centred, so the sun sits a little
+        # right of centre as in the theme's reference.
+        size = (width, height)
+        if self._backdrop_cache is None or self._backdrop_cache[0] != size:
+            scaled = self._backdrop.scaledToWidth(
+                max(1, round(width * 1.08)), Qt.SmoothTransformation
+            )
+            self._backdrop_cache = (size, scaled)
+        return self._backdrop_cache[1]
 
     def set_active(self, value: bool):
         value = bool(value)
@@ -165,14 +336,41 @@ class PixelPanel(QWidget):
         # para que se parezca al mockup de referencia y no genere efecto de bisel.
         cut = 9 if not self.inner else 7
         fill = NAVY_INNER if self.inner else NAVY
-        border = BORDER_BLUE_LIGHT if self.inner else BORDER_BLUE
+        border = PANEL_BORDER_INNER if self.inner else BORDER_BLUE
         pen_width = 2 if not self.inner else 2
         if self._active and not self.inner:
             border = BORDER_BLUE_ACTIVE
             pen_width = 3
 
         path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), cut)
-        painter.setBrush(QBrush(fill))
+        if self._backdrop is not None:
+            painter.save()
+            painter.setClipPath(path)
+            painter.fillRect(rect, self._backdrop_sky)
+            scaled = self._scaled_backdrop(rect.width(), rect.height())
+            painter.drawPixmap(
+                rect.x() + (rect.width() - scaled.width()) // 2,
+                rect.bottom() - scaled.height() + 1,
+                scaled,
+            )
+            painter.restore()
+        else:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(fill))
+            painter.drawPath(path)
+        painter.setBrush(Qt.NoBrush)
+
+        # Neon themes: a soft halo under the border line (BU129).
+        if PANEL_GLOW:
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            for width, alpha in ((9, 28), (6, 55), (4, 90)):
+                glow = QColor(border)
+                glow.setAlpha(alpha)
+                painter.setPen(QPen(glow, width))
+                painter.drawPath(path)
+            painter.restore()
+
         painter.setPen(QPen(border, pen_width))
         painter.drawPath(path)
 
@@ -184,7 +382,8 @@ class PixelPanel(QWidget):
 # =========================
 
 class PixelSectionTitle(QLabel):
-    def __init__(self, text: str, parent=None, center: bool = False):
+    def __init__(self, text: str, parent=None, center: bool = False, alt: bool = False):
+        """``alt`` picks the theme's secondary title colour (BU129)."""
         super().__init__(text, parent)
         self.setObjectName("PixelSectionTitle")
         self.setAlignment(Qt.AlignCenter if center else Qt.AlignLeft)
@@ -195,13 +394,14 @@ class PixelSectionTitle(QLabel):
         font.setLetterSpacing(QFont.AbsoluteSpacing, 2)
         self.setFont(font)
 
+        color = theme.role("section_title_alt" if alt else "section_title")
         self.setStyleSheet(
-            """
-            QLabel#PixelSectionTitle {
-                color: #FFE9A8;
+            f"""
+            QLabel#PixelSectionTitle {{
+                color: {color};
                 background: transparent;
                 border: none;
-            }
+            }}
             """
         )
 
@@ -209,6 +409,46 @@ class PixelSectionTitle(QLabel):
 # =========================
 # Buttons
 # =========================
+
+# Accent variants a theme can give a button through its ``accent`` property
+# (BU129). Classic has none, so the property changes nothing there.
+_ACCENT_BUTTON_QSS = {
+    theme.SYNTHWAVE: """
+    QPushButton#PixelButton[accent="primary"] {
+        color: #FFF8FF;
+        background: #6E0258;
+        border: 2px solid #E0149F;
+    }
+    QPushButton#PixelButton[accent="primary"]:hover {
+        background: #850A6C;
+    }
+    QPushButton#PixelButton[accent="primary"]:pressed {
+        background: #52003F;
+    }
+    """,
+}
+
+_ACCENT_TOOL_QSS = {
+    theme.SYNTHWAVE: """
+    QToolButton#PixelToolButton[accent="menu"] {
+        background: #321054;
+        border-color: #8A2A9A;
+    }
+    QToolButton#PixelToolButton[accent="menu"]:hover {
+        background: #43186E;
+        border-color: #C040C8;
+    }
+    """,
+}
+
+
+def set_accent(widget: QWidget, accent: str):
+    """Give a PixelButton / PixelToolButton one of the theme's accent looks."""
+    widget.setProperty("accent", accent)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
+
 
 class PixelButton(QPushButton):
     """
@@ -235,7 +475,7 @@ class PixelButton(QPushButton):
         self.setStyleSheet(
             """
             QPushButton#PixelButton {
-                color: #FFF0BF;
+                color: __BUTTON_TEXT__;
                 background: #274F9B;
                 border: 2px solid #3A67C7;
                 border-radius: 7px;
@@ -267,7 +507,8 @@ class PixelButton(QPushButton):
                 background: #18336F;
                 border: 2px solid #284B94;
             }
-            """
+            """.replace("__BUTTON_TEXT__", theme.role("button_text"))
+            + _ACCENT_BUTTON_QSS.get(theme.active(), "")
         )
 
 
@@ -288,10 +529,17 @@ class PixelToolButton(QToolButton):
         size = QSize(34, 34) if compact else QSize(52, 52)
         icon_size = QSize(18, 18) if compact else QSize(28, 28)
         border_width = 1 if compact else 2
+        if not theme.is_classic():
+            border_width = 2  # the neon border has to read at a glance
+        tool_border = theme.role("tool_border")
         radius = 6 if compact else 7
         padding = 4 if compact else 6
 
-        self.setMinimumSize(size)
+        if compact:
+            # Pin compact buttons so every toolbar button renders the same size.
+            self.setFixedSize(size)
+        else:
+            self.setMinimumSize(size)
         self.setIconSize(icon_size)
         self.setObjectName("PixelToolButton")
 
@@ -305,7 +553,7 @@ class PixelToolButton(QToolButton):
             QToolButton#PixelToolButton {{
                 color: #FFF0BF;
                 background: #274F9B;
-                border: {border_width}px solid #3A67C7;
+                border: {border_width}px solid {tool_border};
                 border-radius: {radius}px;
                 padding: {padding}px;
             }}
@@ -325,6 +573,7 @@ class PixelToolButton(QToolButton):
                 border: 2px solid #284B94;
             }}
             """
+            + _ACCENT_TOOL_QSS.get(theme.active(), "")
         )
 
 
@@ -352,14 +601,33 @@ class PixelBubble(QWidget):
         tail: str = "left",
         max_width: int = 520,
         parent=None,
+        segmented: bool = False,
     ):
+        """
+        Args:
+            segmented: keep each appended chunk as its own label inside the
+                bubble instead of merging it into one body (BU113 follow-up).
+                A grouped bubble can hold a minute of speech, and the chunk -
+                not the bubble - is what the user selects and asks about, so
+                each one has to be a widget that can be hit-tested and
+                highlighted on its own. The labels are siblings in this
+                widget's single top-level layout, which is the arrangement
+                Qt's word-wrap height propagation handles (see the layout
+                comment below); they are not a nested layout.
+        """
         super().__init__(parent)
         self.variant = variant
         self.tail = tail
         self.cut = 7
         self.tail_size = 13
         self._highlighted = False
+        self._selected = False
         self._match_terms = []
+        self._segmented = segmented
+        self._segments = []
+        self._segment_texts = []
+        self._max_width = max_width
+        self._fill_width = False  # set_max_width() turns this on
 
         self.setAttribute(Qt.WA_StyledBackground, False)
         self.setAutoFillBackground(False)
@@ -370,7 +638,7 @@ class PixelBubble(QWidget):
         footer_text = footer_match.group(1) if footer_match else None
         self._body_text = body_text
 
-        text_color = "#071846" if variant == "cream" else "#FFF0BF"
+        text_color = "#071846" if variant == "cream" else theme.role("bubble_blue_text")
 
         self.label = QLabel(simple_markdown_to_html(body_text))
         self.label.setWordWrap(True)
@@ -397,6 +665,11 @@ class PixelBubble(QWidget):
 
         self.footer_label = None
         if footer_text:
+            # Scope attribution ("— via Specific Session — Session X") reads as
+            # a quiet source tag under a hairline: "via Specific Session · Session X".
+            is_scope = footer_text.startswith("— via ")
+            if is_scope:
+                footer_text = footer_text[2:].replace(" — ", " · ")
             self.footer_label = QLabel(footer_text)
             self.footer_label.setWordWrap(True)
             self.footer_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -406,12 +679,27 @@ class PixelBubble(QWidget):
             footer_font = QFont("Courier New")
             footer_font.setPointSize(9)
             footer_font.setBold(False)
-            footer_font.setItalic(True)
+            footer_font.setItalic(not is_scope)
             self.footer_label.setFont(footer_font)
 
             footer_color = "#5B6A94" if variant == "cream" else "#93A2CE"
-            self.footer_label.setStyleSheet(
-                f"""
+            # Size lives in the stylesheet: the app-wide QWidget font-size rule
+            # overrides setFont().
+            if is_scope:
+                rule_color = "rgba(91, 106, 148, 0.35)" if variant == "cream" else "rgba(147, 162, 206, 0.30)"
+                footer_qss = f"""
+                QLabel {{
+                    color: {footer_color};
+                    background: transparent;
+                    border: none;
+                    border-top: 1px solid {rule_color};
+                    padding: 6px 6px 0px 0px;
+                    font-size: 11px;
+                    font-style: normal;
+                }}
+                """
+            else:
+                footer_qss = f"""
                 QLabel {{
                     color: {footer_color};
                     background: transparent;
@@ -419,7 +707,7 @@ class PixelBubble(QWidget):
                     padding-right: 6px;
                 }}
                 """
-            )
+            self.footer_label.setStyleSheet(footer_qss)
 
         # A single top-level layout directly on the widget - no layout nested
         # inside another - is the one case Qt's word-wrap heightForWidth
@@ -434,6 +722,48 @@ class PixelBubble(QWidget):
         layout.addWidget(self.label)
         if self.footer_label:
             layout.addWidget(self.footer_label)
+        self._layout = layout
+
+        if self._segmented:
+            self._segments.append(self.label)
+            self._segment_texts.append(body_text)
+            self._style_segment(self.label, selected=False)
+
+    def set_max_width(self, max_width: int):
+        """Let the bubble's text fill up to ``max_width``, e.g. to follow a
+        resizable window.
+
+        A word-wrapped QLabel's size hint is Qt's own narrow guess, and the
+        bubble's Maximum size policy treats that hint as a ceiling, so raising
+        the maximum alone never widens anything. Each label also gets a
+        minimum width: its text's single-line width, capped at ``max_width``.
+        Long text then fills the space, while short text keeps a snug bubble.
+        """
+        self._max_width = int(max_width)
+        self._fill_width = True
+        for label, text in self._width_labels():
+            self._fit_label_width(label, text)
+        self.updateGeometry()
+
+    def _width_labels(self):
+        if self._segmented:
+            pairs = list(zip(self._segments, self._segment_texts))
+        else:
+            pairs = [(self.label, self._body_text)]
+        if self.footer_label:
+            pairs.append((self.footer_label, self.footer_label.text()))
+        return pairs
+
+    def _fit_label_width(self, label: QLabel, text: str):
+        label.setMaximumWidth(self._max_width)
+        if not self._fill_width:
+            return
+        metrics = label.fontMetrics()
+        natural = max((metrics.horizontalAdvance(line) for line in text.splitlines()),
+                      default=0)
+        # Room for the label's 6px right padding plus a little slack, so the
+        # measured line doesn't wrap its last word.
+        label.setMinimumWidth(min(natural + 16, self._max_width))
 
     def set_highlighted(self, value: bool):
         value = bool(value)
@@ -441,6 +771,20 @@ class PixelBubble(QWidget):
             return
         self._highlighted = value
         self.update()
+
+    def set_selected(self, value: bool):
+        """Mark this bubble as part of the user's selection (BU113)."""
+        value = bool(value)
+        if value == self._selected:
+            return
+        self._selected = value
+        self.update()
+
+    def is_selected(self) -> bool:
+        return self._selected
+
+    def is_highlighted(self) -> bool:
+        return self._highlighted
 
     def set_match_terms(self, terms):
         """Wrap every occurrence of ``terms`` inside the bubble's own text in
@@ -451,14 +795,13 @@ class PixelBubble(QWidget):
         if terms == self._match_terms:
             return
         self._match_terms = terms
-        if terms:
-            # Pick the pair that contrasts with *this* bubble's own fill.
-            bg, fg = FIND_TERM_ON_CREAM if self.variant == "cream" else FIND_TERM_ON_BLUE
-            self.label.setTextFormat(Qt.RichText)
-            self.label.setText(highlight_terms_html(self._body_text, terms, bg, fg))
-        else:
-            self.label.setTextFormat(Qt.RichText)
-            self.label.setText(simple_markdown_to_html(self._body_text))
+        if self._segmented:
+            # Every chunk re-renders: a match can be in any of them, and they
+            # are separate labels with separate text.
+            for label, text in zip(self._segments, self._segment_texts):
+                self._render_label(label, text)
+            return
+        self._render_label(self.label, self._body_text)
 
     def append_text(self, text: str):
         """Grow this bubble's body with more text (BU103 grouped live
@@ -467,16 +810,130 @@ class PixelBubble(QWidget):
 
         Each appended chunk starts its own paragraph (a blank line) rather
         than running on from a single space, so a viewer can tell where the
-        newly-arrived text starts inside a bubble that keeps growing.
+        newly-arrived text starts inside a bubble that keeps growing. In a
+        ``segmented`` bubble it becomes its own label instead, so the chunk
+        can be selected on its own.
         """
         self._body_text = f"{self._body_text}\n\n{text}"
+
+        if self._segmented:
+            self._segment_texts.append(text)
+            label = self._new_segment_label(text)
+            # Before the footer, if this bubble has one.
+            self._layout.insertWidget(len(self._segments), label)
+            self._segments.append(label)
+            self._fit_label_width(label, text)
+            return
+
+        self._render_label(self.label, self._body_text)
+        self._fit_label_width(self.label, self._body_text)
+
+    def _new_segment_label(self, text: str) -> QLabel:
+        label = QLabel()
+        label.setWordWrap(True)
+        label.setMaximumWidth(self._max_width)
+        label.setTextFormat(Qt.RichText)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        font = QFont("Courier New")
+        font.setPointSize(12)
+        font.setBold(False)
+        label.setFont(font)
+
+        self._render_label(label, text)
+        self._style_segment(label, selected=False)
+        return label
+
+    def _render_label(self, label: QLabel, text: str):
+        """Put ``text`` in ``label``, honouring any active find terms."""
+        label.setTextFormat(Qt.RichText)
         if self._match_terms:
             bg, fg = FIND_TERM_ON_CREAM if self.variant == "cream" else FIND_TERM_ON_BLUE
-            self.label.setTextFormat(Qt.RichText)
-            self.label.setText(highlight_terms_html(self._body_text, self._match_terms, bg, fg))
+            label.setText(highlight_terms_html(text, self._match_terms, bg, fg))
         else:
-            self.label.setTextFormat(Qt.RichText)
-            self.label.setText(simple_markdown_to_html(self._body_text))
+            label.setText(simple_markdown_to_html(text))
+
+    def _style_segment(self, label: QLabel, selected: bool):
+        text_color = "#071846" if self.variant == "cream" else theme.role("bubble_blue_text")
+        if selected:
+            fill = (SEGMENT_SELECTED_ON_CREAM if self.variant == "cream"
+                    else SEGMENT_SELECTED_ON_BLUE)
+            # A fill plus a cyan left edge: the fill is what reads at a glance,
+            # the edge is what the two variants have in common so a mixed
+            # selection still scans as one thing.
+            label.setStyleSheet(
+                f"""
+                QLabel {{
+                    color: {text_color};
+                    background: {fill};
+                    border: none;
+                    border-left: 3px solid {SELECTED_BORDER.name()};
+                    padding: 2px 6px 2px 5px;
+                }}
+                """
+            )
+        else:
+            label.setStyleSheet(
+                f"""
+                QLabel {{
+                    color: {text_color};
+                    background: transparent;
+                    border: none;
+                    border-left: 3px solid transparent;
+                    padding: 2px 6px 2px 5px;
+                }}
+                """
+            )
+
+    # --- segments (BU113 follow-up) --------------------------------------
+
+    @property
+    def segment_count(self) -> int:
+        return len(self._segments) if self._segmented else 0
+
+    def segment_texts(self) -> list:
+        return list(self._segment_texts)
+
+    def set_segment_selected(self, index: int, selected: bool):
+        """Highlight one chunk inside this bubble."""
+        if not self._segmented or not (0 <= index < len(self._segments)):
+            return
+        self._style_segment(self._segments[index], bool(selected))
+
+    def segment_at(self, pos) -> int:
+        """Index of the chunk under ``pos`` (this widget's coordinates).
+
+        Returns the nearest segment vertically rather than -1 when the point
+        falls in the padding between two of them, so a drag through a bubble
+        never stalls on a gap.
+        """
+        if not self._segmented or not self._segments:
+            return -1
+        y = pos.y()
+        best, best_distance = -1, None
+        for index, label in enumerate(self._segments):
+            top = label.y()
+            bottom = top + label.height()
+            if top <= y <= bottom:
+                return index
+            distance = top - y if y < top else y - bottom
+            if best_distance is None or distance < best_distance:
+                best, best_distance = index, distance
+        return best
+
+    def segment_index_of(self, widget) -> int:
+        """Index of the segment that is (or contains) ``widget``, else -1."""
+        if not self._segmented:
+            return -1
+        node = widget
+        while node is not None:
+            for index, label in enumerate(self._segments):
+                if node is label:
+                    return index
+            if node is self:
+                break
+            node = node.parent()
+        return -1
 
     def _bubble_path(self) -> QPainterPath:
         rect = self.rect().adjusted(1, 1, -3, -3)
@@ -516,6 +973,13 @@ class PixelBubble(QWidget):
         pen_width = 2
         if self._highlighted:
             border = CREAM_BORDER
+            pen_width = 3
+
+        # Selection outranks the find highlight on the border: both are
+        # transient, but only one of them is something the user is holding, and
+        # a match inside a selected bubble still shows through its term chip.
+        if self._selected:
+            border = SELECTED_BORDER
             pen_width = 3
 
         path = self._bubble_path()
@@ -678,7 +1142,8 @@ class PixelScopePrompt(QWidget):
         super().paintEvent(event)
 
 
-def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_width: int = 520) -> QWidget:
+def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_width: int = 520,
+                   segmented: bool = False) -> QWidget:
     """
     Retorna una fila con burbuja alineada.
     MainWindow ya usa esta función para chat y transcripts.
@@ -692,7 +1157,8 @@ def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_wi
     layout.setSpacing(0)
 
     tail = "right" if align == "right" else "left"
-    bubble = PixelBubble(text=text, variant=variant, tail=tail, max_width=max_width)
+    bubble = PixelBubble(text=text, variant=variant, tail=tail, max_width=max_width,
+                         segmented=segmented)
 
     if align == "right":
         layout.addStretch(1)
@@ -710,6 +1176,7 @@ def aligned_bubble_with_time(
     align: str = "left",
     max_width: int = 520,
     time_text: str = "",
+    segmented: bool = False,
 ) -> QWidget:
     """Like ``aligned_bubble``, but with a small muted timestamp placed
     *above* the bubble (BU104) instead of buried at the end of its text -
@@ -746,7 +1213,8 @@ def aligned_bubble_with_time(
             time_row.addStretch(1)
         outer.addLayout(time_row)
 
-    outer.addWidget(aligned_bubble(text, variant=variant, align=align, max_width=max_width))
+    outer.addWidget(aligned_bubble(text, variant=variant, align=align, max_width=max_width,
+                                   segmented=segmented))
     return container
 
 
@@ -985,7 +1453,7 @@ _HEADER_DECORATION_RE = re.compile(
 _NUMBERED_LINE_RE = re.compile(r"^\s*(\d{1,2})\s*[.)]\s+(.*)$")
 _BULLET_LINE_RE = re.compile(r"^\s*[-*•]\s+(.*)$")
 _FIELD_LINE_RE = re.compile(
-    r"^\s*\*{0,2}(Title|Description|Due date|Due|Deadline|Responsible|Owner|Assignee|Status)"
+    r"^\s*\*{0,2}(Title|Description|Calendar date|Due date|Due|Deadline|Responsible|Owner|Assignee|Status)"
     r"\*{0,2}\s*:\s*(.*)$",
     re.IGNORECASE,
 )
@@ -1100,7 +1568,11 @@ def format_summary_body_html(body: str) -> str:
         if field:
             flush()
             label, value = field.group(1), field.group(2).strip()
-            if label.lower() == "title":
+            if label.lower() == "calendar date":
+                # Machine-readable copy of the Due date line (BU129), for the
+                # app only. The empty template also swallows wrapped lines.
+                pending = ("", [value])
+            elif label.lower() == "title":
                 if not first_card:
                     parts.append('<hr width="100%">')
                 first_card = False
@@ -1250,7 +1722,9 @@ class PixelCollapsibleSection(QWidget):
 
     toggled = Signal(bool)
 
-    def __init__(self, title: str, body: str, parent=None):
+    def __init__(self, title: str, body: str, parent=None, body_widget: QWidget = None):
+        """``body_widget`` replaces the rich-text body (the Due Dates cards,
+        BU133); the header count still comes from ``body``."""
         super().__init__(parent)
         self.section_title = title
         self._expanded = True
@@ -1259,7 +1733,8 @@ class PixelCollapsibleSection(QWidget):
         self.header.clicked.connect(self.toggle)
 
         self.body_panel = PixelPanel(inner=True)
-        self.body_label = QLabel(format_summary_body_html(body))
+        self.body_widget = body_widget
+        self.body_label = QLabel(theme.remap(format_summary_body_html(body)))
         self.body_label.setTextFormat(Qt.RichText)
         self.body_label.setWordWrap(True)
         # Paragraphs read left-aligned; the block as a whole sits centred in the
@@ -1272,8 +1747,12 @@ class PixelCollapsibleSection(QWidget):
         body_layout = QVBoxLayout(self.body_panel)
         body_layout.setContentsMargins(16, 12, 16, 12)
         body_layout.setSpacing(0)
-        body_layout.addWidget(self.body_label)
-        body_layout.setAlignment(self.body_label, Qt.AlignVCenter)
+        if body_widget is not None:
+            self.body_label.hide()
+            body_layout.addWidget(body_widget)
+        else:
+            body_layout.addWidget(self.body_label)
+            body_layout.setAlignment(self.body_label, Qt.AlignVCenter)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1294,6 +1773,8 @@ class PixelCollapsibleSection(QWidget):
         return super().eventFilter(obj, event)
 
     def _fit_body_height(self):
+        if self.body_widget is not None:
+            return
         label = self.body_label
         width = label.width()
         if width <= 0:
@@ -1331,7 +1812,7 @@ class PixelCollapsibleSection(QWidget):
         count = count_summary_items(body)
         self.header.count.setText(str(count))
         self.header.count.setVisible(count > 0)
-        html = format_summary_body_html(body)
+        html = theme.remap(format_summary_body_html(body))
         if match_marks:
             bg, fg = FIND_TERM_ON_BLUE
             start, end = match_marks
@@ -1350,6 +1831,8 @@ class PixelCollapsibleSection(QWidget):
             "QLabel { color: #FFF0BF; background: transparent; border: none;"
             f" font-family: 'Courier New'; font-size: {max(8.0, 10.5 * scale):.1f}pt; }}"
         )
+        if self.body_widget is not None:
+            self.body_widget.set_scale(scale)
         pad = max(8, round(12 * scale))
         self.body_panel.layout().setContentsMargins(pad + 4, pad, pad + 4, pad)
         self._fit_body_height()
@@ -1358,13 +1841,192 @@ class PixelCollapsibleSection(QWidget):
 
 
 # =========================
+# Due Dates cards (BU133)
+# =========================
+
+class _FittedLabel(QLabel):
+    """Word-wrapped rich-text label that keeps the height its text needs at
+    the width it got (same fix as PixelCollapsibleSection._fit_body_height)."""
+
+    def __init__(self, html: str = "", parent=None):
+        super().__init__(html, parent)
+        self.setTextFormat(Qt.RichText)
+        self.setWordWrap(True)
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+
+    def fit(self):
+        width = self.width()
+        if width <= 0:
+            return
+        previous = self.minimumHeight()
+        self.setMinimumHeight(0)
+        needed = self.heightForWidth(width)
+        self.setMinimumHeight(needed if needed > 0 else previous)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit()
+
+
+_DUE_BUTTON_QSS = """
+QToolButton {
+    color: #FFF0BF; background: #274F9B; border: 2px solid #3A67C7;
+    border-radius: 5px; padding: 0px 10px;
+    font-family: 'Courier New'; font-size: __PT__pt; font-weight: 700;
+}
+QToolButton:hover { background: #315DB1; }
+QToolButton:pressed { background: #1E3F82; }
+QToolButton:disabled { color: #8090B8; background: #18336F; }
+QToolButton[sent="true"] { color: #071846; background: #F6E0A6; border: 2px solid #FFEFC1; }
+QToolButton[sent="true"]:hover { background: #FFEFC1; }
+"""
+
+
+class PixelDueDateCard(QWidget):
+    """One Due Dates entry: title, due text and description as the rich-text
+    body draws them, with a Send to Calendar button beside the title.
+
+    ``link`` is the stored ``calendar_events`` row, or None. Once sent, the
+    button reads "✓ In Calendar" and opens a menu instead.
+    """
+
+    send_requested = Signal()    # first send
+    resend_requested = Signal()  # "Send again..." on a sent entry
+
+    SEND_TEXT = "Send to Calendar"
+    SENT_TEXT = "✓ In Calendar"
+
+    def __init__(self, entry, link=None, parent=None):
+        super().__init__(parent)
+        self.entry = entry
+        self.link = None
+        self._busy_text = None
+
+        title = escape_with_markdown_bold(entry.title or "Untitled")
+        self.title_label = _FittedLabel(theme.remap(f'<b style="color:#FFE9A8;">{title}</b>'))
+        self.button = QToolButton()
+        self.button.setCursor(Qt.PointingHandCursor)
+        self.button.clicked.connect(self._on_clicked)
+
+        rows = []
+        for label, value in (("Due date", entry.due_text), ("Description", entry.description)):
+            if value:
+                rows.append(
+                    f'<div style="margin:0 0 2px 0;"><span style="color:#8EA7D8;">{label}:</span> '
+                    f'{escape_with_markdown_bold(value)}</div>'
+                )
+        self.detail_label = _FittedLabel(theme.remap("".join(rows)))
+        self.detail_label.setVisible(bool(rows))
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(12)
+        top.addWidget(self.title_label, 1, Qt.AlignVCenter)
+        top.addWidget(self.button, 0, Qt.AlignTop)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(4)
+        layout.addLayout(top)
+        layout.addWidget(self.detail_label)
+        self.set_link(link)
+        self.set_scale(1.0)
+
+    def is_sent(self) -> bool:
+        return self.link is not None
+
+    def set_link(self, link):
+        self.link = link
+        self._refresh_button()
+
+    def set_busy(self, text=None):
+        """Show ``text`` on a disabled button (e.g. "Checking..."); None restores it."""
+        self._busy_text = text
+        self._refresh_button()
+
+    def _refresh_button(self):
+        if self._busy_text:
+            self.button.setText(self._busy_text)
+        else:
+            self.button.setText(self.SENT_TEXT if self.is_sent() else self.SEND_TEXT)
+        self.button.setEnabled(not self._busy_text)
+        self.button.setProperty("sent", "true" if self.is_sent() and not self._busy_text else "false")
+        self.button.setToolTip(
+            "This due date is in your Google Calendar" if self.is_sent()
+            else "Create a Google Calendar event for this due date"
+        )
+        self.button.style().unpolish(self.button)
+        self.button.style().polish(self.button)
+
+    def sent_menu(self):
+        """The menu a sent card's button opens."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        html_link = (self.link or {}).get("html_link") or ""
+        open_action = menu.addAction("Open in Google Calendar")
+        open_action.setEnabled(bool(html_link))
+        open_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(html_link)))
+        menu.addAction("Send again…").triggered.connect(self.resend_requested.emit)
+        return menu
+
+    def _on_clicked(self):
+        if not self.is_sent():
+            self.send_requested.emit()
+            return
+        menu = self.sent_menu()
+        menu.exec(self.button.mapToGlobal(self.button.rect().bottomLeft()))
+        menu.deleteLater()
+
+    def set_scale(self, scale: float):
+        text_qss = (
+            "QLabel { color: #FFF0BF; background: transparent; border: none;"
+            f" font-family: 'Courier New'; font-size: {max(8.0, 10.5 * scale):.1f}pt; }}"
+        )
+        self.title_label.setStyleSheet(text_qss)
+        self.detail_label.setStyleSheet(text_qss)
+        pt = max(7.5, 9.5 * scale)
+        self.button.setStyleSheet(_DUE_BUTTON_QSS.replace("__PT__", f"{pt:.1f}"))
+        self.button.setFixedHeight(max(26, round(30 * scale)))
+        self.button.setMinimumWidth(round(170 * scale))
+        self.title_label.fit()
+        self.detail_label.fit()
+
+
+class PixelDueDateList(QWidget):
+    """The Due Dates section body: one :class:`PixelDueDateCard` per entry,
+    separated by a rule like the one the rich-text body draws between entries."""
+
+    def __init__(self, cards, parent=None):
+        super().__init__(parent)
+        self.cards = list(cards)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        for index, card in enumerate(self.cards):
+            if index:
+                rule = QWidget()
+                rule.setAttribute(Qt.WA_StyledBackground, True)
+                rule.setFixedHeight(2)
+                rule.setStyleSheet("QWidget { background: #254D9C; }")
+                layout.addWidget(rule)
+            layout.addWidget(card)
+
+    def set_scale(self, scale: float):
+        for card in self.cards:
+            card.set_scale(scale)
+
+
+# =========================
 # All Sessions browser (BU102)
 # =========================
 
-LIVE_RED = QColor("#FF6B5E")
-PAUSED_AMBER = QColor("#F2B84B")
-CARD_FILL_HOVER = QColor("#0B2762")
-CARD_FILL_SELECTED = QColor("#12306E")
+LIVE_RED = theme.qcolor("#FF6B5E")
+PAUSED_AMBER = theme.qcolor("#F2B84B")
+CARD_FILL_HOVER = theme.qcolor("#0B2762")
+CARD_FILL_SELECTED = theme.qcolor("#12306E")
 
 
 def _label_qss(color: str, pt: float, bold: bool = False, extra: str = "") -> str:
@@ -1485,8 +2147,12 @@ class PixelStatusChip(QLabel):
             self.setToolTip(text or self._label)
 
 
-def pixel_filter_chip(text: str) -> QToolButton:
-    """Checkable pixel pill used as one option of a segmented filter."""
+def pixel_filter_chip(text: str, compact: bool = False) -> QToolButton:
+    """Checkable pixel pill used as one option of a segmented filter.
+
+    ``compact`` trims the side padding, for rows that decide how narrow a
+    window can get.
+    """
     btn = QToolButton()
     btn.setText(text)
     btn.setCheckable(True)
@@ -1500,7 +2166,8 @@ def pixel_filter_chip(text: str) -> QToolButton:
             background: #274F9B;
             border: 2px solid #3A67C7;
             border-radius: 6px;
-            padding: 4px 12px;
+            padding: 4px %dpx;"""
+        % (7 if compact else 12) + """
             font-family: 'Courier New';
             font-size: 9pt;
             font-weight: 700;
@@ -1583,7 +2250,13 @@ class PixelShotsChip(QWidget):
         count = max(0, int(count or 0))
         self.count_label.setText(str(count))
         self.setToolTip(f"{count} screenshot{'s' if count != 1 else ''}")
-        self.setVisible(count > 0)
+        # Showing a chip that has no parent yet would open it as a top-level
+        # window (and PixelWindowChrome would give it a title bar); unhidden,
+        # it simply appears with the card it is placed in.
+        if count <= 0:
+            self.hide()
+        elif self.parentWidget() is not None:
+            self.show()
 
 
 class PixelSessionCard(QWidget):
@@ -1793,3 +2466,989 @@ class PixelSessionCard(QWidget):
         painter.drawRect(rect.x() + 8, rect.y() + 12, 4, max(0, rect.height() - 24))
 
         super().paintEvent(event)
+
+
+class PixelAnswerCard(QWidget):
+    """One answer in the detached window's left rail (BU113).
+
+    A card owns its own lifecycle: it is posted in the ``pending`` state as
+    soon as the user asks, then either fills with the answer or shows a failure
+    with a Retry. The card never talks to the assistant itself - MainWindow
+    drives it through ``set_answer`` / ``set_error`` and listens to the three
+    signals.
+    """
+
+    retry_requested = Signal()
+    dismiss_requested = Signal()
+    timestamp_clicked = Signal()
+
+    def __init__(self, question: str, time_range: str, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setObjectName("PixelAnswerCard")
+        self.setStyleSheet(
+            """
+            QWidget#PixelAnswerCard {
+                background: #0B2A6B;
+                border: 2px solid #3A67C7;
+            }
+            """
+        )
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+
+        self.time_button = QToolButton()
+        self.time_button.setText(time_range or "--:--:--")
+        self.time_button.setCursor(Qt.PointingHandCursor)
+        self.time_button.setToolTip("Scroll the transcript to these chunks")
+        time_font = QFont("Courier New")
+        time_font.setPointSize(9)
+        time_font.setBold(True)
+        time_font.setLetterSpacing(QFont.AbsoluteSpacing, 1)
+        self.time_button.setFont(time_font)
+        self.time_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #7FD4FF;
+                background: transparent;
+                border: none;
+                padding: 0px;
+                text-align: left;
+            }
+            QToolButton:hover { color: #BFE9FF; }
+            """
+        )
+        self.time_button.clicked.connect(self.timestamp_clicked)
+        header.addWidget(self.time_button, 0)
+        header.addStretch(1)
+
+        self.retry_button = pixel_mini_button("\u21BB", "Ask again", width=28, height=24)
+        self.retry_button.clicked.connect(self.retry_requested)
+        self.retry_button.hide()
+        header.addWidget(self.retry_button, 0)
+
+        self.dismiss_button = pixel_mini_button("\u2715", "Dismiss", width=28, height=24)
+        self.dismiss_button.clicked.connect(self.dismiss_requested)
+        header.addWidget(self.dismiss_button, 0)
+        layout.addLayout(header)
+
+        self.question_label = QLabel(question)
+        self.question_label.setWordWrap(True)
+        self.question_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.question_label.setStyleSheet(
+            _label_qss("#FFE9A8", 9, bold=True, extra="background: transparent;")
+        )
+        layout.addWidget(self.question_label)
+
+        self.body_label = QLabel("Thinking...")
+        self.body_label.setWordWrap(True)
+        self.body_label.setTextFormat(Qt.RichText)
+        self.body_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse
+        )
+        self.body_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        # BU116: answers are now one or two sentences. The card takes the
+        # height its text needs and no more, instead of holding a paragraph's
+        # worth of room open under a single line.
+        self.body_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.body_label.setStyleSheet(
+            _label_qss("#D8E3FF", 10, extra="background: transparent;")
+        )
+        layout.addWidget(self.body_label)
+
+    def set_answer(self, html: str):
+        """Fill the card with the rendered answer."""
+        self.retry_button.hide()
+        self.body_label.setStyleSheet(
+            _label_qss("#D8E3FF", 10, extra="background: transparent;")
+        )
+        self.body_label.setText(html)
+
+    def set_error(self, message: str):
+        """Show a failure the user can retry from."""
+        self.retry_button.show()
+        self.body_label.setStyleSheet(
+            _label_qss("#FFB4A8", 10, extra="background: transparent;")
+        )
+        self.body_label.setText(html_escape.escape(message))
+
+    def set_time_range(self, time_range: str):
+        self.time_button.setText(time_range or "--:--:--")
+
+
+class PixelCandidateCard(QWidget):
+    """A detected question waiting on the user, in the answers rail (BU115).
+
+    The second card kind in that rail. It shows what the detector heard and
+    offers one click to answer it; ``to_answer_card_fields`` hands MainWindow
+    what it needs to replace this card with a real ``PixelAnswerCard`` in
+    place. Deliberately does not answer anything itself.
+    """
+
+    answer_requested = Signal()
+    dismiss_requested = Signal()
+    timestamp_clicked = Signal()
+
+    _KIND_COLORS = {
+        "genuine": "#8FE39B",
+        "request": "#FFE9A8",
+        "rhetorical": "#8EA7D8",
+        "discourse": "#8EA7D8",
+    }
+
+    def __init__(self, question: str, time_text: str, asker: str, kind: str,
+                 parent=None):
+        super().__init__(parent)
+        self.question_text = question
+        self.time_text = time_text
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setObjectName("PixelCandidateCard")
+        # A dashed border, against the answer card's solid one: this is a
+        # suggestion the user has not acted on yet, and it should not look like
+        # something that already happened.
+        self.setStyleSheet(
+            """
+            QWidget#PixelCandidateCard {
+                background: #0A2359;
+                border: 2px dashed #4A78D8;
+            }
+            """
+        )
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+
+        self.time_button = QToolButton()
+        self.time_button.setText(time_text or "--:--:--")
+        self.time_button.setCursor(Qt.PointingHandCursor)
+        self.time_button.setToolTip("Scroll the transcript to these chunks")
+        time_font = QFont("Courier New")
+        time_font.setPointSize(9)
+        time_font.setBold(True)
+        time_font.setLetterSpacing(QFont.AbsoluteSpacing, 1)
+        self.time_button.setFont(time_font)
+        self.time_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #7FD4FF;
+                background: transparent;
+                border: none;
+                padding: 0px;
+                text-align: left;
+            }
+            QToolButton:hover { color: #BFE9FF; }
+            """
+        )
+        self.time_button.clicked.connect(self.timestamp_clicked)
+        header.addWidget(self.time_button, 0)
+
+        self.meta_label = QLabel(f"{asker}  ·  {kind}")
+        self.meta_label.setStyleSheet(_label_qss(
+            self._KIND_COLORS.get(kind, "#8EA7D8"), 8, bold=True,
+            extra="background: transparent;",
+        ))
+        header.addWidget(self.meta_label, 0)
+        header.addStretch(1)
+
+        self.dismiss_button = pixel_mini_button("\u2715", "Dismiss", width=28, height=24)
+        self.dismiss_button.clicked.connect(self.dismiss_requested)
+        header.addWidget(self.dismiss_button, 0)
+        layout.addLayout(header)
+
+        self.question_label = QLabel(question)
+        self.question_label.setWordWrap(True)
+        self.question_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.question_label.setStyleSheet(
+            _label_qss("#FFF0BF", 10, extra="background: transparent;")
+        )
+        layout.addWidget(self.question_label)
+
+        self.answer_button = PixelButton("Answer")
+        self.answer_button.setMinimumHeight(30)
+        self.answer_button.clicked.connect(self.answer_requested)
+        layout.addWidget(self.answer_button)
+
+
+def pixel_spend_chip(text: str) -> QLabel:
+    """Detector calls and estimated spend for this session (BU115)."""
+    label = QLabel(text)
+    label.setAlignment(Qt.AlignCenter)
+    label.setStyleSheet(_label_qss(
+        "#8EA7D8", 8, bold=True,
+        extra="background: #10306E; border: 1px solid #3A5C9E;"
+              " border-radius: 4px; padding: 3px 8px;",
+    ))
+    label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    return label
+
+
+class PixelReferenceChip(QWidget):
+    """The attached reference document, in the answers rail header (BU117).
+
+    Names the document and how big it is, because "a file is attached" is not
+    the fact the user needs - "*that* file is attached" is. Clicking the name
+    replaces the document; the X detaches it. Hidden entirely when nothing is
+    attached, rather than sitting there as an empty placeholder.
+    """
+
+    replace_requested = Signal()
+    remove_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PixelReferenceChip")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QWidget#PixelReferenceChip { background: #123A1E;"
+            " border: 1px solid #4E9A63; border-radius: 4px; }"
+        )
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 2, 4, 2)
+        layout.setSpacing(6)
+
+        self.name_button = QToolButton()
+        self.name_button.setCursor(Qt.PointingHandCursor)
+        self.name_button.setToolTip("Click to attach a different document")
+        self.name_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #A8E3B4;
+                background: transparent;
+                border: none;
+                padding: 2px 0px;
+                font-family: 'Courier New';
+                font-size: 8pt;
+                font-weight: 700;
+            }
+            QToolButton:hover { color: #D6F5DD; }
+            """
+        )
+        self.name_button.clicked.connect(self.replace_requested)
+        layout.addWidget(self.name_button, 0)
+
+        self.remove_button = pixel_mini_button(
+            "✕", "Detach this document", width=20, height=18
+        )
+        self.remove_button.clicked.connect(self.remove_requested)
+        layout.addWidget(self.remove_button, 0)
+
+        self.hide()
+
+    def set_document(self, name: str, size_label: str):
+        self.name_button.setText(f"{name} · {size_label}")
+        self.show()
+
+    def clear_document(self):
+        self.name_button.setText("")
+        self.hide()
+
+
+class PixelDropOverlay(QWidget):
+    """The themed affordance shown while a file is dragged over the window.
+
+    Qt's own drag highlight is a thin system-coloured rectangle that looks
+    like nothing else in this app, and it says only "something is being
+    dragged" - not whether *this* file will be taken. This one says which, in
+    the pixel vocabulary, and in two states: accepting (gold) and refusing
+    (red), so a dropped .pdf is turned away visibly instead of silently.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._text = ""
+        self._accepting = True
+        self.hide()
+
+    def show_state(self, text: str, accepting: bool = True):
+        self._text = text
+        self._accepting = accepting
+        self.show()
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        rect = self.rect().adjusted(8, 8, -9, -9)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        border = theme.qcolor("#F6E0A6") if self._accepting else theme.qcolor("#FF8B7A")
+        fill = QColor(7, 24, 70, 210)
+
+        path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(),
+                                     rect.height(), 10)
+        painter.setBrush(QBrush(fill))
+        pen = QPen(border)
+        pen.setWidth(3)
+        pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+        font = QFont("Courier New")
+        font.setBold(True)
+        font.setPointSize(12)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 2)
+        painter.setFont(font)
+        painter.setPen(QPen(border))
+        painter.drawText(rect, Qt.AlignCenter, self._text)
+
+
+def pixel_group_label(text: str) -> QLabel:
+    """A small caption naming what the chips beside it control (BU116).
+
+    The answers rail now carries two chip groups. Without a name on each, the
+    five chips read as one five-way control.
+    """
+    label = QLabel(text.upper())
+    font = QFont("Courier New")
+    font.setBold(True)
+    font.setPointSize(8)
+    font.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
+    label.setFont(font)
+    label.setStyleSheet(_label_qss("#6D7FB4", 8, bold=True,
+                                   extra="background: transparent;"))
+    label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    return label
+
+
+def pixel_rail_notice(text: str) -> QLabel:
+    """A themed notice in the answers rail - e.g. the detection cap is hit."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setAlignment(Qt.AlignCenter)
+    label.setStyleSheet(_label_qss(
+        "#FFE9A8", 9, bold=True,
+        extra="background: #3A3320; border: 1px solid #B89A4E;"
+              " border-radius: 4px; padding: 8px 10px;",
+    ))
+    label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+    return label
+
+
+# =========================
+# Chat input
+# =========================
+
+class PixelChatInput(QTextEdit):
+    """The assistant's question box: Enter sends, Shift+Enter breaks a line.
+
+    Its scrollbars stay hidden - the bar is only two lines tall, and Qt's
+    scrollbar popped up as a blue block beside the text as soon as a newline
+    overflowed it. Longer text still scrolls with the caret and the wheel.
+    """
+
+    submitted = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
+            event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier)
+        ):
+            # A bare Enter on an empty box does nothing rather than asking
+            # the assistant to complain about a missing question.
+            if self.toPlainText().strip():
+                self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+# =========================
+# Past-conversation cards (sidebar history)
+# =========================
+
+class PixelConversationDelegate(QStyledItemDelegate):
+    """Paints a past-conversation card: a two-line title over a small date.
+
+    The card box itself (fill, border, hover/selected states) still comes from
+    the ``QListWidget::item`` QSS; only the text is drawn here. The title is
+    the item's DisplayRole, the date string its ``DATE_ROLE``.
+    """
+
+    DATE_ROLE = Qt.UserRole + 1
+    TITLE_LINES = 2
+    # Border + padding + margin from QListWidget::item in pixel_theme.py.
+    PAD_X = 12
+    PAD_Y = 11
+    DATE_GAP = 7
+    TITLE_COLOR = theme.qcolor("#FFF0BF")
+    DATE_COLOR = theme.qcolor("#A9BCE6")
+    SELECTED_DATE_COLOR = theme.role_color("date_selected")
+
+    def _fonts(self, option):
+        title_font = QFont(option.font)
+        title_font.setBold(True)
+        date_font = QFont(option.font)
+        date_font.setBold(False)
+        date_font.setPointSizeF(max(6.5, title_font.pointSizeF() - 2.5))
+        return title_font, date_font
+
+    def sizeHint(self, option, index):
+        title_font, date_font = self._fonts(option)
+        title_h = QFontMetrics(title_font).lineSpacing() * self.TITLE_LINES
+        date_h = QFontMetrics(date_font).height()
+        return QSize(0, title_h + self.DATE_GAP + date_h + 2 * self.PAD_Y)
+
+    def _wrap(self, text: str, metrics: QFontMetrics, width: int) -> list:
+        """Word-wrap into at most TITLE_LINES lines, eliding the last one."""
+        words = text.split()
+        lines = []
+        current = ""
+        while words and len(lines) < self.TITLE_LINES - 1:
+            word = words[0]
+            candidate = f"{current} {word}".strip()
+            if metrics.horizontalAdvance(candidate) <= width:
+                current = candidate
+                words.pop(0)
+            elif current:
+                lines.append(current)
+                current = ""
+            else:
+                # A single word wider than the line: let the last line elide it.
+                break
+        if current:
+            lines.append(current)
+        rest = " ".join(words)
+        if rest:
+            if len(lines) >= self.TITLE_LINES:
+                lines[-1] = metrics.elidedText(f"{lines[-1]} {rest}", Qt.ElideRight, width)
+            else:
+                lines.append(metrics.elidedText(rest, Qt.ElideRight, width))
+        return lines
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        title = opt.text
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        title_font, date_font = self._fonts(option)
+        rect = option.rect.adjusted(self.PAD_X, self.PAD_Y, -self.PAD_X, -self.PAD_Y)
+        if rect.width() <= 0:
+            return
+
+        painter.save()
+        title_metrics = QFontMetrics(title_font)
+        painter.setFont(title_font)
+        painter.setPen(self.TITLE_COLOR)
+        y = rect.top()
+        for line in self._wrap(title, title_metrics, rect.width()):
+            painter.drawText(rect.left(), y + title_metrics.ascent(), line)
+            y += title_metrics.lineSpacing()
+
+        date = index.data(self.DATE_ROLE) or ""
+        if date:
+            date_metrics = QFontMetrics(date_font)
+            painter.setFont(date_font)
+            selected = bool(option.state & QStyle.State_Selected)
+            painter.setPen(self.SELECTED_DATE_COLOR if selected else self.DATE_COLOR)
+            date_y = rect.top() + title_metrics.lineSpacing() * self.TITLE_LINES + self.DATE_GAP
+            painter.drawText(
+                rect.left(), date_y + date_metrics.ascent(),
+                date_metrics.elidedText(date, Qt.ElideRight, rect.width()),
+            )
+        painter.restore()
+
+
+# =========================
+# Detached transcripts window (BU112)
+# =========================
+
+def transcript_gap_separator(label: str) -> QWidget:
+    """A break in the transcript stream: a centred label between two rules.
+
+    Inserted when a long silence sits between two bubbles (BU112) so the jump
+    in timestamps reads as a pause in the room rather than as missing
+    transcript.
+    """
+    widget = QWidget()
+    widget.setAttribute(Qt.WA_StyledBackground, False)
+    widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+    layout = QHBoxLayout(widget)
+    layout.setContentsMargins(2, 2, 2, 2)
+    layout.setSpacing(10)
+
+    def _rule():
+        rule = QWidget()
+        rule.setFixedHeight(2)
+        rule.setAttribute(Qt.WA_StyledBackground, True)
+        rule.setStyleSheet("background: #1E3F82;")
+        return rule
+
+    text = QLabel(label.upper())
+    spaced = QFont("Courier New")
+    spaced.setBold(True)
+    spaced.setPointSize(8)
+    spaced.setLetterSpacing(QFont.AbsoluteSpacing, 1.5)
+    text.setFont(spaced)
+    text.setStyleSheet(_label_qss("#7E8FC2", 8, bold=True))
+
+    layout.addWidget(_rule(), 1, Qt.AlignVCenter)
+    layout.addWidget(text, 0)
+    layout.addWidget(_rule(), 1, Qt.AlignVCenter)
+    return widget
+
+
+def pixel_empty_hint(text: str) -> QLabel:
+    """Centred muted hint for a column that is intentionally empty."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setAlignment(Qt.AlignCenter)
+    label.setStyleSheet(
+        _label_qss("#6D7FB4", 9, extra="padding: 18px 14px;")
+    )
+    label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+    return label
+
+
+
+# =========================
+# Frameless window chrome
+# =========================
+
+class PixelWindowButton(QToolButton):
+    """Minimise / maximise / close button for the custom title bar.
+
+    The glyph is painted as chunky pixel blocks instead of a font character
+    so it matches the pixel-art icons. ``kind`` is "min", "max" or "close".
+    """
+
+    # The hit area fills the title bar's height and is wider than the glyph,
+    # so the button is easy to hit without a box drawn around it.
+    WIDTH = 40
+    PX = 2  # one "pixel" of the glyph, in screen pixels
+
+    def __init__(self, kind: str, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.maximized = False
+        self.setFixedSize(self.WIDTH, PixelTitleBar.HEIGHT)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def set_maximized(self, maximized: bool):
+        self.maximized = maximized
+        self.update()
+
+    def _glyph(self):
+        """Cells (col, row) on a 7x7 grid for the current glyph."""
+        if self.kind == "min":
+            return [(c, 5) for c in range(1, 6)] + [(c, 6) for c in range(1, 6)]
+        if self.kind == "close":
+            cells = []
+            for i in range(7):
+                cells += [(i, i), (6 - i, i)]
+            return cells
+        if self.maximized:
+            # Restore: a back box peeking out behind a front box.
+            back = [(c, 0) for c in range(2, 7)] + [(6, r) for r in range(1, 5)] + [(2, 1)]
+            front = ([(c, 2) for c in range(0, 5)] + [(c, 3) for c in range(0, 5)]
+                     + [(c, 6) for c in range(0, 5)]
+                     + [(0, r) for r in range(4, 6)] + [(4, r) for r in range(4, 6)])
+            return back + front
+        box = [(c, 0) for c in range(7)] + [(c, 1) for c in range(7)] + [(c, 6) for c in range(7)]
+        box += [(0, r) for r in range(2, 6)] + [(6, r) for r in range(2, 6)]
+        return box
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        hovered = self.underMouse()
+        pressed = self.isDown()
+        # No background at rest: just the glyph. Hover fills the whole hit
+        # area, red for close.
+        fg = theme.qcolor("#FFE9A8")
+        if hovered or pressed:
+            bg = theme.qcolor("#B8323A") if self.kind == "close" else theme.qcolor("#274F9B")
+            if pressed:
+                bg = bg.darker(120)
+            p.fillRect(self.rect(), bg)
+            fg = theme.qcolor("#FFF0BF")
+
+        b = self.PX
+        x0 = (self.width() - 7 * b) // 2
+        y0 = (self.height() - 7 * b) // 2
+        for col, row in self._glyph():
+            p.fillRect(x0 + col * b, y0 + row * b, b, b, fg)
+        p.end()
+
+
+class PixelTitleBar(QWidget):
+    """Custom title bar for the frameless main window: drag to move,
+    double-click to maximise, pixel-art window buttons on the right."""
+
+    HEIGHT = 30
+
+    def __init__(self, window, title: str = "Chronicle", parent=None):
+        super().__init__(parent)
+        self._window = window
+        self.setFixedHeight(self.HEIGHT)
+
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(_label_qss(theme.role("title_bar_text"), 11, bold=True))
+        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        self.min_button = PixelWindowButton("min")
+        self.min_button.setToolTip("Minimize")
+        self.min_button.clicked.connect(window.showMinimized)
+        self.max_button = PixelWindowButton("max")
+        self.max_button.setToolTip("Maximize")
+        self.max_button.clicked.connect(self.toggle_maximized)
+        self.close_button = PixelWindowButton("close")
+        self.close_button.setToolTip("Close")
+        self.close_button.clicked.connect(window.close)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.title_label, 0, Qt.AlignVCenter)
+        layout.addStretch(1)
+        layout.addWidget(self.min_button)
+        layout.addWidget(self.max_button)
+        layout.addWidget(self.close_button)
+
+    def toggle_maximized(self):
+        if self._window.isMaximized():
+            self._window.showNormal()
+        else:
+            self._window.showMaximized()
+
+    def sync_state(self):
+        maximized = self._window.isMaximized()
+        self.max_button.set_maximized(maximized)
+        self.max_button.setToolTip("Restore" if maximized else "Maximize")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            handle = self._window.windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class PixelResizeFrame(QWidget):
+    """Backdrop of the frameless window. Its outer margin doubles as the
+    resize grip: pressing within ``GRIP`` px of an edge starts a native
+    resize in that direction."""
+
+    GRIP = 6
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self._window = window
+        self.setMouseTracking(True)
+
+    def _edges(self, pos):
+        edges = Qt.Edges()
+        if self._window.isMaximized():
+            return edges
+        g, w, h = self.GRIP, self.width(), self.height()
+        if pos.x() <= g:
+            edges |= Qt.LeftEdge
+        if pos.x() >= w - g:
+            edges |= Qt.RightEdge
+        if pos.y() <= g:
+            edges |= Qt.TopEdge
+        if pos.y() >= h - g:
+            edges |= Qt.BottomEdge
+        return edges
+
+    def mouseMoveEvent(self, event):
+        # The cursor itself is driven by PixelWindowChrome's application-wide
+        # tracker, which also sees the moves that this frame's children
+        # swallow - setting it here would leave it stuck on the first child
+        # the pointer crossed on its way back inside.
+        sync_resize_cursor(self._window, self.GRIP)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            edges = self._edges(event.position().toPoint())
+            handle = self._window.windowHandle()
+            if edges and handle is not None:
+                handle.startSystemResize(edges)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
+class PixelWindowChrome(QObject):
+    """Application-wide event filter that gives every top-level window and
+    dialog the frameless pixel-art chrome (title bar + edge resize).
+
+    It hooks QEvent.Polish, which Qt sends inside show() before the window
+    maps, so the window flags can still be changed without a flicker. The
+    title bar is an overlay child pinned to the top edge; the window's layout
+    top margin is pushed down to make room for it, and its side/bottom
+    margins double as the resize grip.
+
+    Windows that build their own title bar (the main window) set the
+    ``pixelChrome`` property beforehand and are left alone.
+    """
+
+    GRIP = 6
+
+    def eventFilter(self, obj, event):
+        etype = event.type()
+        if etype == QEvent.Polish:
+            if isinstance(obj, QWidget) and self._wants_chrome(obj):
+                self._apply(obj)
+            return False
+
+        if etype in _CURSOR_EVENTS and isinstance(obj, QWidget):
+            # Mouse moves are delivered to the child under the pointer, not to
+            # the window, so the window only ever hears about its own margin.
+            # Tracking every widget's moves is what lets the resize cursor go
+            # back off once the pointer leaves the edge.
+            win = obj.window()
+            if win is not None and win.property("pixelChrome") is not None:
+                sync_resize_cursor(win, self.GRIP)
+
+        bar = getattr(obj, "_pixel_title_bar", None) if isinstance(obj, QWidget) else None
+        if bar is None:
+            return False
+        if etype == QEvent.ParentChange and not obj.isWindow():
+            # Polished while parentless, then placed in a layout: it is a
+            # child widget now, so the window chrome comes back off.
+            self._remove(obj)
+            return False
+        if etype == QEvent.Resize:
+            bar.setGeometry(0, 0, obj.width(), PixelTitleBar.HEIGHT)
+            bar.raise_()
+        elif etype == QEvent.WindowTitleChange:
+            bar.title_label.setText(obj.windowTitle())
+        elif etype == QEvent.WindowStateChange:
+            bar.sync_state()
+        elif etype == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            edges = _edges_at(obj, event.position().toPoint(), self.GRIP)
+            handle = obj.windowHandle()
+            if edges and handle is not None:
+                handle.startSystemResize(edges)
+                return True
+        return False
+
+    @staticmethod
+    def _wants_chrome(widget) -> bool:
+        if not widget.isWindow() or widget.property("pixelChrome") is not None:
+            return False
+        return widget.windowType() in (Qt.Window, Qt.Dialog)
+
+    def _apply(self, win):
+        win.setProperty("pixelChrome", True)
+        win.setWindowFlags(win.windowFlags() | Qt.FramelessWindowHint)
+        win.setMouseTracking(True)
+
+        bar = PixelTitleBar(win, win.windowTitle() or "Chronicle", parent=win)
+        bar.setAttribute(Qt.WA_StyledBackground, True)
+        bar.setStyleSheet("PixelTitleBar { background: #0E2A6B; }")
+        if isinstance(win, QDialog):
+            # Minimising a dialog on its own just loses it behind its parent.
+            bar.min_button.hide()
+        win._pixel_title_bar = bar
+
+        layout = win.layout()
+        if layout is not None:
+            m = layout.contentsMargins()
+            win._pixel_chrome_margins = m
+            layout.setContentsMargins(
+                max(m.left(), self.GRIP),
+                m.top() + PixelTitleBar.HEIGHT,
+                max(m.right(), self.GRIP),
+                max(m.bottom(), self.GRIP),
+            )
+        bar.setGeometry(0, 0, max(win.width(), 1), PixelTitleBar.HEIGHT)
+        bar.raise_()
+        bar.show()
+
+    @staticmethod
+    def _remove(widget):
+        bar = widget._pixel_title_bar
+        widget._pixel_title_bar = None
+        bar.hide()
+        bar.deleteLater()
+        margins = getattr(widget, "_pixel_chrome_margins", None)
+        if margins is not None and widget.layout() is not None:
+            widget.layout().setContentsMargins(margins)
+
+
+def _edges_at(win, pos, grip):
+    edges = Qt.Edges()
+    if win.isMaximized():
+        return edges
+    w, h = win.width(), win.height()
+    if pos.x() <= grip:
+        edges |= Qt.LeftEdge
+    if pos.x() >= w - grip:
+        edges |= Qt.RightEdge
+    if pos.y() <= grip:
+        edges |= Qt.TopEdge
+    if pos.y() >= h - grip:
+        edges |= Qt.BottomEdge
+    return edges
+
+
+_CURSOR_EVENTS = (
+    QEvent.MouseMove,
+    QEvent.HoverMove,
+    QEvent.Enter,
+    QEvent.Leave,
+    QEvent.WindowDeactivate,
+)
+
+
+def sync_resize_cursor(win, grip=6):
+    """Match ``win``'s cursor to where the pointer actually is.
+
+    The resize cursor is set on the window, so every child without a cursor
+    of its own inherits it; if it is only ever updated from the window's own
+    mouse moves it sticks - the pointer moves onto a child, the child eats
+    the move, and the window keeps showing a resize cursor over its whole
+    content. Re-deriving it from the global pointer position on any move in
+    the window keeps it honest."""
+    if win is None:
+        return
+    pos = win.mapFromGlobal(QCursor.pos())
+    edges = _edges_at(win, pos, grip) if win.rect().contains(pos) else Qt.Edges()
+    _set_resize_cursor(win, edges)
+
+
+def _set_resize_cursor(widget, edges):
+    if edges in (Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.BottomEdge):
+        shape = Qt.SizeFDiagCursor
+    elif edges in (Qt.RightEdge | Qt.TopEdge, Qt.LeftEdge | Qt.BottomEdge):
+        shape = Qt.SizeBDiagCursor
+    elif edges & (Qt.LeftEdge | Qt.RightEdge):
+        shape = Qt.SizeHorCursor
+    elif edges & (Qt.TopEdge | Qt.BottomEdge):
+        shape = Qt.SizeVerCursor
+    else:
+        shape = None
+    # Called on every mouse move: skip the no-op re-set, which would
+    # otherwise reapply the cursor down the whole child tree.
+    if getattr(widget, "_pixel_resize_cursor", None) == shape:
+        return
+    widget._pixel_resize_cursor = shape
+    if shape is None:
+        widget.unsetCursor()
+    else:
+        widget.setCursor(shape)
+
+
+class _NativeSnapFilter(QAbstractNativeEventFilter):
+    """Win32 side of ``enable_native_snap``: the frameless windows it tracks
+    carry a real resizable caption style (so Aero Snap, Win+arrows and the
+    min/max animations work), and this filter answers WM_NCCALCSIZE so that
+    caption and border never get drawn - the whole window stays client area.
+
+    Maximized, Windows still overhangs every monitor edge by the border
+    width; ``snap_overhang`` reports it so the window can pad it away."""
+
+    WM_NCCALCSIZE = 0x0083
+
+    def __init__(self):
+        super().__init__()
+        self.windows = {}  # hwnd -> QWidget
+
+    def nativeEventFilter(self, event_type, message):
+        name = event_type.data() if hasattr(event_type, 'data') else bytes(event_type)
+        if name != b'windows_generic_MSG':
+            return False, 0
+        from ctypes import wintypes
+        msg = wintypes.MSG.from_address(int(message))
+        if (msg.message != self.WM_NCCALCSIZE or not msg.wParam
+                or (msg.hWnd or 0) not in self.windows):
+            return False, 0
+        # Result 0: the proposed window rect is all client area.
+        return True, 0
+
+
+def snap_overhang(win) -> QMargins:
+    """How far a maximized snap-enabled window reaches past the screen's
+    work area on each side (zero when not maximized). Pad the content by
+    this so nothing is laid out off-screen."""
+    screen = win.screen()
+    if not win.isMaximized() or screen is None:
+        return QMargins()
+    avail, g = screen.availableGeometry(), win.geometry()
+    return QMargins(max(0, avail.left() - g.left()), max(0, avail.top() - g.top()),
+                    max(0, g.right() - avail.right()), max(0, g.bottom() - avail.bottom()))
+
+
+_native_snap_filter = None
+
+
+def enable_native_snap(win) -> None:
+    """Let a frameless window snap like a normal Windows window: drag to the
+    left/right edge for half screen, to a corner for a quarter, to the top to
+    maximize. Call after every (re)creation of the native window - showEvent
+    is a safe place, it is idempotent. No-op off Windows."""
+    import sys
+    if sys.platform != 'win32':
+        return
+    global _native_snap_filter
+    import ctypes
+    from ctypes import wintypes
+    try:
+        hwnd = int(win.winId())
+        if _native_snap_filter is None:
+            _native_snap_filter = _NativeSnapFilter()
+            QApplication.instance().installNativeEventFilter(_native_snap_filter)
+        _native_snap_filter.windows[hwnd] = win
+
+        GWL_STYLE = -16
+        WS_THICKFRAME, WS_CAPTION = 0x00040000, 0x00C00000
+        WS_MINIMIZEBOX, WS_MAXIMIZEBOX, WS_SYSMENU = 0x00020000, 0x00010000, 0x00080000
+        wanted = WS_THICKFRAME | WS_CAPTION | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+        user32 = ctypes.windll.user32
+        style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE) & 0xFFFFFFFF
+        if style & wanted != wanted:
+            user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE,
+                                  ctypes.c_long(style | wanted))  # wraps to signed
+            # SWP_NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
+            user32.SetWindowPos(wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                                0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Could not enable window snapping", exc_info=True)
+
+
+def install_pixel_window_chrome(app) -> PixelWindowChrome:
+    """Install the frameless pixel chrome for every window the app opens."""
+    chrome = PixelWindowChrome(app)
+    app.installEventFilter(chrome)
+    return chrome

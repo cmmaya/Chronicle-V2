@@ -1,55 +1,43 @@
-PySide6==6.6.0
-mss==10.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
+# Chronicle runtime dependencies (BU120).
+# Every direct third-party import in src/ is listed here, pinned to the version
+# verified in .venv312. Test/build tools live in requirements-dev.txt.
 
-soundcard>=0.4.0
-soundfile>=0.12.0
-sounddevice>=0.4.0
+# UI
+PySide6==6.6.0
+
+# Core
 numpy==1.26.4
+requests==2.34.2
+httpx==0.28.1
+python-dotenv==1.2.2
+
+# Audio capture
+soundcard==0.4.6
+soundfile==0.13.1
+sounddevice==0.5.5
 
 # Voice Activity Detection
-webrtcvad-wheels
+webrtcvad-wheels==2.0.14
 
-# Primary STT backend: NVIDIA Parakeet through onnx-asr.
-
-# We no longer use Whisper, faster-whisper, or PyTorch for transcription.
-
+# Speech-to-text: NVIDIA Parakeet (nemo-parakeet-tdt-0.6b-v3) through onnx-asr.
+# No Whisper, faster-whisper or PyTorch.
 #
-
 # onnxruntime 1.26.0 may fail to import on some Windows/Python 3.12 setups
-
 # with a DLL initialization error. Version 1.20.1 has been verified working
-
-# with this project.
-
+# with this project. Nothing here may relax this pin.
 onnxruntime==1.20.1
+onnx-asr[cpu,hub]==0.11.0
 
-# Includes ONNX ASR runtime support and Hugging Face model download support.
+# Model downloads (Parakeet and the e5 embedder) - imported directly by
+# src/rag/embeddings.py, so pinned directly rather than relying on onnx-asr[hub].
+huggingface_hub==1.17.0
 
-onnx-asr[cpu,hub]
+# RAG session router (BU089): tokenizer for intfloat/multilingual-e5-small.
+# The ONNX encoder itself is loaded with the onnxruntime pinned above.
+tokenizers==0.23.1
 
-# Parakeet requires mono audio. The app converts stereo WAV files to mono
+# Upload Audio (BU104): decodes .m4a / WAV / MP3 uploads. Wheels bundle FFmpeg.
+av==17.0.1
 
-# before transcription in src/transcription/parakeet.py.
-
-#
-
-# First model load downloads the Parakeet ONNX model from Hugging Face:
-
-# nemo-parakeet-tdt-0.6b-v3
-
-#
-
-# Optional: set HF_TOKEN for faster/higher-limit Hugging Face downloads.
-
-# RAG session router (BU089): local multilingual sentence embeddings.
-# The ONNX encoder (intfloat/multilingual-e5-small) is loaded directly with the
-# onnxruntime pinned above. Only a tokenizer is added here; huggingface-hub
-# already comes via onnx-asr[cpu,hub]. Nothing here may relax the onnxruntime
-# pin -- see src/rag/embeddings.py for why the direct-load approach is used.
-tokenizers>=0.15,<1.0
-
-# Upload Audio (BU104): decodes uploaded recordings - iPhone Voice Memos .m4a
-# (AAC / Apple Lossless), WAV, MP3, ... Wheels bundle FFmpeg; no system install.
-av>=12.0
+# OpenRouter API key storage in the Windows Credential Manager (BU122).
+keyring==25.7.0

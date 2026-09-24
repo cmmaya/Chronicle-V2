@@ -17,7 +17,7 @@ from .session_resolver import (
     ScopeResolution,
 )
 from .tools import AssistantRetrievalTools
-from ..config import ANY_SESSION_TEMPERATURE, ASSISTANT_AGENTS, get_selected_model
+from ..config import ANSWER_TEMPERATURE, ANY_SESSION_TEMPERATURE, ASSISTANT_AGENTS, get_selected_model
 from ..storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -214,7 +214,7 @@ class AssistantAnswerService:
             # Use selected model from settings (don't pass explicit model)
             answer = self._call_openrouter(
                 messages,
-                temperature=ANY_SESSION_TEMPERATURE if is_any_session else None,
+                temperature=ANY_SESSION_TEMPERATURE if is_any_session else ANSWER_TEMPERATURE,
             )
         except Exception as e:
             return AnswerResponse(
@@ -237,6 +237,7 @@ class AssistantAnswerService:
         active_session_id: Optional[int] = None,
         selected_session_id: Optional[int] = None,
         conversation_id: Optional[int] = None,
+        persist: bool = True,
     ) -> AnswerResponse:
         """
         Process a user question and return an answer.
@@ -248,6 +249,8 @@ class AssistantAnswerService:
             active_session_id: Currently active session ID, if any.
             selected_session_id: Currently selected session ID in UI, if any.
             conversation_id: Existing conversation ID to continue, or None for new.
+            persist: False answers without saving a conversation (live Q&A
+                answers in the Transcripts window are not chat history).
 
         Returns:
             AnswerResponse with either:
@@ -340,7 +343,7 @@ class AssistantAnswerService:
             # Use selected model from settings (don't pass explicit model)
             answer = await self._call_openrouter_async(
                 messages,
-                temperature=ANY_SESSION_TEMPERATURE if is_any_session else None,
+                temperature=ANY_SESSION_TEMPERATURE if is_any_session else ANSWER_TEMPERATURE,
             )
         except Exception as e:
             return AnswerResponse(
@@ -349,7 +352,8 @@ class AssistantAnswerService:
             )
 
         return self._finalize_answer(
-            answer, is_any_session, conversation_id, session_ids, question
+            answer, is_any_session, conversation_id, session_ids, question,
+            persist=persist,
         )
 
     def _finalize_answer(
@@ -359,6 +363,7 @@ class AssistantAnswerService:
         conversation_id: Optional[int],
         session_ids: List[int],
         question: str,
+        persist: bool = True,
     ) -> AnswerResponse:
         """Strip the answer contract trailer, persist, and build the response.
 
@@ -401,16 +406,18 @@ class AssistantAnswerService:
                 scope_offer.session_id if scope_offer else None,
             )
 
-        try:
-            conv_id = self._persist_conversation(
-                conversation_id,
-                session_ids[0] if session_ids else None,
-                question,
-                answer,
-            )
-        except Exception:
-            # Don't fail the answer if persistence fails - just log
-            conv_id = conversation_id
+        conv_id = conversation_id
+        if persist:
+            try:
+                conv_id = self._persist_conversation(
+                    conversation_id,
+                    session_ids[0] if session_ids else None,
+                    question,
+                    answer,
+                )
+            except Exception:
+                # Don't fail the answer if persistence fails - just log
+                conv_id = conversation_id
 
         return AnswerResponse(
             success=True,
@@ -744,9 +751,9 @@ class AssistantAnswerService:
     ) -> str:
         """Call OpenRouter API and return the answer.
 
-        ``temperature=None`` leaves the client at its default (0.7); the Any
-        Session path passes ``ANY_SESSION_TEMPERATURE`` for reliable contract
-        compliance. Other call paths are unchanged.
+        ``temperature=None`` leaves the client at its default (0.7). The answer
+        paths pass ``ANY_SESSION_TEMPERATURE`` (reliable contract compliance)
+        or ``ANSWER_TEMPERATURE`` (stay on the evidence).
         """
         # Always use fresh selected model - don't cache the client with a fixed model
         # This ensures model changes in settings are immediately applied

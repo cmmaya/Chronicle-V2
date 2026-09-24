@@ -56,7 +56,10 @@ class Database:
     once per connection.
     """
 
-    def __init__(self, db_path: str = 'chronicle.db'):
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            from ..paths import db_path as default_db_path
+            db_path = str(default_db_path())
         self.db_path = db_path
         self._local = threading.local()
         self._lock = threading.Lock()  # guards _connections
@@ -340,6 +343,23 @@ class Database:
                     session_id UNINDEXED
                 )
             ''')
+            # Calendar events sent from a session's Due Dates (BU132). Keyed on
+            # the entry fingerprint, not summary_id, so links survive
+            # re-summarizing. SQLite only honours the CASCADE with
+            # PRAGMA foreign_keys on, so session deletes also clear it by hand.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS calendar_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    google_event_id TEXT NOT NULL,
+                    html_link TEXT,
+                    event_date TEXT,
+                    created_at REAL,
+                    UNIQUE(session_id, fingerprint),
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                )
+            ''')
             conn.commit()
 
             if version < SCHEMA_VERSION:
@@ -552,6 +572,7 @@ class Database:
     def delete_session(self, session_id: int) -> None:
         try:
             cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM calendar_events WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
             self.connection.commit()
         except sqlite3.Error as e:
@@ -618,6 +639,7 @@ class Database:
             cursor.execute('DELETE FROM summaries WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM transcripts WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM screenshots WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM calendar_events WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
 
             self.connection.commit()
@@ -662,6 +684,7 @@ class Database:
             ('transcripts', 'DELETE FROM transcripts WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('screenshots', 'DELETE FROM screenshots WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('summaries', 'DELETE FROM summaries WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('calendar_events', 'DELETE FROM calendar_events WHERE session_id NOT IN (SELECT id FROM sessions)'),
         )
         removed = {}
         for table, sql in statements:
@@ -1126,6 +1149,47 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'Summary retrieval failed: {str(e)}')
+
+    def get_calendar_link(self, session_id: int, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """The calendar event sent for a Due Dates entry, or None (BU132)."""
+        try:
+            row = self.connection.execute(
+                'SELECT * FROM calendar_events WHERE session_id = ? AND fingerprint = ?',
+                (session_id, fingerprint),
+            ).fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Calendar link lookup failed: {str(e)}')
+
+    def save_calendar_link(self, session_id: int, fingerprint: str, google_event_id: str,
+                           html_link: Optional[str] = None,
+                           event_date: Optional[str] = None) -> None:
+        """Record (or replace) the calendar event sent for a Due Dates entry."""
+        try:
+            self.connection.execute('''
+                INSERT INTO calendar_events
+                    (session_id, fingerprint, google_event_id, html_link, event_date, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, fingerprint) DO UPDATE SET
+                    google_event_id = excluded.google_event_id,
+                    html_link = excluded.html_link,
+                    event_date = excluded.event_date,
+                    created_at = excluded.created_at
+            ''', (session_id, fingerprint, google_event_id, html_link, event_date,
+                  datetime.now().timestamp()))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Calendar link save failed: {str(e)}')
+
+    def delete_calendar_link(self, session_id: int, fingerprint: str) -> None:
+        try:
+            self.connection.execute(
+                'DELETE FROM calendar_events WHERE session_id = ? AND fingerprint = ?',
+                (session_id, fingerprint),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Calendar link deletion failed: {str(e)}')
 
     def get_summary(self, summary_id: int) -> Dict[str, Any]:
         """Get a specific summary by ID.

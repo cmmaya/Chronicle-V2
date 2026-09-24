@@ -1,4 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" shape-rendering="crispEdges">
-<path fill="#FFE8AD" d="M14 3h4v5h3v2h5v4h3v4h-5v3h2v5h-4v-2h-4v5h-4v-5h-4v2H6v-4h2v-3H3v-4h5v-4H6V7h4v2h4V3zm-2 10v6h8v-6h-8z" fill-rule="evenodd"/>
-
+<path fill="#FFE8AD" fill-rule="evenodd" d="M9 7h14v2h2v14h-2v2H9v-2H7V9h2V7zm3 5v8h8v-8h-8z"/>
+<g fill="#FFE8AD">
+<rect x="13" y="3" width="6" height="4"/>
+<rect x="13" y="25" width="6" height="4"/>
+<rect x="3" y="13" width="4" height="6"/>
+<rect x="25" y="13" width="4" height="6"/>
+<rect x="6" y="6" width="4" height="4"/>
+<rect x="22" y="6" width="4" height="4"/>
+<rect x="6" y="22" width="4" height="4"/>
+<rect x="22" y="22" width="4" height="4"/>
+<rect x="14" y="14" width="4" height="4"/>
+</g>
 </svg>

@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Callable
 
+from .. import paths
 from ..storage.database import Database
 from ..audio.importer import decode_audio_file, write_chunks, SAMPLE_RATE as IMPORT_SAMPLE_RATE
 from ..audio_capture.chunk import AudioChunk
@@ -121,35 +122,40 @@ class SessionManager:
     """
 
     def __init__(self,
-                 base_path: str = 'sessions',
-                 db_path: str = 'chronicle.db',
+                 base_path: Optional[str] = None,
+                 db_path: Optional[str] = None,
                  status_callback: Optional[callable] = None,
                  live_transcription_ui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
                  session_finalized_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None):
         """Initialize SessionManager.
 
         Args:
-            base_path: Base directory for session data
-            db_path: Path to SQLite database
+            base_path: Base directory for session data (default: paths.sessions_dir())
+            db_path: Path to SQLite database (default: paths.db_path())
             status_callback: Optional callable for status updates
             live_transcription_ui_callback: Optional callback for live transcription results
             session_finalized_callback: Optional ``(session_id, outcome)`` callback
                 fired when a stopped session's post-processing has finished
         """
-        self.base_path = Path(base_path)
+        self.base_path = Path(base_path) if base_path is not None else paths.sessions_dir()
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.status_callback = status_callback
         self.live_transcription_ui_callback = live_transcription_ui_callback
         self.session_finalized_callback = session_finalized_callback
 
         # Initialize database
-        self.db = Database(db_path)
+        self.db = Database(db_path if db_path is not None else str(paths.db_path()))
         self.db.connect()
         self._recover_after_restart()
 
         # Active session
         self.current_session: Optional[Session] = None
         self.current_timeline: Optional[Timeline] = None
+
+        # BU118: which sources the user wants muted. Held here rather than on
+        # the session so the choice can be made before a session exists - every
+        # recorder this manager creates is handed this state at creation.
+        self._muted_sources = {'mic': False, 'system': False}
 
         # Component factories (can be overridden for testing)
         self.dual_recorder_factory = DualSourceChunkedRecorder
@@ -341,6 +347,7 @@ class SessionManager:
             live_transcription_callback=live_callback,
             on_status=self._on_audio_status
         )
+        self._apply_muted_sources(session)
         session.screenshot_capture = self.screenshot_capture_factory(
             str(session_path),
             db=self.db
@@ -443,6 +450,7 @@ class SessionManager:
                 live_transcription_callback=self._live_callback_for(session_id),
                 on_status=self._on_audio_status
             )
+            self._apply_muted_sources(session)
             session.screenshot_capture = self.screenshot_capture_factory(
                 str(session_path),
                 db=self.db
@@ -482,6 +490,32 @@ class SessionManager:
 
         self._update_status(f'Started session {session.id}: {session.name}')
         return session
+
+    def set_source_muted(self, source: str, muted: bool) -> bool:
+        """Mute or unmute 'mic' or 'system' (BU118).
+
+        Valid before a session exists: the choice is remembered and applied to
+        the recorder as soon as one is created, so the user can silence a
+        source and then hit record. Returns False only for an unknown source.
+        """
+        if source not in self._muted_sources:
+            self._update_status(f'Unknown audio source: {source}', is_error=True)
+            return False
+
+        self._muted_sources[source] = bool(muted)
+        if self.current_session:
+            self.current_session.set_source_muted(source, muted)
+        return True
+
+    def is_source_muted(self, source: str) -> bool:
+        """True if that source is muted, session or no session."""
+        return self._muted_sources.get(source, False)
+
+    def _apply_muted_sources(self, session: Session) -> None:
+        """Hand a freshly built recorder the mute state the user already chose."""
+        for source, muted in self._muted_sources.items():
+            if muted:
+                session.set_source_muted(source, muted)
 
     def pause_session(self) -> bool:
         """Pause the current session.

@@ -2507,3 +2507,1139 @@ Files Changed:
 - src/storage/database.py, src/app/pixel_widgets.py, src/app/window.py
 
 - Follow-up: the camera chip only shows when the session has screenshots (hidden at 0); icon 14 -> 18 px, count 8.5 -> 7.5 pt; fixed two-digit width so it keeps the same size on every card.
+
+## BU111-BU115 - Live Q&A In The Transcripts Window
+
+### BU111 - Structured transcript records and detached bubble grouping
+
+The transcript stream was a list of display strings (`"[HH:MM:SS] Mic: text"`)
+that `_add_transcription_to_detached` re-parsed with a regex, losing the
+start/end datetimes and the `transcripts.id` row. Replaced by
+`TranscriptRecord` (text / source / start_dt / end_dt / transcript_id /
+display_text), built by both producers, so a replayed session renders
+identically to a live one. `_transcription_history` survives as a *read-only
+property* over `display_text`, which is what keeps the BU101 download byte-for-
+byte unchanged - the three places that assigned to it now assign to
+`_transcript_records`.
+
+The BU103 grouping check came out of `add_transcription_to_view` into the pure
+`should_extend_group(group, start_dt, end_dt)`, and the detached window now
+applies it too, over its own `_detached_transcript_groups` - the two panels can
+be filtered differently, so a shared open bubble would be wrong. Each row
+carries a `record_indices` list property, accumulated as a group extends; that
+is what BU113 selects on.
+
+One thing the BU did not call out: `_clear_transcription_view` cleared the
+records but left the detached rows standing, so their `record_indices` would
+have pointed into a discarded list. It clears both now.
+
+The dead `if ... self._detached_display: pass` tail is gone, and so is the
+attribute - nothing read it.
+
+Validation: tests/test_bu111.py, 19 tests, Qt offscreen against the real
+widgets.
+
+### BU112 - Two-column layout and transcript polish
+
+The detached window is a `QSplitter` - answers left, transcripts right - with
+the Mic/System filter moved into the transcript column's own header. Split and
+window geometry persist in `preferences.json`; `detached_splitter_sizes` is the
+pure fallback rule (a saved left column narrower than the answers minimum is
+widened, not discarded). Preferences are merge-based now
+(`_read_preferences` / `_update_preferences`); `_save_preferences` used to
+rewrite the whole file from the two menu toggles, which would have deleted the
+layout keys on any menu click.
+
+Two departures from the BU text, both deliberate:
+
+- `setVerticalScrollMode(ScrollPerPixel)` does not exist on `QScrollArea` -
+  it is `QAbstractItemView` API, and a `QScrollArea` already scrolls per pixel.
+  What actually decides how far a wheel notch travels is the scrollbar's
+  `singleStep` (Qt multiplies it by the system wheel-scroll-lines), so that is
+  pinned to `DETACHED_SCROLL_PIXELS_PER_STEP` = 24 px. Same outcome, the knob
+  that exists.
+- The long-gap separator is an inserted divider row, not a pinned sticky
+  header. "Inserted when the gap exceeds..." is what the task says; a genuinely
+  sticky header needs an overlay tracking scroll position, in a view that has
+  to stay smooth with hundreds of bubbles. Confirmed with the user.
+
+`gap_separator_label` measures the gap across the whole stream rather than per
+source - the pause is a pause in the room - and a separator closes every open
+group, so the next chunk from either source starts below the break. Separators
+drop out under a source filter: the break belongs to the unfiltered stream, and
+showing it over a subset would claim a silence that was not there.
+
+User-requested on top of the BU, after seeing it rendered: the answers rail
+went from 38% to 48% of the split, the splitter handle lost its own colour (it
+carries the panel background, since both columns already have painted borders),
+and **Ctrl+F now works in the detached window** - its own `PixelFindBar` +
+`FindController` in "right" mode, hosted on the transcript column.
+`_detached_find_texts()` contributes an empty string for separators and
+filter-hidden rows rather than dropping them, so a match index always lands on
+the row it was computed from. Bubbles widened to 420 px now that the column is
+not 320 px wide.
+
+Validation: tests/test_bu112.py, 31 tests; rendered through a real MainWindow
+on the Windows platform and inspected.
+
+### BU113 - Manual chunk selection and answering
+
+`resolve_bubble_selection` is the pure click model (plain / Ctrl / Shift +
+anchor), and rows absent from the visible set drop out - which is also what
+prunes the selection when a filter hides a bubble. `BubbleClickFilter` is
+installed on each row *and* the widgets inside it, because a press lands on the
+QLabel holding the text, never on the row; it does not consume a left press, so
+click-drag text selection inside a bubble still works.
+
+`build_question_from_records` collapses the recorder's chunk overlap
+(`collapse_overlap`, normalized word match up to 12 words, surviving text
+verbatim, only within one source since mic and system are recorded
+independently) so a multi-chunk selection does not read as a stutter.
+
+Concurrency was the part worth care: each card has an id, `card_id` is bound
+into every handler, and threads live in `_detached_answer_threads` keyed the
+same way - so a late response can only reach the card it was asked for, and the
+chat panel's single `_assistant_thread` slot and its Ask button are untouched.
+
+Validation: tests/test_bu113.py, 46 tests, including two concurrent answers
+resolving into their own cards and a response arriving for a dismissed card.
+
+### BU114 - Question detection service
+
+`QuestionDetector` runs on its own worker thread; `feed(record, index)` only
+appends to a queue, so the transcription path can neither block nor be raised
+into. The index is passed explicitly rather than read off the record - the
+position is the caller's fact about its own list, not a property of a chunk.
+
+Three filters run before anything is spent: the interval cap
+(`min_detect_interval_seconds`, consulted after the queue hands over a record,
+so faster chunks are folded into the window for free), `local_gate`, and the
+discourse blocklist.
+
+A bug the tests caught: `is_discourse` was being applied to the *formatted*
+window line (`[10:00:00] Mic: any questions`), which can never equal a
+blocklist phrase, so the whole local discourse tier was dead. Replaced with
+`window_is_all_discourse(records)`, which matches on the spoken text and
+suppresses only when *every* utterance in the window is filler - a window
+holding "any questions?" next to a real question is still worth a call.
+
+`DETECTOR_SYSTEM_PROMPT` emits neutral labels only. Class-vs-meeting policy is
+a local filter (BU115), not a second prompt: one call serves both, and a prompt
+that already knows the answer it is supposed to give stops measuring anything.
+
+Validation: tests/test_bu114.py, 67 tests. The client and the clock are both
+injected, so the interval cap is tested without sleeping and no call leaves the
+process.
+
+### BU115 - Auto mode controls and detected-question cards
+
+Manual|Auto chips, a gear menu (1-5 chunk window labelled in seconds, the three
+detector models with their measured notes, "Answer automatically" and "Only
+questions aimed at me", both off), and a spend chip. Manual is the default and
+builds no detector at all, so it cannot spend.
+
+Candidates reach the UI only through the `_detected_ready` signal, queued from
+the detector's worker thread - the same hop every other cross-thread path in
+this window uses. `passes_mode_policy` is where the product decision lives,
+deliberately outside the prompt so it can change without a re-measurement.
+
+A candidate card is dashed where an answer card is solid: it is a suggestion
+nobody has acted on, and should not look like something that already happened.
+"Answer" replaces it in place and runs the BU113 path - the chat agent and
+`get_selected_model()`, never `LIVE_QA.detector_model`.
+
+The detector is torn down on switch-to-Manual, window close, pause and stop,
+and re-stood-up on resume. Window size and detector model reach a running
+detector without restarting it.
+
+Validation: tests/test_bu115.py, 48 tests, with a fake detector so nothing
+leaves the process; rendered and inspected in Auto mode with a candidate and an
+answer card side by side.
+
+### Test harness
+
+`tests/detached_harness.py` replaced the per-file harnesses that copied
+individual `MainWindow` methods onto a bare object. Every BU that added a
+dependency between two detached methods broke every harness that had copied
+only one of them. `DetachedHarness` subclasses `MainWindow` and skips only its
+`__init__`, seeding the attributes the detached code reads, so the methods under
+test are the real ones reached through the real class.
+
+Validation: 211 tests across tests/test_bu111.py through tests/test_bu115.py.
+Pre-existing collection failures elsewhere in tests/ (test_recorder.py,
+test_recorder_simple.py, test_bu034.py, test_fetch_transcripts.py import a
+`audio.recorder` module that does not exist in this layout; test_summary.py and
+test_process_session12.py call `exit(1)` at import) are unrelated and untouched.
+
+Files Changed:
+
+- src/app/window.py, src/app/pixel_widgets.py, src/assistant/live_qa.py (new),
+  src/config.py, tests/detached_harness.py (new), tests/test_bu111.py,
+  tests/test_bu112.py, tests/test_bu113.py, tests/test_bu114.py,
+  tests/test_bu115.py
+
+### BU113 / BU115 follow-up - chunk-level selection, and three modes instead of two
+
+Both from user feedback on the rendered window.
+
+**Selecting a minute of speech was not useful.** BU111 requires 60 s grouping in
+the detached window and BU113 selected whole bubbles, so asking about one
+sentence dragged in everything around it. Neither BU reconciles that; each was
+implemented as written and the conflict fell through the gap between them.
+
+`PixelBubble(segmented=True)` keeps each appended chunk as its own sibling
+QLabel instead of merging it into one body. That is safe here specifically
+because the bubble's layout is a single `QVBoxLayout` on the widget itself
+already holding `label` and `footer_label` as siblings - the thing that broke
+word-wrap height propagation before was *nesting* a layout, which this is not.
+Selection state moved from row widgets to record indices, which also made the
+gesture model simpler: one flat list of visible chunk indices, and
+`resolve_chunk_selection` over it.
+
+The gesture the user asked for is click to pick one, sustained click dragged
+through the stream to take everything it touches, Ctrl+click to add. Drag runs
+are recomputed from the anchor on every move, so reversing a drag gives chunks
+back rather than leaving them stuck selected. Consequence worth naming: a left
+press on a bubble is now consumed, so dragging no longer starts the label's own
+text selection - "Copy text" in the context menu copies the selected chunks,
+which is the better trade but is a change from BU112's "selectable and
+copyable".
+
+Driving real `QMouseEvent`s through the built window caught a bug the unit
+tests could not: `_install_bubble_selection` ran once at row creation, when a
+grouped bubble still has one chunk, so the labels `append_text` adds later had
+no event filter on them. A press still reached the window by propagating up to
+the bubble - which is exactly why a click looked fine and a drag did nothing.
+The installer is idempotent now and runs again after every append. Two
+regression tests cover it.
+
+**"Answer automatically" should not have existed as a separate thing.** There
+were genuinely three states, but presented as two chips plus a hidden menu
+item, so "Auto" read as though it already meant auto-answer. Now there is one
+chip per mode - Manual / Suggest / Auto - and `_detection_enabled` and
+`_live_qa_auto_answer` are properties derived from it, so there is no second
+place to disagree. Suggest stays the default for the reason BU115 gives: the
+detector was measured against one lecture.
+
+`normalize_live_qa_mode(value, auto_answer)` migrates the old shape. It checks
+the flag *before* the pass-through, because "auto" is a valid value in both
+shapes and the pass-through would otherwise win; preferences keep writing the
+flag in agreement with the mode, so the migration is stable if it runs twice.
+
+Validation: 233 tests across tests/test_bu111.py through tests/test_bu115.py. A
+real press/drag/release driven through the built window confirms a click picks
+one chunk, a drag extends and shrinks, Ctrl+click reaches across bubbles, and
+the assembled question contains exactly the selected chunks and nothing else.
+
+Files Changed:
+
+- src/app/window.py, src/app/pixel_widgets.py, tests/detached_harness.py,
+  tests/test_bu112.py, tests/test_bu113.py, tests/test_bu115.py
+
+
+### BU116 / BU117 - answering well, and answering from a handout
+
+**The auto-mode bug was a thrown-away purchase.** `_answer_candidate` called
+`build_question_from_records(records)` on the detector's rolling window, which
+emits the excerpt and no question. So the app paid a detector call to identify
+a question, then sent the model the surrounding transcript and asked it to find
+the question again - and the model, given an excerpt and no question, quite
+reasonably summarised the excerpt. `build_question_for_candidate` states the
+detected question first and labels the window as context. The manual path keeps
+`build_question_from_records` unchanged: there the user's selection *is* the
+question, and the two paths differ for a reason rather than by accident.
+
+One shape decision worth recording: with no resolvable records the candidate
+path sends `candidate.text` alone, with no preamble at all. A preamble exists to
+separate a question from its context; with no context there is nothing to
+separate, and the mode instruction already frames the task.
+
+**Answers were verbose because they were running a chat-pane prompt.**
+`research_helper` says "clearly indicate when you're using general knowledge vs
+transcript content" - a paragraph-shaped instruction rendered into a ~440 px
+card. The two modes are now their own prompts in `LIVE_QA["answer_instructions"]`,
+with the length rule stated to the model rather than only to us.
+
+**Where the instruction override enters.** BU116 offers two places and its
+allowed files pick one: `ask_async` takes an `agent_id`, not a system
+instruction, and `src/assistant/service.py` is out of scope. So
+`AssistantQueryThread._effective_agent_id()` derives an agent from the chat
+panel's own - same model, same everything, different prompt - keyed by a sha1
+digest of the instruction, and registers it in the service's `_agents`. Keying
+on the instruction is what makes it safe: two modes in flight get two entries,
+and re-registering the same instruction rewrites the same value, so concurrent
+detached answers cannot race. With no `system_instruction` the method returns
+the agent id untouched, which is why the chat panel's ask flow is byte-identical.
+
+Consequence named rather than hidden: the derived id is not `research_helper`,
+so `_needs_session_context` returns True and session context is retrieved even
+in General Knowledge mode. The prompt tells the model to ignore it. Skipping the
+retrieval would mean editing the service.
+
+**BU117 is deliberately one concern.** Plain text only - no parsing, no
+extraction, no format detection - so what gets proven is whether a reference
+document helps at all, not whether we can read a PDF. Excerpt selection reuses
+`FindController`'s matching rule rather than reaching for embeddings, and picks
+the best *contiguous* span because a problem set's answer usually straddles the
+paragraph that names it and the one after. Ranking is `(score, -start, end)`:
+highest score, then earliest, then longest - which also gives the sensible
+fallback for a question that matches nothing, namely the top of the document.
+
+**Refusing a drop visibly took more than `event.ignore()`.** An ignored drag is
+not promised a `dragLeaveEvent`, so a refusal overlay shown on `dragEnterEvent`
+would hang there until the next drag. It clears on a timer as well. Driving real
+`QDragEnterEvent` / `QDropEvent` through the built window confirmed the three
+refusals (.pdf, folder, multiple files) each leave the previously attached
+document intact and never crash.
+
+Validation: 422 tests across `tests/test_bu111.py` - `tests/test_bu117.py`, all
+passing. Beyond the unit tests, a built detached window was driven end to end
+offscreen: a dropped .txt attaches and names its chip, a .pdf and a folder are
+refused with a message, and an auto-answered candidate produces a payload
+carrying the detected question, the transcript window labelled as context, the
+reference excerpt labelled as a document, and the three-tier instruction naming
+the file - under the chat agent, with no model pinned. The answers rail was
+rendered at 440 px and at its 280 px minimum to confirm the second chip row
+fits. `webrtcvad-wheels` (already in requirements.txt) had to be installed into
+`.venv` before the Qt tests could import at all.
+
+Not done, and deliberately: the two manual checks that need a real recording and
+a real key - that a live Auto-mode answer comes back relevant and ~2 sentences,
+and that a question answered only by the handout comes back labelled
+`From <filename>:`. The payloads and prompts that produce them are verified;
+what the model does with them is not.
+
+Files Changed:
+
+- src/config.py, src/assistant/live_qa.py, src/assistant/reference_doc.py (new),
+  src/app/window.py, src/app/pixel_widgets.py, tests/detached_harness.py,
+  tests/test_bu116.py (new), tests/test_bu117.py (new)
+
+
+## BU118 - Mic And System Audio Mute Toggles
+
+Summary:
+Mic and system audio can each be muted mid-session from two toggles in the
+top-right corner of the chat section. Muting drops that source's audio at
+capture: nothing is chunked, saved, transcribed or stored while it is muted,
+and the other source keeps recording untouched.
+
+Files Changed:
+
+- src/audio_capture/core.py, src/app/session.py, src/app/session_manager.py,
+  src/app/window.py, assets/pixel/icon_mic_on.svg, icon_mic_off.svg,
+  icon_audio_on.svg, icon_audio_off.svg (new), tests/test_bu118.py (new)
+
+Implementation:
+
+- Mute is a *drop gate*, not a stop. `ChunkedAudioRecorder.set_muted()` /
+  `is_muted` flip a flag; `_feed()` - the single ingest point both the
+  microphone callback path and the system loopback path funnel through - drops
+  the captured blocks before VAD, chunk saving, the save callback and live
+  transcription. The device stays open and the capture thread keeps running, so
+  there is no teardown to survive and nothing for the watchdog to read as a
+  lost stream.
+- The transition itself is handed to the recording thread via `_mute_dirty`,
+  so buffer surgery never races `_feed`. On mute, the partial window is
+  *flushed*, not discarded: that audio was captured before the user muted, and
+  dropping it would silently lose up to one chunk of speech. Either direction
+  then calls the new `_reset_pending_state()`, so pre-mute and post-mute audio
+  can never land in one chunk. That reset deliberately leaves `self._raw`
+  alone - the microphone callback closes over that deque, and swapping it
+  mid-run would leave the capture thread draining a queue nothing writes to.
+- `check_health()` reports a muted recorder as healthy ("muted"). Without it
+  the watchdog would read the by-design silence as a stall and restart the
+  recorder every `watchdog_stall_seconds` for as long as the user stayed muted.
+- `DualSourceChunkedRecorder.set_source_muted(source, muted)` /
+  `is_source_muted(source)` route per source and raise on an unknown one. The
+  flag lives on the recorder, so `restart()` keeps it.
+- `Session` and `SessionManager` expose the same pair and return False rather
+  than raising when there is no session or no recorder, so the UI can leave its
+  control where it was instead of claiming a mute capture never got.
+- UI: `_build_mute_toggle_row()` builds two compact `PixelToolButton`s driven
+  by the `_MUTE_TOGGLES` table; `_update_mute_controls()` (called from
+  `_update_ui_state`) reads the recorder, so a new session comes back unmuted
+  without the UI resetting anything. The row sits in its own right-aligned row
+  above the search bar rather than beside it: the search frame has a 360px
+  minimum and in a narrow centre column the two overlapped by exactly the row's
+  width.
+- No config block was added - nothing needed a tunable.
+
+Definition of Done Satisfied:
+
+- [x] Two icon toggles in the top-right of the chat section, using the supplied designs
+- [x] Un-slashed icon = live source, slashed = muted
+- [x] Muting stops that source being saved, transcribed or stored, immediately
+- [x] The other source is unaffected
+- [x] Unmuting resumes without splicing pre-mute audio into a chunk
+- [x] A muted source never trips the watchdog
+- [x] Toggles disabled with no session recording, unmuted per session
+- [x] Toggling reports through the status path
+
+Validation:
+
+24 tests in `tests/test_bu118.py`, all passing, and 364 across
+`tests/test_bu111.py` - `tests/test_bu118.py` plus
+`tests/test_capture_system_chunk.py` with no regressions. The gate is tested on
+a real `ChunkedAudioRecorder` fed synthetic audio: a muted feed produces no
+chunk and fires neither callback, muting flushes the pre-mute partial, and the
+first chunk after unmuting is read back off disk and asserted to contain only
+post-unmute samples. `restart()` is driven with the loop stubbed out (no device
+in a test run) to confirm the flag survives. The real `MainWindow` was also
+built offscreen: the toggles come up disabled with no session, enable and swap
+to the slashed icon on click under a stubbed active session, and the rendered
+row was inspected to confirm the icons match the supplied designs.
+
+Not done, and deliberately: the end-to-end checks that need a real recording -
+that speech during a mic mute is absent from the live transcript while system
+audio keeps transcribing, and that a multi-minute mute draws no watchdog
+restart. The gate and the health carve-out that produce those are verified; a
+live capture session is not.
+
+Next:
+
+- none
+
+## BU118 follow-up - Mute Before Recording
+
+Summary:
+The toggles were disabled until a session was capturing. Requested change: they
+are clickable at any time, so a source can be silenced before hitting record.
+
+Files Changed:
+
+- src/app/session_manager.py, src/app/window.py, tests/test_bu118.py,
+  docs/build_plan/BU118.md, docs/current_state.md
+
+Implementation:
+
+- The desired mute state moved from "whatever the recorder says" to
+  `SessionManager._muted_sources`. `set_source_muted()` now stores the choice
+  and applies it to the current session only if there is one, returning False
+  just for an unknown source; `is_source_muted()` answers from that state with
+  or without a session. `_apply_muted_sources(session)` hands it to each
+  recorder the manager builds, in `create_session` and in `load_session`, so a
+  mute chosen beforehand is in force from the first chunk.
+- The toggles are never disabled, and `_update_mute_controls()` reads the
+  manager rather than the session. A click with no session running reports
+  "Microphone muted (applies when recording starts)" so the deferral is
+  visible.
+- The mute now outlives a session rather than resetting per session: the button
+  shows a slashed mic, so the next recording must not quietly come back with a
+  live mic. It is still in-memory only - a fresh app start is unmuted.
+
+Validation:
+
+27 tests in `tests/test_bu118.py`, all passing, and no regressions across
+`tests/test_bu111.py` - `tests/test_bu118.py`. New coverage: a pre-session
+click is accepted and reported as deferred, the state survives the session
+starting, a stopped session leaves the mute in place, and
+`_apply_muted_sources` reaches a freshly built recorder. The real `MainWindow`
+was built offscreen with no session: both toggles come up enabled, clicking the
+mic sets the manager's state and swaps the icon to the slashed design.
+
+## BU119 - Persisted UI State And A Safe Preferences File
+
+Summary:
+The app now comes back the way it was left: same model, same session and scope
+with its transcripts, same transcript filter, same mute state - and
+preferences.json is written atomically and no longer tracked by git. The chat
+still starts new every launch, which it already did.
+
+Files Changed:
+
+- src/app/window.py, .gitignore, tests/test_bu119.py (new)
+
+Implementation:
+
+- Audit first. Saved before this BU: the two menu toggles, the detached
+  window's geometry/splitter/pin, and the six live_qa_* keys. Not saved: the
+  selected model, the transcript source filter, the selected session and scope,
+  and the BU118 mute state.
+- The model was a bug, not a gap: `set_selected_model()` wrote a module global
+  that nothing persisted, while the Model Settings dialog told the user
+  "Changes will persist across application restarts". The dialog now writes
+  `selected_model` and `_restore_selected_model()` puts it back through
+  `set_selected_model()`, whose ALLOWED_MODELS check makes a removed id fall
+  back to DEFAULT_MODEL instead of pointing every call at nothing.
+- `_write_preferences()` is the one writer: temp file in the same directory,
+  fsync, `os.replace`. An interrupted write can no longer truncate the file -
+  which mattered because `_read_preferences` has to discard an unparseable file
+  and *silently* reset every setting. That discard is now logged with the path.
+  `preferences.json` is in .gitignore and untracked; the defaults live in code,
+  so there is no defaults file to keep in sync.
+- Mute is restored into SessionManager before anything can record, and
+  **announced** ("Microphone still muted from last session") - restored last in
+  the startup sequence so 'App Started' does not overwrite the warning. A
+  malformed stored value reads as unmuted rather than raising.
+- Session and scope persist from `_update_scope_label()`, the single funnel all
+  eight scope/selection paths already call, and only when the pair actually
+  changed. `_restore_session_scope()` sets the combo, the search bar and the
+  selection behind the existing `_clearing_scope` guard so the transcripts load
+  exactly once, and a stored session that no longer exists falls back to Any
+  Session silently - it is not something the user can act on.
+- The chat is untouched: `_current_conversation_id` starts at None and
+  `_load_past_conversations()` only fills the sidebar list.
+
+Definition of Done Satisfied:
+
+- [x] preferences.json written atomically, ignored and untracked
+- [x] A corrupt file starts on defaults and is logged
+- [x] Model survives a restart; an invalid stored id falls back
+- [x] Mute survives a restart, applies before the first session, and is announced
+- [x] Transcript filter survives a restart
+- [x] Session and scope survive a restart, with transcripts loaded
+- [x] A deleted stored session falls back to Any Session cleanly
+- [x] The chat still starts new every launch
+
+Validation:
+
+25 tests in `tests/test_bu119.py`, and 392 across
+`tests/test_bu111.py` - `tests/test_bu119.py` plus
+`tests/test_capture_system_chunk.py`, all passing. Beyond the unit tests the
+real `MainWindow` was driven through a two-phase round trip offscreen against
+the real database: phase one muted the mic, set the filter to Mic, chose
+`anthropic/claude-sonnet-4` and selected session 69 in Specific Session scope;
+phase two relaunched and read back every one of them, with the session's 40
+transcript records loaded (one `_load_transcripts_for_session` call, confirmed
+from the logs), an empty chat, and the mute warning left on the status bar. The
+user's own preferences.json was backed up and restored around that run.
+
+Files Changed (detail):
+
+- src/app/window.py: `_write_preferences`, `_restore_selected_model`,
+  `_restore_transcription_filter`, `_save_transcription_filter`,
+  `stored_muted_sources`, `_save_muted_sources`, `_restore_muted_sources`,
+  `_save_session_scope`, `_restore_session_scope`, `TRANSCRIPT_FILTERS`
+
+Next:
+
+- none
+
+## BU120 - Dependency Audit And Clean Requirements
+
+Summary:
+requirements.txt now lists exactly what src/ imports, pinned to the versions
+verified in .venv312, with test tools split into requirements-dev.txt. The dead
+Whisper modules are gone and no venv file is tracked any more.
+
+Files Changed:
+
+- requirements.txt, requirements-dev.txt (new), .gitignore, docs/setup.md
+- src/transcription/whisper.py, src/transcription/processor_parakeet (1).py (deleted)
+
+Implementation:
+
+- Added the two direct imports that were only there transitively: `httpx`
+  (openrouter_client) and `huggingface_hub` (embeddings, now model_manager).
+  Removed `mss` - screenshots use Qt's `grabWindow`. Every line is `==` pinned
+  to .venv312 (onnx-asr 0.11.0, huggingface_hub 1.17.0, tokenizers 0.23.1,
+  av 17.0.1, ...), with the onnxruntime 1.20.1 DLL note kept.
+- `requirements-dev.txt` = `-r requirements.txt` + `pytest==9.1.1`.
+- A grep confirmed nothing imports `whisper.py` or the stray copy.
+- .gitignore: `.venv*/` and `venv*/`; the 46 tracked `.venv/` files were
+  removed from the index with `git rm -r --cached` (nothing deleted on disk).
+  The last lines of .gitignore had been saved as UTF-16 (`config.json. e n v`)
+  and matched nothing; rewritten as `config.json` / `.env`.
+- docs/setup.md rewritten for Python 3.12, the venv, requirements-dev.txt,
+  `.env` or Settings > API Key, and the model download.
+
+Validation:
+
+- A brand-new venv (at a short path - pip hit the Windows long-path limit
+  inside the scratch folder) installed from requirements-dev.txt alone, then
+  every test file was run in it and in .venv312 file by file: identical
+  results. The same failures exist in both and are not dependency problems:
+  legacy scripts that fail collection (`test_bu034`, `test_fetch_transcripts`,
+  `test_process_session12`, `test_recorder`, `test_recorder_simple` insert a
+  non-existent `tests/src`; `test_summary` calls `exit()`), 4 in
+  `test_assistant_service` (scope/clarification behaviour in service.py) and 3
+  in `test_openrouter_client` (they mock `client._requests`, but the client has
+  used httpx since before this BU).
+- The app launched from the fresh venv (offscreen) into an empty data folder.
+- Not done here (needs the real desktop): a recorded session with live
+  transcription, a screenshot, a chat answer, a summary and an `.m4a` upload
+  in the fresh venv. `av` imports and the upload tests pass.
+
+Next:
+
+- BU121
+
+## BU121 - App Paths: Separate Install Folder From User Data
+
+Summary:
+Everything the app writes now lives under one per-user data folder resolved by
+`src/paths.py`, and everything it ships is read from `resource_dir()`. Nothing
+depends on the working directory. Running from source still uses the project
+root, so existing data opens unchanged.
+
+Files Changed:
+
+- src/paths.py (new), src/main.py, src/app/window.py, src/app/session_manager.py,
+  src/app/pixel_theme.py, src/storage/database.py, tests/test_bu121.py (new),
+  .gitignore (`/models/`, `/logs/`)
+
+Implementation:
+
+- `data_dir()`: `CHRONICLE_DATA_DIR` > pointer file
+  `%APPDATA%\Chronicle\location.json` (`{"data_dir": "..."}`; unreadable or
+  malformed is logged and ignored) > project root from source > frozen
+  `%LOCALAPPDATA%\Chronicle`. The frozen default uses
+  `QStandardPaths.GenericDataLocation` + `Chronicle` rather than
+  `AppLocalDataLocation`, because the latter depends on the Qt application name
+  and on whether a QApplication exists yet - the result is the same folder.
+- The three `project_root = dirname(dirname(dirname(...)))` computations are
+  gone. `Database(db_path=None)` and `SessionManager(base_path=None,
+  db_path=None)` resolve through paths; explicit paths still win (tests).
+  `Database` imports paths lazily so the legacy `from storage.database import`
+  path still imports.
+- `main.py` sets `HF_HOME=models_dir()` before any huggingface_hub/onnx_asr
+  import: always when frozen; from source only when HF_HOME is unset and the
+  models are not already in the default cache (the dev exception).
+- `main.py` can now be run as a script from any folder: it replaces `src/` on
+  `sys.path` with the project root. Before this it only worked as
+  `python -m src.main`, and leaving `src/` on the path would let
+  `src/secrets.py` (BU122) shadow the stdlib module.
+
+Validation:
+
+- 11 tests in tests/test_bu121.py: resolution order with `sys.frozen`
+  patched, derived folders created on first use, malformed pointer files,
+  cwd independence, Database defaults, icons found from source and from a fake
+  `_MEIPASS` bundle.
+- From `C:\`, `python <repo>\src\main.py` with `CHRONICLE_DATA_DIR` set to an
+  empty folder started cleanly (offscreen) and created `chronicle.db` and
+  `sessions/` there. From `C:\`, the dev-default paths resolve to the project's
+  existing `chronicle.db`, `sessions/` and `preferences.json`.
+- Not done here: recording into the relocated folder, and checking the
+  existing sessions/screenshots/chat history in the real window.
+
+Next:
+
+- BU122
+
+## BU122 - API Key In The Windows Credential Store
+
+Summary:
+One function supplies the OpenRouter key to every caller, and the key can be
+set, tested, changed and removed from Settings > API Key..., stored in the
+Windows Credential Manager. `.env` still wins for development.
+
+Files Changed:
+
+- src/secrets.py (new), src/assistant/openrouter_client.py,
+  src/summarization/generator.py, src/app/window.py, requirements.txt
+  (`keyring==25.7.0`), tests/test_bu122.py (new), tests/test_openrouter_client.py
+
+Implementation:
+
+- `get_api_key()`: `OPENROUTER_API_KEY` / `.env`, then keyring (`Chronicle` /
+  `openrouter`). `set_api_key`, `clear_api_key` (keyring only; removing a
+  missing key is not an error), `has_saved_key`, `key_source`, `mask`,
+  `redact`.
+- `check_api_key(key)`: `GET https://openrouter.ai/api/v1/key`, 10 s timeout,
+  no tokens spent. 200 ok, 401 invalid, 402 no credits, timeout and
+  connection errors reported as connection problems (never as "invalid"),
+  anything else with its status code.
+- Both clients call `get_api_key()`; the missing-key error now reads "No
+  OpenRouter API key is set. Add it in Settings > API Key." Both are created
+  per request, so a newly saved key applies without a restart.
+- Settings > API Key...: password-mode field, the current key as
+  `••••••••` + last 4 with where it comes from (an env/.env key is flagged as
+  taking priority, since saving would otherwise look like it did nothing),
+  Test on an `ApiKeyCheckThread` so the UI does not freeze, Save, Remove.
+- Error text from httpx/requests exceptions goes through `redact()` in both
+  clients; nothing logs the key.
+- The module is `src/secrets.py` as specified; see BU121 for why `src/` must
+  never be on `sys.path`.
+
+Validation:
+
+- 20 tests in tests/test_bu122.py (lookup order, set/clear, broken backend,
+  Settings message from both clients, every `check_api_key` mapping, key never
+  in log output, redaction in both clients).
+  `test_missing_api_key_raises_error` in test_openrouter_client.py now isolates
+  the keyring and checks the new message.
+- The dialog was driven offscreen with a fake keyring: masked field, save,
+  test result, source label. A real keyring round-trip (WinVaultKeyring) under
+  a throwaway service name saved, read back and removed a key.
+- Not done here: saving the real key and removing it from `.env`, the
+  wrong-key and network-off Test checks against OpenRouter, and seeing
+  "Chronicle" in Credential Manager.
+
+Next:
+
+- BU123
+
+## BU123 - Model Manager: Check, Download And Verify Models
+
+Summary:
+`src/model_manager.py` knows every model the app needs at a pinned revision,
+reports install status from disk alone, and downloads with progress, resume,
+cancel, a disk-space check and typed errors. With everything installed the
+app runs with `HF_HUB_OFFLINE=1`, and neither loader can download at runtime.
+
+Files Changed:
+
+- src/model_manager.py (new), src/transcription/parakeet.py,
+  src/rag/embeddings.py, src/config.py (quantization comment),
+  src/main.py (offline switch), tests/test_bu123.py (new), docs/setup.md
+
+Implementation:
+
+- Measured during Understand (remote tree at the pinned revisions, local
+  snapshot): Parakeet full precision = config.json, vocab.txt,
+  encoder-model.onnx, encoder-model.onnx.data (2.44 GB),
+  decoder_joint-model.onnx = 2.55 GB; int8 = 0.67 GB; e5 `onnx/model.onnx` +
+  `onnx/tokenizer.json` = 0.49 GB. Parakeet is pinned to
+  `8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce`. Each file carries its byte size,
+  so `status()` can tell a truncated file from a complete one without network.
+- `download()` checks free space on the nearest existing ancestor of the cache
+  (+200 MB margin), then calls `hf_hub_download` per missing file with a tqdm
+  stand-in that reports bytes and raises `DownloadCancelled` on cancel. A
+  file already in the snapshot at the wrong size is re-fetched with
+  `force_download`.
+- Xet is disabled for the duration of `download()`. Measured: with Xet, a
+  cancel at 256 MB was only honoured after the 470 MB file had finished,
+  which for the 2.44 GB encoder would mean minutes. Over plain HTTP the cancel
+  stopped at 157 MB, left a 147 MB `.incomplete` blob, and the next run's
+  first progress report was 146.8 MB - a Range resume.
+- Error mapping: httpx connect/timeout/network errors and huggingface_hub's
+  offline errors -> `OfflineError`; ENOSPC -> `DiskFullError`; anything else
+  is `DownloadError` unless a HEAD probe to huggingface.co fails. The probe is
+  needed: with the network down, huggingface_hub's retry surfaced
+  `RuntimeError: Cannot send a request, as the client has been closed` with
+  no cause chain.
+- Parakeet: `_model_dir()` returns the installed snapshot for the configured
+  quantization (or `model_path` when it is itself a directory) and
+  `onnx_asr.load_model(name, dir, quantization=...)` - an existing local
+  directory makes onnx-asr resolve offline. The int8-then-full fallback is
+  removed; a missing model raises `ModelLoadError` pointing at setup.
+- Embeddings: `_load()` takes both files from `model_manager.local_path()`;
+  missing files leave the service unavailable (lexical-only routing, as
+  before) with the setup hint logged. It no longer imports huggingface_hub.
+- `enable_offline_if_installed()` sets the env var and, because
+  huggingface_hub reads it once at import, the constant too if already
+  imported. `python -m src.model_manager` prints status and downloads with a
+  console progress line - the stand-in until the BU124 wizard.
+
+Validation:
+
+- 28 tests in tests/test_bu123.py: status installed/missing/incomplete
+  (truncated file and `.incomplete` blob) with no network; the file list
+  checked against `NemoConformerTdt._get_model_files` and `model_repos`;
+  progress, only-missing, forced wrong-size file, resume offset, cancel
+  before/mid, every error mapping, the probe, disk-space refusal, Xet
+  restored afterwards, offline mode only when installed, Parakeet refusing to
+  load (and never calling onnx-asr) when missing and loading exactly one
+  variant from the local folder, the embedder degrading without a download.
+- Real runs: status reports both models installed in the default cache; with
+  `HF_HUB_OFFLINE=1` Parakeet (full precision, 6.7 s) and e5 both loaded and
+  ran. A real e5 download into an empty cache went to 100% and `installed`;
+  cancel/resume as above; with a dead proxy the download raised the readable
+  `OfflineError`.
+- Not done here: the full 3 GB download into an empty `CHRONICLE_DATA_DIR`,
+  and a live session with the network physically off.
+
+Next:
+
+- BU124
+
+## BU124 - First-Run Setup Wizard Before The Main Window
+
+Changes:
+
+- `src/app/setup_wizard.py` (new): `check_setup()` / `needed_pages()` gate,
+  `models_cache()` / `apply_models_cache()` (the one HF cache decision, moved
+  out of `main.py`), `location_problem()` / `required_bytes()`, and a `QWizard`
+  with Welcome, Location, API key, Download and Done pages in the pixel theme.
+  Completed steps are recorded in `<data>/setup_state.json` so a later launch
+  reopens only what is missing and a skipped key never blocks.
+- `src/main.py`: the gate runs in `main()` after the QApplication exists and
+  before `MainWindow` is imported; `--setup` forces every page. Importing
+  the wizard does not pull in huggingface_hub or onnx_asr (checked).
+- `src/paths.py`: `resolved_data_dir()` (no mkdir), `data_dir_from_environment()`,
+  `save_data_location()` (atomic pointer write), `setup_state_path()`.
+
+Validation:
+
+- 34 tests in tests/test_bu124.py: page selection for every combination
+  (first run, models deleted, closed mid-download, skipped key, disconnected
+  drive, `--setup`); no wizard when complete; `main()` never configures
+  models or builds the window when the wizard is closed; unwritable and
+  too-small folders rejected; pointer and state written; cache choice frozen
+  vs. source; API-key page Next rules and save; download page error, cancel
+  (bar kept at 50%), success, already-installed and shutdown with the
+  manager mocked.
+- BU111-BU123 tests still pass. The 18 failures in test_assistant_service /
+  test_openrouter_client are live OpenRouter calls returning 401 with no key
+  in the environment; they are unrelated to BU124.
+- Skipped on request: the heavy manual checks (full download into an empty
+  data folder, a custom folder on another drive, relaunch mid-download,
+  deleting a model file, skip key then add in Settings).
+
+Next:
+
+- BU125
+
+## BU128 - Settings Pop-Up Window
+
+Summary:
+
+- The sidebar Settings button used to toggle a stock `QMenuBar` that
+  appeared as an unstyled strip above the pixel title bar. It now opens a
+  pixel-art pop-up (`src/app/settings_dialog.py`) with a left rail (General,
+  Audio, Model, API Key, Maintenance, About) and a `▶` cursor on the open
+  page. Each setting sits on its own row card.
+- New `PixelToggle` switch, pixel-styled sliders with value chips, fade-and-rise
+  pop-in, and a navy scrim over the main window. Changes apply immediately;
+  the Done button, Esc and the title bar ✕ all close the pop-up.
+- `window.py`: `_create_menu_bar` -> `_create_settings_actions` (the same
+  QActions, no menu bar); `_open_settings_dialog` (single instance, `Ctrl+,`);
+  `_apply_vad_settings` / `_apply_selected_model` replace the OK branches of
+  the old VAD and Model dialogs. `_show_vad_settings`, `_show_model_settings`,
+  `_show_api_key_settings` and `_show_about` were removed.
+
+Validation:
+
+- 9 tests in tests/test_bu128.py: no menu bar or QMenu on the window; all
+  pages present; toggles mirror and write the QActions (and persist); VAD
+  debounce plus flush on close posts one status line; model change calls
+  `set_selected_model` and stores the preference; the Reindex button follows
+  `_reindex_action`; the pop-up is single-instance; `PixelToggle` flips on
+  click and on Space, and `setChecked` is silent.
+- Every page was rendered with the real window chrome and checked visually.
+- Not run: a full app launch against a live session (manual checklist in
+  BU128.md).
+
+Next:
+
+- none
+
+## BU125 - Windowed-App Hardening: Log File, Crash Dialog, Single Instance
+
+Summary:
+
+- `src/main.py`: `setup_logging()` replaces `logging.basicConfig` - a rotating
+  `logs/chronicle.log` (5 MB x 3) under the data folder, a console handler
+  only when a console exists, and `_LogWriter` stand-ins for a `None`
+  `sys.stdout` / `sys.stderr`. Re-run after the setup wizard so the log
+  follows a newly chosen data folder.
+- `CrashReporter` installs `sys.excepthook` and `threading.excepthook`: logs
+  the traceback, shows a dialog (short error, log folder, "Open log folder")
+  on the GUI thread via a queued signal, and does not re-raise.
+- Single instance per user via `QLocalServer` / `QLocalSocket`
+  (`Chronicle-<USERNAME>`); a second launch sends `activate` and exits, the
+  first instance raises and focuses its window.
+- "Open log folder": the menu bar is gone since BU128, so the entry is a
+  `MainWindow._open_log_folder_action` shown as a card on Settings >
+  Maintenance. This touched `src/app/settings_dialog.py`, which is outside
+  BU125's Allowed Files.
+
+Validation:
+
+- 5 tests in tests/test_bu125.py: `_LogWriter` accepts writes and forwards
+  lines; `setup_logging` replaces missing streams and `print()` reaches the
+  log file; the excepthook logs and returns normally; a second-instance
+  client signals the server (test-specific socket name); no server -> False.
+- Heavy validation skipped at the user's request: the manual checks
+  (pythonw run with a recorded session, deliberate exception from a button,
+  double launch) were not run.
+
+Next:
+
+- BU126
+
+## BU126 - PyInstaller Build Of A Standalone App Folder
+
+Summary:
+
+- `packaging/build.ps1`: one command. Fresh `build\venv` from
+  `requirements.txt` + `pyinstaller==6.22.3`, optional `-Test` (unit suite in
+  that venv), PyInstaller, a check that fails the build if a database,
+  `sessions`, `preferences.json`, `setup_state.json`, `location.json`, `.env`
+  or `.wav` is inside `dist\Chronicle\`, then the folder size.
+- `packaging/chronicle.spec`: onedir, windowed, `assets/chronicle.ico`, the
+  version resource, `assets/` as data; soundcard `.py.h` and onnx_asr
+  preprocessor graphs as data; native libs of onnxruntime, PortAudio
+  (`_sounddevice_data`), libsndfile (`_soundfile_data`), av and tokenizers;
+  hidden imports for onnx_asr submodules and keyring backends
+  (+ `win32ctypes.core`); excludes tests/pytest/tkinter and ~40 unused Qt
+  modules (QtSvg kept for the `qsvg` icon plugin).
+- `packaging/version_info.txt` is a template; the spec fills it from
+  `APP_VERSION` so the number lives only in `src/config.py`
+  (`APP_VERSION = "1.0.0"`). Shown in the setup wizard title and on
+  Settings > About (`CHRONICLE 1.0.0`).
+- `assets/chronicle.ico`: 16x16 pixel-art "C" with a record dot, packed at
+  16-256 px.
+- Outside Allowed Files, both required for the build to work:
+  - `packaging/hooks/hook-webrtcvad.py`: the pyinstaller-hooks-contrib hook
+    copies metadata for `webrtcvad`, which is not installed (we pin
+    `webrtcvad-wheels`), and aborted the analysis.
+  - `src/main.py`: the script-mode `sys.path[0]` rewrite is skipped when
+    frozen, where `sys.path[0]` is the bundled standard library. Also
+    `hold_app_mutex()` for BU127 (below).
+  - `src/app/setup_wizard.py`, `src/app/settings_dialog.py`: show
+    `APP_VERSION`, as the Tasks require.
+- `.gitignore`: `build/` and `dist/` were already ignored; added
+  `packaging/redist/`. `requirements-dev.txt` unchanged: the PyInstaller pin
+  lives in `build.ps1` so a dev install stays test-only.
+
+Validation:
+
+- `build.ps1 -SkipInstaller` ran end to end from a clean venv: `dist\Chronicle\`
+  = 283 MB. Present: `onnxruntime.dll`, PortAudio, libsndfile, FFmpeg
+  (`av.libs`), `qsvg.dll`, soundcard `*.py.h`, onnx_asr `preprocessors/data`,
+  `assets/`, webrtcvad dist-info. Forbidden-file check passed.
+- `py_compile` on the changed modules; tests/test_bu124.py, test_bu125.py,
+  test_bu128.py -> 48 passed.
+- Test fixes found on the way (the run hung, and while it hung the real app
+  would not start - "Chronicle is already running"):
+  - test_bu124 `MainGateTests` called the real `main()`, which claimed the
+    real per-user single-instance name for the life of the pytest process.
+    It now mocks the instance server, the mutex and the excepthook install.
+  - test_bu125 `CrashReporterTest` patched `_show_dialog` on the instance
+    after `__init__` had connected the signal to the real method, so a
+    modal dialog blocked the run offscreen. Patched on the class instead.
+  - test_bu125 `SingleInstanceTest` sent `activate` from the same thread
+    as the server, where the Windows pipe never delivers it. The client now
+    runs in a second process, as a real second launch does (verified that
+    this path activates the first instance).
+- Heavy validation skipped at the user's request: the frozen app was not
+  launched here (a source instance was running, and the single-instance
+  check would hand off to it), and the clean Windows 11 VM checklist in
+  BU126.md (wizard + downloads, recording, hotkey, upload, chat, summary,
+  reindex, missing VC++ errors, cold-start time) was not run. The full unit
+  suite in the build venv was not run either; note that `tests/test_summary.py`
+  calls `exit(1)` at import, which aborts a plain `pytest tests` run.
+
+Next:
+
+- BU127
+
+## BU127 - Windows Installer With A Choosable Install Folder
+
+Summary:
+
+- `packaging/chronicle.iss` (Inno Setup 6.3+): fixed `AppId` GUID;
+  `PrivilegesRequired=lowest` + `PrivilegesRequiredOverridesAllowed=dialog`
+  ("just me" by default, no admin; "all users" goes to Program Files);
+  `DefaultDirName={autopf}\Chronicle` with the folder page always shown;
+  Start-menu shortcut and an optional desktop one; `_internal` of a previous
+  version removed before files are copied.
+- VC++ runtime: `vc_redist.x64.exe` is bundled and run (`/install /quiet
+  /norestart`, `runas` verb) only if the registry shows no x64 runtime 14.40+
+  in either registry view; onnxruntime binaries built with VS 17.10+ can crash
+  on an older `msvcp140.dll`.
+- "Launch Chronicle" (checked, as the original user) on the last page; with no
+  pointer file yet, the app opens the setup wizard.
+- `AppMutex=Chronicle-AppRunning,Global\Chronicle-AppRunning`, blocking
+  install and uninstall while the app runs. BU125's single-instance check is a
+  `QLocalServer` (a named pipe), which Inno cannot see, so `src/main.py` now
+  also holds a named mutex (`APP_MUTEX`, `hold_app_mutex()`), created right
+  after the instance server. `CloseApplications=no`, so Setup never closes a
+  recording app itself.
+- Uninstaller: Inno removes the installed files and shortcuts (no blanket
+  delete of `{app}`, in case it was pointed at a shared folder). It then asks,
+  default No, whether to delete the user data, showing the folder read from
+  `%APPDATA%\Chronicle\location.json` (a small JSON reader that decodes
+  `\uXXXX` escapes; falls back to `%LOCALAPPDATA%\Chronicle`). Yes deletes
+  only Chronicle's own entries (`sessions`, `models`, `logs`, `chronicle.db*`,
+  `preferences.json`, `setup_state.json`, preference temp files), removes the
+  folder if it is then empty, deletes the API key from the Credential Manager
+  (`CredDeleteW` on `Chronicle` and `openrouter@Chronicle`), the pointer
+  folder, and the themed-icon cache in `%TEMP%`. Silent uninstalls keep data.
+- `build.ps1`: after PyInstaller, finds `ISCC.exe` (`$env:ISCC`, PATH, default
+  folders), downloads `vc_redist.x64.exe` once into `packaging\redist\`, and
+  compiles with `/DAppVersion=<APP_VERSION>` into
+  `dist\ChronicleSetup-<version>.exe`. `-SkipInstaller` stops before this.
+- `docs/setup.md`: "Building the app folder" and "Building the installer".
+
+Validation:
+
+- Not compiled here: Inno Setup is not installed on this machine, so
+  `chronicle.iss` has not been through `ISCC` yet.
+- Heavy validation skipped at the user's request: none of the clean-VM
+  checks in BU127.md (per-user / other-drive / all-users installs, upgrade
+  keeping data, uninstall keep/delete, install blocked while running).
+
+Next:
+
+- none
+
+## BU129 - Machine-Readable Calendar Date In Due Dates Entries
+
+Summary:
+
+- `templates.py`: each Due Dates entry now has a `Calendar date:` line after
+  `Due date:`, in one of four forms (`YYYY-MM-DD`, `YYYY-MM-DD HH:MM`,
+  `YYYY-MM-DD HH:MM-HH:MM`, `none`). New rule: resolve only from the
+  Recording date, 24-hour local time, a time only when one was stated, and
+  `none` for recurring, conditional, multi-candidate or unclear dates.
+  `Due date:` is unchanged.
+- New `src/calendar_sync/` package with `due_dates.py`: `DueDateEntry`
+  (with a `fingerprint` property: SHA-1 of the lowercased title with
+  punctuation removed and whitespace collapsed, as BU132 specifies),
+  `parse_due_date_entries()` and `parse_calendar_date()`. Impossible dates,
+  bad times and `end <= start` are rejected. Legacy entries use the only ISO
+  date in `Due date:` as all-day; zero or two or more give `None`.
+- `pixel_widgets.py`: `Calendar date` added to `_FIELD_LINE_RE`;
+  `format_summary_body_html` drops that line (and any wrapped continuation)
+  so the summary window looks as before.
+
+Validation:
+
+- `tests/test_bu129.py` (10 tests) and `tests/test_bu100.py` pass.
+- Manual checks from BU129.md (summarizing a real session with the new
+  prompt, viewing an old summary in the app) not run here.
+
+Next:
+
+- BU130
+
+## BU130 - Google Account Sign-In (OAuth Desktop Flow)
+
+Summary:
+
+- New `src/calendar_sync/google_auth.py`: `load_client()` /
+  `parse_client()` / `import_custom_client()` for the `chronicle` and
+  `custom` OAuth clients; `SignInFlow` (loopback redirect on `127.0.0.1:0`,
+  PKCE `S256`, `state`, `access_type=offline`, `prompt=consent`, scopes
+  `openid email calendar.events`, cancellable, 3-minute timeout, granted
+  scope check); `get_access_token()` with in-memory caching and
+  `invalid_grant` cleanup (`GoogleAuthExpired`); `disconnect()`;
+  `connection_state()`. Only `requests` and the standard library.
+- `secrets.py`: get/set/clear helpers for the refresh token (keyring user
+  `google_calendar_refresh_token`), and `register_secret()` so `redact()`
+  also masks Google tokens and client secrets.
+- `paths.py`: `bundled_google_client_path()` and
+  `custom_google_client_path()`.
+- `.gitignore`: `google_oauth_client.json`, `google_client.json`.
+  `chronicle.spec` bundles `google_oauth_client.json` from the repo root when
+  present.
+- `docs/setup.md`: step 10, creating the Google Cloud project and client.
+
+Validation:
+
+- `tests/test_bu130.py` (20 tests, network mocked; the redirect is driven
+  through the real loopback server) plus `test_bu121.py` / `test_bu122.py`
+  pass.
+- Manual checks from BU130.md (real Google sign-in with both clients,
+  cancel, unticked Calendar permission, revoke at myaccount.google.com, log
+  grep) not run here: they need a Google Cloud project and client.
+
+Next:
+
+- BU131
+
+## BU131 - Calendar Page In The Settings Pop-Up
+
+Summary:
+
+- `settings_dialog.py`: a Calendar page between API Key and Maintenance with
+  three cards. Google account: connection state and a Connect / Disconnect
+  button; sign-in runs on a new `GoogleCallThread` with "Waiting for
+  browser..." and a Cancel button; errors show in a muted line; Disconnect
+  asks for confirmation first. Calendar: read-only "Primary calendar
+  (<email>)". OAuth client: Chronicle / Custom combo (Chronicle disabled when
+  no bundled client, the whole choice disabled while connected), Import
+  client_secret.json... and the truncated custom client ID. Closing Settings
+  cancels a running sign-in.
+- `window.py`: `open_settings(page=None)` opens or focuses Settings on a
+  given page.
+- Calendar picker left out, as BU131.md decided (it would need another
+  scope). The open question for the user still stands.
+
+Validation:
+
+- `tests/test_bu131.py` (11 tests, auth layer mocked) and
+  `tests/test_bu128.py` pass.
+- Offscreen render of the page checked for layout.
+- Manual checks from BU131.md (real browser sign-in, cancel on close,
+  disconnect, invalid import, restart) not run here: they need a Google
+  Cloud client.
+
+Next:
+
+- BU132
+
+## BU132 - Calendar Event Service And Sent-Event Tracking
+
+Summary:
+
+- New `src/calendar_sync/events.py`: `EventDraft` (validation and the
+  all-day / timed event body), `create_event()` and `event_exists()` against
+  the primary calendar. No time gives an all-day event with an exclusive end
+  date; a start time without an end gives one hour. Times are local with
+  their offset, and `timeZone` is added only when an IANA name is known.
+  Events use the default reminders and carry the session ID and fingerprint
+  as private extended properties.
+- Errors: a 401 refreshes the token and retries once; a second 401 or a 403
+  `insufficientPermissions` raises `GoogleAuthExpired`; network, 4xx, 429 and
+  5xx failures raise `CalendarError` with a readable message. Event bodies
+  are not logged.
+- `database.py`: `calendar_events` table keyed on `(session_id,
+  fingerprint)`, plus get / save (upsert) / delete helpers. The table
+  declares `ON DELETE CASCADE`, but SQLite only enforces that with
+  `PRAGMA foreign_keys` on, which Chronicle doesn't turn on. So
+  `delete_session`, `purge_session` and the orphan sweep delete the rows
+  themselves. No schema version bump: `CREATE TABLE IF NOT EXISTS` adds it
+  to existing databases.
+- `due_dates.py` unchanged: BU129's fingerprint already normalizes as
+  specified.
+
+Validation:
+
+- `tests/test_bu132.py` (19 tests, HTTP mocked), `test_bu129.py` and
+  `test_database_perf.py` pass. (`test_bu130.py` fails to import here
+  because `keyring` isn't installed in this interpreter; unrelated.)
+- Manual checks from BU132.md (real account: all-day, 15:00 default hour,
+  15:00-15:30, deleted event, session delete) not run here: they need a
+  connected Google account.
+
+Next:
+
+- BU133
+
+## BU133 - "Send To Calendar" Button And Event Dialog
+
+Summary:
+
+- `pixel_widgets.py`: `PixelDueDateCard` (one entry, with a Send to Calendar /
+  ✓ In Calendar button beside the title; a sent card's button opens Open in
+  Google Calendar / Send again…) and `PixelDueDateList` (the cards separated
+  by rules). `PixelCollapsibleSection` takes an optional `body_widget`; the
+  header count still comes from the text.
+- `window.py`: `build_summary_section()` uses the cards for a Due Dates
+  section whose entries parse, reading each card's state from
+  `get_calendar_link`. Other sections are unchanged. The summary window gets
+  a `DueDateSender` and an "Event created in Google Calendar. Open" line.
+- New `calendar_dialog.py`: `CalendarEventDialog` pre-fills the title, the
+  description plus a "From Chronicle session …" footer, the date, All day
+  and the times. It shows a gold hint when the transcript gave no single
+  date, a warning for past dates, and validation messages under each field.
+  The primary button is Connect Google… (opens Settings › Calendar) or
+  Create Event (creates on a worker thread; saves the link on success;
+  keeps the dialog and every edit on errors). Discard asks first only when
+  something was edited. `DueDateSender` allows one dialog at a time and runs
+  `event_exists` before Send again: it asks for confirmation when the event
+  still exists and drops the stale link when it was deleted.
+
+Validation:
+
+- `tests/test_bu133.py` (19 tests, event service and connection state
+  mocked) plus `test_bu100.py`, `test_bu128.py`, `test_bu129.py`,
+  `test_bu131.py` and `test_bu132.py` pass in `.venv`.
+- Offscreen render of the Due Dates section and the dialog checked for
+  layout.
+- `test_bu130.py` does not import in `.venv`: `keyring` is not installed
+  there (`pip install -r requirements.txt` should fix it). BU133 doesn't
+  depend on it.
+- Manual checks from BU133.md (real account: all-day and timed events,
+  unclear dates, ✓ state after restart, Send again after deleting in
+  Google, the connect path, no network, Discard) not run here: they need a
+  connected Google account.
+
+Next:
+
+- none

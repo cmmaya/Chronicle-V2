@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QSplitter, QVBoxLayout, QWidget,
 )
 
+from . import theme
 from ..config import SCREENSHOT
 from ..screenshots.context_generator import ScreenshotContextGenerator
 from ..screenshots.metadata import ensure_previews, transcript_window
@@ -223,7 +224,7 @@ class _ImageStage(QGraphicsView):
         self._item.setTransformationMode(Qt.SmoothTransformation)
         self._scene.addItem(self._item)
         self._message = self._scene.addText("")
-        self._message.setDefaultTextColor(QColor("#8EA7D8"))
+        self._message.setDefaultTextColor(theme.qcolor("#8EA7D8"))
         message_font = QFont("Courier New")
         message_font.setPointSize(11)
         self._message.setFont(message_font)
@@ -235,7 +236,7 @@ class _ImageStage(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setBackgroundBrush(QBrush(QColor("#071D52")))
+        self.setBackgroundBrush(QBrush(theme.qcolor("#071D52")))
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(
             "QGraphicsView { border: 2px solid #254D9C; border-radius: 6px;"
@@ -329,7 +330,7 @@ class _FullscreenImage(QWidget):
         layout.setContentsMargins(0, 0, 0, 8)
         layout.setSpacing(6)
         self.stage = _ImageStage()
-        self.stage.setBackgroundBrush(QBrush(QColor("#030C24")))
+        self.stage.setBackgroundBrush(QBrush(theme.qcolor("#030C24")))
         self.stage.setStyleSheet("QGraphicsView { border: none; background: #030C24; }")
         self.stage.double_clicked.connect(self.close)
         self.stage.prev_button.clicked.connect(lambda: self.navigate.emit(-1))
@@ -794,7 +795,7 @@ class ScreenshotViewer(QDialog):
         self.filmstrip.blockSignals(True)
         self.filmstrip.clear()
         placeholder = QPixmap(THUMB_SIZE)
-        placeholder.fill(QColor("#0B2762"))
+        placeholder.fill(theme.qcolor("#0B2762"))
         for row in self._rows:
             thumb = self._thumbs.get(row.get('filepath', ''))
             item = QListWidgetItem(_thumb_icon(thumb if thumb is not None else placeholder),

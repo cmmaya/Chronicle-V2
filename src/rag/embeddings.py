@@ -6,10 +6,11 @@ new dependency is ``tokenizers``. We deliberately do **not** use ``fastembed``:
 it declares its own ``onnxruntime`` requirement and pip may promote the pin,
 which would break Parakeet transcription.
 
-If onnxruntime / tokenizers / huggingface-hub are missing, or the model cannot
-be downloaded or run, :pyattr:`EmbeddingService.is_available` stays ``False`` and
-callers must degrade to lexical-only retrieval. Nothing here raises on load
-failure.
+If onnxruntime / tokenizers are missing, or the model is not installed or cannot
+run, :pyattr:`EmbeddingService.is_available` stays ``False`` and callers must
+degrade to lexical-only retrieval. Nothing here raises on load failure. The
+model is never downloaded here (BU123): it is installed up front by
+``src/model_manager.py`` and loaded from its local files.
 
 Meetings are recorded in Spanish, so the model must be multilingual. Preferred:
 ``intfloat/multilingual-e5-small`` (384-dim, retrieval-tuned). E5 requires input
@@ -120,14 +121,15 @@ class EmbeddingService:
     def _load(self) -> None:
         import onnxruntime as ort  # noqa: WPS433 - lazy on purpose
         from tokenizers import Tokenizer
-        from huggingface_hub import hf_hub_download
+        from .. import model_manager
 
-        model_path = hf_hub_download(
-            self._repo_id, _ONNX_MODEL_FILE, revision=self._revision
-        )
-        tokenizer_path = hf_hub_download(
-            self._repo_id, _TOKENIZER_FILE, revision=self._revision
-        )
+        if (self._repo_id, self._revision) != (model_manager.E5_REPO_ID, model_manager.E5_REVISION):
+            raise model_manager.ModelNotInstalledError(
+                f"{self.model_id} is not the embedding model the model manager installs"
+            )
+        # Raises ModelNotInstalledError (with the setup hint) if missing.
+        model_path = str(model_manager.local_path(model_manager.EMBEDDINGS, _ONNX_MODEL_FILE))
+        tokenizer_path = str(model_manager.local_path(model_manager.EMBEDDINGS, _TOKENIZER_FILE))
 
         self._tokenizer = Tokenizer.from_file(tokenizer_path)
         self._tokenizer.enable_truncation(max_length=_MAX_TOKENS)
