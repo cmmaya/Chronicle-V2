@@ -17,6 +17,7 @@ from functools import partial
 import hashlib
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 
 from .session_manager import SessionManager
@@ -33,7 +34,7 @@ from .pixel_widgets import (
     pixel_spend_chip, pixel_rail_notice, pixel_group_label,
     format_answer_html, PixelDropOverlay, PixelReferenceChip,
     PixelTitleBar, PixelResizeFrame, set_accent, enable_native_snap, snap_overhang,
-    PixelDueDateCard, PixelDueDateList,
+    PixelDueDateCard, PixelDueDateList, PixelSearchResultCard, search_snippet,
 )
 from ..audio_capture.core import ChunkedAudioRecorder
 from ..audio.importer import SUPPORTED_EXTENSIONS as UPLOAD_AUDIO_EXTENSIONS
@@ -61,6 +62,9 @@ from ..assistant.scope_offer import (
 # Labels for the candidate picker. Default is the original ambiguity-clarification
 # flow; the "handoff" variant is reached from the in-chat scope prompt's
 # "Choose another session" link (BU093).
+# Markdown emphasis / heading / quote markers, dropped from search snippets.
+_MARKDOWN_MARKS = re.compile(r"[*#`>]+")
+
 _CANDIDATE_TITLE_DEFAULT = "SELECT A SESSION"
 _CANDIDATE_BTN_DEFAULT = "Use Selected Session"
 _CANDIDATE_TITLE_HANDOFF = "ASK IN SPECIFIC SESSION"
@@ -7952,126 +7956,564 @@ class MainWindow(QMainWindow):
 
         dialog.exec_()
 
-    def _open_search_dialog(self):
-        """Global keyword search dialog: transcript lines and past conversations.
+    # ------------------------------------------------------------------
+    # "Search" window (sidebar "Search Chats")
+    # ------------------------------------------------------------------
+    _SEARCH_DIALOG_QSS = """
+        QDialog#SearchDialog { background: #061946; }
+        QLabel#SearchMuted {
+            color: #8EA7D8; font-family: "Courier New"; font-size: 9pt;
+        }
+        QLabel#SearchTips {
+            color: #B9C8EA; font-family: "Courier New"; font-size: 10pt;
+            background: #071D52; border: 1px dashed #3A5C9E; border-radius: 6px;
+            padding: 12px 14px;
+        }
+        QLineEdit#SearchQuery {
+            border-radius: 6px;
+            padding: 6px 10px;
+            min-height: 26px;
+            font-family: "Courier New";
+            font-size: 12pt;
+            font-weight: 700;
+        }
+        QLineEdit#SearchQuery:focus { border: 2px solid #FFEFC1; }
+        QToolButton#SearchLink {
+            color: #FFE9A8; background: transparent; border: none;
+            font-family: "Courier New"; font-size: 9pt; font-weight: 700;
+            padding: 2px 6px;
+        }
+        QToolButton#SearchLink:hover { color: #FFFFFF; }
+        QPushButton#SearchRecent {
+            color: #FFF0BF; background: #0B2762;
+            border: 1px solid #254D9C; border-radius: 5px;
+            padding: 7px 12px;
+            font-family: "Courier New"; font-size: 10pt; font-weight: 700;
+            text-align: left;
+        }
+        QPushButton#SearchRecent:hover { background: #12306E; border-color: #4A78D8; }
+        QPushButton#SearchClose {
+            color: #FFF0BF;
+            background: transparent;
+            border: 2px solid #3A67C7;
+            border-radius: 5px;
+            padding: 0px 16px;
+            font-family: "Courier New";
+            font-size: 9.5pt;
+            font-weight: 700;
+        }
+        QPushButton#SearchClose:hover { background: #274F9B; }
+        QPushButton#SearchClose:pressed { background: #1E3F82; }
+    """
 
-        Opened from the sidebar "Search Chats" button. Queries accept one or more
-        whitespace-separated keywords, AND-matched and case-insensitive, via
-        ``db.search_transcripts`` / ``db.search_conversations``. Activating a
-        transcript result focuses that session in the transcripts panel;
-        activating a conversation result loads it in the assistant panel.
+    # (key, label) for the result-kind filter; "all" shows a preview of each.
+    _SEARCH_KINDS = (
+        ("all", "All"),
+        ("transcript", "Transcripts"),
+        ("summary", "Summaries"),
+        ("chat", "Chats"),
+    )
+    _SEARCH_LIMITS = {"transcript": 100, "summary": 40, "chat": 50}
+    _SEARCH_PREVIEW = 4  # hits per kind under "All" before "Show all"
+    _SEARCH_MIN_CHARS = 3  # shorter queries match nearly everything
+    _RECENT_SEARCHES_MAX = 8
+
+    def _recent_searches(self) -> list:
+        stored = self._read_preferences().get('recent_searches')
+        if not isinstance(stored, list):
+            return []
+        return [q for q in stored if isinstance(q, str) and q.strip()][:self._RECENT_SEARCHES_MAX]
+
+    def _remember_search(self, query: str):
+        query = " ".join((query or "").split())
+        if not query:
+            return
+        recents = [q for q in self._recent_searches() if q.lower() != query.lower()]
+        self._update_preferences({'recent_searches': [query, *recents][:self._RECENT_SEARCHES_MAX]})
+
+    def _search_when(self, ts) -> str:
+        """Short date for a search hit: "Today 14:32", "Sep 12 · 09:10"."""
+        try:
+            dt = datetime.fromtimestamp(ts) if ts else None
+        except (ValueError, OSError, OverflowError, TypeError):
+            dt = None
+        if dt is None:
+            return ""
+        day = self._session_day_label(ts)
+        if day in ("Today", "Yesterday"):
+            return f"{day} {dt:%H:%M}"
+        stamp = f"{dt:%b} {dt.day}" if dt.year == datetime.now().year else f"{dt:%b} {dt.day}, {dt.year}"
+        return f"{stamp} · {dt:%H:%M}"
+
+    def _search_hits(self, query: str) -> dict:
+        """Run ``query`` against transcripts, summaries and chats.
+
+        Returns ``{kind: [hit, ...]}`` where each hit is a display-ready dict
+        (title / meta / snippet) plus what opening it needs.
         """
-        from datetime import datetime
-
         db = self.session_manager.db
+        terms = FindController.parse_terms(query)
+        hits = {kind: [] for kind in self._SEARCH_LIMITS}
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Search")
-        dialog.resize(640, 520)
-        layout = QVBoxLayout(dialog)
-
-        query_row = QHBoxLayout()
-        query_input = QLineEdit()
-        query_input.setPlaceholderText("Keywords…")
-        search_button = QPushButton("Search")
-        query_row.addWidget(query_input, 1)
-        query_row.addWidget(search_button, 0)
-        layout.addLayout(query_row)
-
-        tabs = QTabWidget()
-        trans_list = QListWidget()
-        conv_list = QListWidget()
-        tabs.addTab(trans_list, "Transcripts")
-        tabs.addTab(conv_list, "Conversations")
-        layout.addWidget(tabs, 1)
-
-        def _placeholder(list_widget, text):
-            list_widget.clear()
-            item = QListWidgetItem(text)
-            item.setFlags(Qt.NoItemFlags)
-            list_widget.addItem(item)
-
-        def _run_search():
-            query = query_input.text().strip()
-            on_transcripts = tabs.currentIndex() == 0
-            list_widget = trans_list if on_transcripts else conv_list
-            if not query:
-                _placeholder(list_widget, "Type keywords and press Enter")
-                return
+        for r in db.search_transcripts(query, limit=self._SEARCH_LIMITS["transcript"]):
+            ts = r.get("timestamp") or 0
+            source = "Mic" if r.get("source") in ("mic", "microphone") else "System"
+            name = r.get("session_name") or f"Session {r.get('session_id')}"
             try:
-                if on_transcripts:
-                    rows = db.search_transcripts(query, limit=50)
+                clock = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""
+            except (ValueError, OSError, OverflowError):
+                clock = ""
+            hits["transcript"].append({
+                "kind": "transcript",
+                "title": name,
+                "meta": f"{source}  ·  {self._search_when(ts)}",
+                "line_title": f"{clock}  ·  {source}" if clock else source,
+                "group_label": f"{name}  ·  {self._session_day_label(ts)}",
+                "snippet": search_snippet(r.get("text"), terms),
+                "session_id": r.get("session_id"),
+                "text": r.get("text") or "",
+            })
+
+        seen_sessions = set()
+        for r in db.search_summaries(query, limit=self._SEARCH_LIMITS["summary"]):
+            session_id = r.get("session_id")
+            if session_id in seen_sessions:  # newest summary per session only
+                continue
+            seen_sessions.add(session_id)
+            name = r.get("session_name") or f"Session {session_id}"
+            content = _MARKDOWN_MARKS.sub("", r.get("content") or "")
+            hits["summary"].append({
+                "kind": "summary",
+                "title": name,
+                "meta": self._search_when(r.get("session_start_time") or r.get("created_at")),
+                "snippet": search_snippet(content, terms, 200),
+                "session_id": session_id,
+                "session_name": name,
+            })
+
+        for r in db.search_conversations(query, limit=self._SEARCH_LIMITS["chat"]):
+            count = r.get("match_count") or 0
+            meta = self._search_when(r.get("updated_at"))
+            if count:
+                meta = f"{count} message{'s' if count != 1 else ''}  ·  {meta}"
+            hits["chat"].append({
+                "kind": "chat",
+                "title": r.get("title") or f"Conversation #{r.get('id')}",
+                "meta": meta,
+                "snippet": search_snippet(_MARKDOWN_MARKS.sub("", r.get("snippet") or ""), terms),
+                "conv_id": r.get("id"),
+            })
+        return hits
+
+    def _open_search_dialog(self):
+        """Global keyword search over transcripts, summaries and chats.
+
+        Opened from the sidebar "Search Chats" button. Results update as the
+        user types (debounced, from ``_SEARCH_MIN_CHARS`` letters on); every
+        whitespace-separated keyword must match
+        (AND, case-insensitive). The kind chips filter the list - "All" shows
+        a few hits of each kind with a "Show all" link. Opening a hit:
+
+        - transcript: loads its session and lands the transcripts pane's find
+          bar on that line, pre-filled so ▲/▼ walk the session's other hits;
+        - summary: loads its session and opens the summary window;
+        - chat: loads the conversation in the assistant panel.
+
+        With no query the window lists recent searches (kept in preferences).
+        """
+        dialog = QDialog(self)
+        dialog.setObjectName("SearchDialog")
+        dialog.setWindowTitle("Search")
+        dialog.setStyleSheet(self._SEARCH_DIALOG_QSS)
+        dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        dialog.setSizeGripEnabled(True)
+        dialog.setMinimumSize(560, 420)
+        dialog.resize(getattr(self, '_search_window_size', None) or QSize(780, 620))
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = PixelPanel()
+        outer.addWidget(panel)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+
+        title_row = QHBoxLayout()
+        title_row.addWidget(PixelSectionTitle("SEARCH"), 1)
+        count_label = QLabel()
+        count_label.setObjectName("SearchMuted")
+        title_row.addWidget(count_label, 0)
+        layout.addLayout(title_row)
+
+        query_input = QLineEdit()
+        query_input.setObjectName("SearchQuery")
+        query_input.setPlaceholderText("Search transcripts, summaries and chats…")
+        query_input.setClearButtonEnabled(True)
+        query_input.addAction(self._make_icon("icon_search_dark.svg"), QLineEdit.LeadingPosition)
+        layout.addWidget(query_input)
+
+        chip_row = QHBoxLayout()
+        chip_row.setSpacing(8)
+        kind_group = QButtonGroup(dialog)
+        kind_group.setExclusive(True)
+        chips = {}
+        for key, label in self._SEARCH_KINDS:
+            chip = pixel_filter_chip(label)
+            chip.setProperty("kindKey", key)
+            chip.setChecked(key == getattr(self, '_search_kind', 'all'))
+            kind_group.addButton(chip)
+            chip_row.addWidget(chip, 0)
+            chips[key] = chip
+        if kind_group.checkedButton() is None:
+            chips["all"].setChecked(True)
+        chip_row.addStretch(1)
+        layout.addLayout(chip_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFocusPolicy(Qt.NoFocus)
+        container = QWidget()
+        list_layout = QVBoxLayout(container)
+        list_layout.setContentsMargins(0, 0, 8, 4)
+        list_layout.setSpacing(8)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(8)
+        hint = QLabel("↑ ↓ move  ·  Enter open  ·  Esc close")
+        hint.setObjectName("SearchMuted")
+        bottom_row.addWidget(hint, 1)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("SearchClose")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setFixedHeight(32)
+        # Enter in the query field opens a hit; it must never "press" Close.
+        close_btn.setAutoDefault(False)
+        close_btn.setDefault(False)
+        bottom_row.addWidget(close_btn, 0)
+        layout.addLayout(bottom_row)
+
+        state = {
+            'query': '',
+            'hits': {kind: [] for kind in self._SEARCH_LIMITS},
+            'cards': [],     # [(card, hit)] in display order
+            'selected': -1,
+            'error': None,
+            'short': False,  # something typed, but too little to search
+        }
+        debounce = QTimer(dialog)
+        debounce.setSingleShot(True)
+        debounce.setInterval(220)
+
+        def current_kind():
+            return kind_group.checkedButton().property("kindKey")
+
+        def kind_count(kind):
+            n = len(state['hits'][kind])
+            return f"{n}+" if n >= self._SEARCH_LIMITS[kind] else str(n)
+
+        def total_count():
+            hits = state['hits']
+            total = sum(len(v) for v in hits.values())
+            capped = any(len(hits[k]) >= self._SEARCH_LIMITS[k] for k in hits)
+            return total, f"{total}{'+' if capped else ''}"
+
+        def refresh_chips():
+            _total, total_text = total_count()
+            for key, label in self._SEARCH_KINDS:
+                if not state['query']:
+                    chips[key].setText(label)
+                elif key == "all":
+                    chips[key].setText(f"{label}  {total_text}")
                 else:
-                    rows = db.search_conversations(query, limit=50)
-            except Exception as e:
-                logger.error(f"Search dialog query failed: {str(e)}")
-                QMessageBox.warning(dialog, "Search failed", f"Search failed: {str(e)}")
+                    chips[key].setText(f"{label}  {kind_count(key)}")
+
+        def clear_list():
+            while list_layout.count():
+                item = list_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.hide()
+                    widget.deleteLater()
+            state['cards'] = []
+            state['selected'] = -1
+
+        def select(index, reveal=True):
+            cards = state['cards']
+            if not cards:
                 return
-            list_widget.clear()
-            if not rows:
-                _placeholder(list_widget, "No matches.")
-                return
-            if on_transcripts:
-                for r in rows:
-                    session_name = r.get("session_name") or f"Session {r.get('session_id')}"
-                    ts = r.get("timestamp", 0)
-                    time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                    text = " ".join((r.get("text") or "").split())
-                    if len(text) > 120:
-                        text = text[:120].rstrip() + "…"
-                    item = QListWidgetItem(f"{session_name}  ·  {time_str}\n{text}")
-                    item.setSizeHint(QSize(0, 46))
-                    item.setData(Qt.UserRole, (r.get("session_id"), ts))
-                    trans_list.addItem(item)
+            index = max(0, min(index, len(cards) - 1))
+            if 0 <= state['selected'] < len(cards):
+                cards[state['selected']][0].set_selected(False)
+            state['selected'] = index
+            card = cards[index][0]
+            card.set_selected(True)
+            if reveal:
+                scroll.ensureWidgetVisible(card, 0, 12)
+
+        def add_card(hit, title=None, show_title=True, meta=None):
+            card = PixelSearchResultCard(
+                hit['kind'], title if title is not None else hit['title'],
+                hit['meta'] if meta is None else meta,
+                hit['snippet'], FindController.parse_terms(state['query']),
+                show_title=show_title,
+            )
+            card.activated.connect(lambda h=hit: open_hit(h))
+            list_layout.addWidget(card)
+            state['cards'].append((card, hit))
+
+        def add_message(text):
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setAlignment(Qt.AlignCenter)
+            label.setObjectName("SearchMuted")
+            label.setStyleSheet("QLabel { padding: 40px 12px; font-size: 11pt; }")
+            list_layout.addWidget(label)
+
+        def forget_recents():
+            self._update_preferences({'recent_searches': []})
+            render()
+
+        def render_start():
+            recents = self._recent_searches()
+            if recents:
+                head = QHBoxLayout()
+                head.setContentsMargins(0, 0, 0, 0)
+                head_widget = QWidget()
+                head_widget.setLayout(head)
+                head.addWidget(pixel_group_header("Recent searches"), 1)
+                forget = QToolButton()
+                forget.setObjectName("SearchLink")
+                forget.setText("Clear")
+                forget.setCursor(Qt.PointingHandCursor)
+                forget.setFocusPolicy(Qt.NoFocus)
+                forget.clicked.connect(forget_recents)
+                head.addWidget(forget, 0, Qt.AlignBottom)
+                list_layout.addWidget(head_widget)
+                for recent in recents:
+                    btn = QPushButton()
+                    btn.setObjectName("SearchRecent")
+                    btn.setAutoDefault(False)
+                    btn.setText(f"↺  {recent}")
+                    btn.setCursor(Qt.PointingHandCursor)
+                    btn.setFocusPolicy(Qt.NoFocus)
+                    btn.clicked.connect(lambda _=False, q=recent: run_now(q))
+                    list_layout.addWidget(btn)
+                list_layout.addSpacing(8)
+            tips = QLabel(
+                "Search every transcript line, session summary and assistant chat at once.<br><br>"
+                "&#8226;&nbsp;Several words: a result must contain <b>all</b> of them.<br>"
+                "&#8226;&nbsp;Open a transcript hit to jump to that exact line in its session.<br>"
+                "&#8226;&nbsp;Open a summary hit to read that session's summary.<br>"
+                "&#8226;&nbsp;Ctrl+F searches inside the pane you're working in."
+            )
+            tips.setObjectName("SearchTips")
+            tips.setTextFormat(Qt.RichText)
+            tips.setWordWrap(True)
+            list_layout.addWidget(tips)
+
+        def render():
+            clear_list()
+            query = state['query']
+            hits = state['hits']
+            total, total_text = total_count()
+
+            if not query:
+                count_label.setText(
+                    f"Type at least {self._SEARCH_MIN_CHARS} letters" if state['short'] else ""
+                )
+                render_start()
+            elif state['error']:
+                count_label.setText("")
+                add_message(f"Search failed: {state['error']}")
+            elif not total:
+                count_label.setText("No matches")
+                add_message(f"Nothing matches “{query}”.\n"
+                            "Every word has to appear - try fewer or shorter keywords.")
             else:
-                for r in rows:
-                    title = r.get("title") or f"Conversation #{r.get('id')}"
-                    updated_at = r.get("updated_at", 0)
-                    date_str = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d")
-                    item = QListWidgetItem(f"{title}  ·  {date_str}\n{r.get('snippet', '')}")
-                    item.setSizeHint(QSize(0, 46))
-                    item.setData(Qt.UserRole, r.get("id"))
-                    conv_list.addItem(item)
+                count_label.setText(f"{total_text} match{'es' if total != 1 else ''}")
+                kind = current_kind()
+                if kind == "all":
+                    for key, label in self._SEARCH_KINDS[1:]:
+                        kind_hits = hits[key]
+                        if not kind_hits:
+                            continue
+                        list_layout.addWidget(pixel_group_header(label, len(kind_hits)))
+                        for hit in kind_hits[:self._SEARCH_PREVIEW]:
+                            add_card(hit)
+                        if len(kind_hits) > self._SEARCH_PREVIEW:
+                            more = QToolButton()
+                            more.setObjectName("SearchLink")
+                            more.setText(f"Show all {kind_count(key)} {label.lower()}  →")
+                            more.setCursor(Qt.PointingHandCursor)
+                            more.setFocusPolicy(Qt.NoFocus)
+                            more.clicked.connect(lambda _=False, k=key: show_kind(k))
+                            list_layout.addWidget(more, 0, Qt.AlignRight)
+                elif not hits[kind]:
+                    add_message(f"No {dict(self._SEARCH_KINDS)[kind].lower()} match “{query}”.")
+                elif kind == "transcript":
+                    # One header per session; the cards then only need the time.
+                    groups = {}
+                    for hit in hits["transcript"]:
+                        groups.setdefault(hit['session_id'], []).append(hit)
+                    for members in groups.values():
+                        list_layout.addWidget(pixel_group_header(members[0]['group_label'], len(members)))
+                        for hit in members:
+                            add_card(hit, title=hit['line_title'], meta="")
+                else:
+                    for hit in hits[kind]:
+                        add_card(hit)
 
-        def _on_tab_changed(_index):
-            if query_input.text().strip():
-                _run_search()
+            list_layout.addStretch(1)
+            # Start at the top, so the first group header stays in view.
+            scroll.verticalScrollBar().setValue(0)
+            if state['cards']:
+                select(0, reveal=False)
 
-        def _select_conversation_row(conv_id):
-            if not hasattr(self, "conversations_list"):
-                return
-            for i in range(self.conversations_list.count()):
-                item = self.conversations_list.item(i)
-                if item.data(Qt.UserRole) == conv_id:
-                    self.conversations_list.setCurrentItem(item)
-                    break
+        def run_search():
+            debounce.stop()
+            query = " ".join(query_input.text().split())
+            state['short'] = 0 < len(query.replace(" ", "")) < self._SEARCH_MIN_CHARS
+            if state['short']:
+                query = ""
+            state['query'] = query
+            state['error'] = None
+            state['hits'] = {kind: [] for kind in self._SEARCH_LIMITS}
+            if query:
+                try:
+                    state['hits'] = self._search_hits(query)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"Search dialog query failed: {e}")
+                    state['error'] = str(e)
+            refresh_chips()
+            render()
 
-        def _on_item_activated(item):
-            data = item.data(Qt.UserRole)
-            if data is None:
-                return
-            if tabs.currentIndex() == 0:
-                session_id, _ts = data
-                if session_id is None:
-                    return
-                dialog.accept()
-                self._select_session_by_id(session_id)
+        def run_now(query):
+            query_input.blockSignals(True)
+            query_input.setText(query)
+            query_input.blockSignals(False)
+            query_input.setFocus()
+            run_search()
+
+        def show_kind(kind):
+            chips[kind].setChecked(True)
+            on_kind_changed(chips[kind])
+
+        def on_kind_changed(button):
+            self._search_kind = button.property("kindKey")
+            render()
+
+        def open_hit(hit):
+            self._remember_search(state['query'])
+            dialog.accept()
+            if hit['kind'] == "transcript":
+                if hit['session_id'] is not None:
+                    self._open_transcript_hit(hit['session_id'], hit['text'], state['query'])
+            elif hit['kind'] == "summary":
+                self._select_session_by_id(hit['session_id'])
+                self._show_summary_by_session_id(hit['session_id'], hit['session_name'])
             else:
-                conv_id = data
-                dialog.accept()
-                self._load_conversation(conv_id)
-                _select_conversation_row(conv_id)
+                self._load_conversation(hit['conv_id'])
+                self._find_select_conversation(hit['conv_id'])
 
-        search_button.clicked.connect(_run_search)
-        query_input.returnPressed.connect(_run_search)
-        tabs.currentChanged.connect(_on_tab_changed)
-        trans_list.itemActivated.connect(_on_item_activated)
-        conv_list.itemActivated.connect(_on_item_activated)
+        def open_selected():
+            if debounce.isActive():
+                run_search()
+            if 0 <= state['selected'] < len(state['cards']):
+                open_hit(state['cards'][state['selected']][1])
 
-        _placeholder(trans_list, "Type keywords and press Enter")
-        _placeholder(conv_list, "Type keywords and press Enter")
+        class _QueryKeys(QObject):
+            """Arrow keys move the selection; Enter opens it."""
+
+            def eventFilter(self_, obj, event):
+                if event.type() != QEvent.KeyPress:
+                    return False
+                key = event.key()
+                if key == Qt.Key_Down:
+                    select(state['selected'] + 1)
+                    return True
+                if key == Qt.Key_Up:
+                    select(state['selected'] - 1)
+                    return True
+                if key == Qt.Key_PageDown:
+                    select(state['selected'] + 5)
+                    return True
+                if key == Qt.Key_PageUp:
+                    select(state['selected'] - 5)
+                    return True
+                if key in (Qt.Key_Return, Qt.Key_Enter):
+                    open_selected()
+                    return True
+                return False
+
+        query_keys = _QueryKeys(dialog)
+        query_input.installEventFilter(query_keys)
+
+        def on_text_changed(text):
+            if len("".join(text.split())) >= self._SEARCH_MIN_CHARS:
+                debounce.start()
+            else:
+                run_search()
+
+        query_input.textChanged.connect(on_text_changed)
+        debounce.timeout.connect(run_search)
+        kind_group.buttonClicked.connect(on_kind_changed)
+        close_btn.clicked.connect(dialog.reject)
+
+        def on_finished(_result):
+            debounce.stop()
+            self._search_window_size = dialog.size()
+
+        dialog.finished.connect(on_finished)
+
+        run_search()
         query_input.setFocus()
-        dialog.exec_()
+        dialog.exec()
+
+    def _open_transcript_hit(self, session_id: int, hit_text: str, query: str):
+        """Open a transcript search hit: load its session, then land the
+        transcripts pane's find bar on the matching line.
+
+        The find bar comes up pre-filled with the query, so ▲/▼ step through
+        the session's other hits from there.
+        """
+        # A highlight left on a row that the reload is about to delete.
+        self._close_find_bar()
+        self._select_session_by_id(session_id)
+        # Wait for the Search dialog to finish closing: focus returning to the
+        # main window would otherwise move the active pane, and the find bar
+        # closes whenever the active pane leaves it.
+        QTimer.singleShot(80, lambda: self._focus_transcript_hit(hit_text, query))
+
+    def _focus_transcript_hit(self, hit_text: str, query: str):
+        if not self.right_shell.isVisible():
+            self._on_status_update("Session opened - maximize the window to see the matching transcript line")
+            return
+        self._set_active_pane("right")
+        self._open_find_bar()
+        self._find_bar.set_query_text(query)
+        # Stop following the live tail, or the next layout pass would pull
+        # the stream back down to the newest line.
+        self._transcription_autoscroll = False
+        self._on_find_query_changed(query)
+
+        needle = " ".join((hit_text or "").split()).lower()
+        if not needle:
+            return
+        rows = self._layout_rows(self._transcription_layout)
+        target = next(
+            (i for i, row in enumerate(rows)
+             if needle in " ".join((row.property('find_text') or "").split()).lower()),
+            None,
+        )
+        if target in self._find.matches and self._find.current() != target:
+            self._clear_find_highlight()
+            self._find.cursor = self._find.matches.index(target)
+            self._apply_find_current()
+            self._find_bar.set_match_count(*self._find.match_label())
 
     def _on_detach_assistant(self):
         """Create a detached window for the assistant chat panel."""

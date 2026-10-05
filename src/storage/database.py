@@ -1687,38 +1687,40 @@ class Database:
     def search_summaries(self, query: str, limit: int = 10, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Search summaries by content using parameterized LIKE queries.
 
+        Same matching rule as ``search_transcripts``: whitespace-separated
+        terms are AND-matched, case-insensitive, with ``%``, ``_`` and ``\\``
+        matched literally. An empty query returns ``[]``.
+
         Args:
-            query: Search term to match against summary content
+            query: One or more space-separated keywords to match against summary content
             limit: Maximum number of results to return
             session_id: Optional session ID to limit search to a specific session
 
         Returns:
-            List of summary dictionaries with session metadata, sorted by created_at
+            List of summary dictionaries with session metadata (``session_name``,
+            ``session_start_time``), sorted by created_at DESC
 
         Raises:
             DatabaseError: If search fails
         """
+        patterns = self._like_terms(query)
+        if not patterns:
+            return []
         try:
             cursor = self.connection.cursor()
-            search_pattern = f'%{query}%'
+            conditions = ' AND '.join("su.content LIKE ? ESCAPE '\\'" for _ in patterns)
+            params = [*patterns]
             if session_id is not None:
-                cursor.execute('''
-                    SELECT su.*, s.name as session_name
-                    FROM summaries su
-                    JOIN sessions s ON su.session_id = s.id
-                    WHERE su.session_id = ? AND su.content LIKE ?
-                    ORDER BY su.created_at DESC
-                    LIMIT ?
-                ''', (session_id, search_pattern, limit))
-            else:
-                cursor.execute('''
-                    SELECT su.*, s.name as session_name
-                    FROM summaries su
-                    JOIN sessions s ON su.session_id = s.id
-                    WHERE su.content LIKE ?
-                    ORDER BY su.created_at DESC
-                    LIMIT ?
-                ''', (search_pattern, limit))
+                conditions = f'su.session_id = ? AND {conditions}'
+                params.insert(0, session_id)
+            cursor.execute(f'''
+                SELECT su.*, s.name as session_name, s.start_time as session_start_time
+                FROM summaries su
+                JOIN sessions s ON su.session_id = s.id
+                WHERE {conditions}
+                ORDER BY su.created_at DESC
+                LIMIT ?
+            ''', (*params, limit))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'Summary search failed: {str(e)}')

@@ -1369,6 +1369,14 @@ class PixelFindBar(QWidget):
     def query_text(self) -> str:
         return self._field.text()
 
+    def set_query_text(self, text: str):
+        """Fill the field without firing ``query_changed``; the caller runs
+        the query itself (and can then move to a specific match)."""
+        self._field.blockSignals(True)
+        self._field.setText(text)
+        self._field.blockSignals(False)
+        self._debounce.stop()
+
 
 # =========================
 # Summary view (BU100)
@@ -2465,6 +2473,148 @@ class PixelSessionCard(QWidget):
         painter.setBrush(QBrush(stripe))
         painter.drawRect(rect.x() + 8, rect.y() + 12, 4, max(0, rect.height() - 24))
 
+        super().paintEvent(event)
+
+
+def search_snippet(text: str, terms, width: int = 180) -> str:
+    """A ``width``-character window of ``text`` around its first match.
+
+    Whitespace is collapsed first. When the earliest occurrence of any term
+    sits past the start, the window shifts so the hit lands about a third of
+    the way in, and "…" marks each cut side - a hit deep inside a long
+    transcript chunk is still visible in the result card.
+    """
+    flat = " ".join((text or "").split())
+    if len(flat) <= width:
+        return flat
+    lowered = flat.lower()
+    hits = [lowered.find(t) for t in (terms or []) if t and t in lowered]
+    first = min(hits) if hits else 0
+    start = max(0, min(first - width // 3, len(flat) - width))
+    # Don't start or end in the middle of a word.
+    if start > 0:
+        space = flat.find(" ", start)
+        if space != -1 and space < first:
+            start = space + 1
+    end = min(len(flat), start + width)
+    if end < len(flat):
+        space = flat.rfind(" ", start, end)
+        if space > first:
+            end = space
+    snippet = flat[start:end].strip()
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(flat) else "")
+
+
+class PixelSearchResultCard(QWidget):
+    """One hit in the Search window: a kind badge, a title, a meta line on the
+    right and a snippet with the searched words highlighted.
+
+    Click (or Enter while selected) emits ``activated``; the owner decides
+    what opening a hit means for its kind.
+    """
+
+    activated = Signal()
+
+    # kind -> (badge text, fg, bg, border)
+    _KINDS = {
+        "transcript": ("TRANSCRIPT", "#FFE9A8", "#1E3F82", "#3A67C7"),
+        "summary": ("SUMMARY", "#8FE39B", "#10362F", "#3C9A6B"),
+        "chat": ("CHAT", "#6FD3FF", "#0E3350", "#2F8FC0"),
+    }
+
+    def __init__(self, kind: str, title: str, meta: str, snippet: str, terms,
+                 show_title: bool = True, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setAutoFillBackground(False)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = False
+        self._selected = False
+
+        badge_text, fg, bg, border = self._KINDS.get(kind, self._KINDS["transcript"])
+        self.badge = QLabel(badge_text)
+        self.badge.setStyleSheet(_label_qss(
+            fg, 7.5, bold=True,
+            extra=f"background: {bg}; border: 1px solid {border};"
+            " border-radius: 4px; padding: 1px 6px;"
+        ))
+
+        self.title_label = PixelElidedLabel(title)
+        self.title_label.setToolTip(title)
+        self.title_label.setStyleSheet(_label_qss("#FFF0BF", 10.5, bold=True))
+
+        self.meta_label = QLabel(meta)
+        self.meta_label.setStyleSheet(_label_qss("#8EA7D8", 9))
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(self.badge, 0, Qt.AlignVCenter)
+        head.addWidget(self.title_label, 1, Qt.AlignVCenter)
+        if not show_title:
+            head.addStretch(1)
+        head.addWidget(self.meta_label, 0, Qt.AlignVCenter)
+
+        bg_hl, fg_hl = FIND_TERM_ON_BLUE
+        self.snippet_label = QLabel()
+        self.snippet_label.setTextFormat(Qt.RichText)
+        self.snippet_label.setWordWrap(True)
+        self.snippet_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.snippet_label.setText(highlight_terms_html(snippet, terms, bg_hl, fg_hl))
+        self.snippet_label.setStyleSheet(_label_qss("#D5DFF5", 10, extra="line-height: 130%;"))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 9, 14, 10)
+        layout.setSpacing(5)
+        layout.addLayout(head)
+        layout.addWidget(self.snippet_label)
+        # Only hide, never show, before the card has a parent: showing a
+        # parentless label opens it as a blank top-level window.
+        if not show_title:
+            self.title_label.hide()
+        if not snippet:
+            self.snippet_label.hide()
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+    def set_selected(self, value: bool):
+        value = bool(value)
+        if value != self._selected:
+            self._selected = value
+            self.update()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.activated.emit()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        rect = self.rect().adjusted(1, 1, -2, -2)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        if self._selected:
+            fill, border, stripe = CARD_FILL_SELECTED, CREAM_BORDER, CREAM
+        elif self._hover:
+            fill, border, stripe = CARD_FILL_HOVER, BORDER_BLUE_ACTIVE, BORDER_BLUE_LIGHT
+        else:
+            fill, border, stripe = NAVY_INNER, BORDER_BLUE, BORDER_BLUE_LIGHT
+        path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 7)
+        painter.setBrush(QBrush(fill))
+        painter.setPen(QPen(border, 2))
+        painter.drawPath(path)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(stripe))
+        painter.drawRect(rect.x() + 8, rect.y() + 10, 4, max(0, rect.height() - 20))
         super().paintEvent(event)
 
 
