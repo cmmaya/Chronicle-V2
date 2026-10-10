@@ -160,9 +160,50 @@ _HEADING_SIZES = {1: 16, 2: 14, 3: 13, 4: 12, 5: 12, 6: 12}
 _RULE_HTML = '<hr>'
 
 
+# Models write math as LaTeX ("$q_\pi(s, a)$"). Qt rich text has no math
+# renderer, so the common subset is mapped to Greek/symbol glyphs plus
+# <sub>/<sup> instead of leaving the raw TeX source on screen.
+_MATH_RE = re.compile(r"\$(?!\s)([^$\n]*?[^\s$])\$(?!\d)")
+_TEX_SYMBOLS = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "lambda": "λ",
+    "mu": "μ", "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ", "sigma": "σ",
+    "tau": "τ", "phi": "φ", "varphi": "φ", "chi": "χ", "psi": "ψ",
+    "omega": "ω", "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ",
+    "Pi": "Π", "Sigma": "Σ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+    "cdot": "·", "times": "×", "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥",
+    "neq": "≠", "ne": "≠", "approx": "≈", "infty": "∞", "sum": "Σ",
+    "prod": "Π", "int": "∫", "partial": "∂", "nabla": "∇", "in": "∈",
+    "to": "→", "rightarrow": "→", "leftarrow": "←", "pm": "±",
+    "sqrt": "√", "ldots": "…", "dots": "…", "mid": "|",
+    "arg": "arg", "max": "max", "min": "min", "log": "log", "exp": "exp",
+}
+_TEX_CMD_RE = re.compile(r"\\([A-Za-z]+)")
+_TEX_SCRIPT_RE = re.compile(r"([_^])(?:\{([^{}]*)\}|(\\[A-Za-z]+|.))")
+_TEX_WRAP_RE = re.compile(r"\\(?:text|mathrm|mathbf|mathcal|operatorname)\{([^{}]*)\}")
+
+
+def _latex_to_html(expr: str) -> str:
+    """Render a TeX math fragment (already HTML-escaped) as inline HTML."""
+    expr = _TEX_WRAP_RE.sub(r"\1", expr)
+    expr = _TEX_CMD_RE.sub(
+        lambda m: _TEX_SYMBOLS.get(m.group(1), m.group(1)), expr
+    )
+    expr = _TEX_SCRIPT_RE.sub(
+        lambda m: "<{0}>{1}</{0}>".format(
+            "sub" if m.group(1) == "_" else "sup",
+            m.group(2) if m.group(2) is not None else m.group(3).lstrip("\\"),
+        ),
+        expr,
+    )
+    return f"<i>{expr.replace('{', '').replace('}', '')}</i>"
+
+
 def _inline_markdown_to_html(text: str) -> str:
     """Escape ``text`` and convert the inline span markers only."""
-    escaped = html_escape.escape(text)
+    escaped = _MATH_RE.sub(
+        lambda m: _latex_to_html(m.group(1)), html_escape.escape(text)
+    )
     coded = _CODE_RE.sub(
         lambda m: ('<span style="background:rgba(0,0,0,0.12);">'
                    f'{m.group(1)}</span>'),
@@ -571,6 +612,14 @@ class PixelToolButton(QToolButton):
                 color: #8090B8;
                 background: #18336F;
                 border: 2px solid #284B94;
+            }}
+
+            /* BU138: a button that is switched off but should still look
+               unselected - opt in with setProperty("quietDisabled", True). */
+            QToolButton#PixelToolButton[quietDisabled="true"]:disabled {{
+                color: #FFF0BF;
+                background: #274F9B;
+                border: {border_width}px solid {tool_border};
             }}
             """
             + _ACCENT_TOOL_QSS.get(theme.active(), "")

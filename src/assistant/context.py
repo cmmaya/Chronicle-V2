@@ -1,5 +1,7 @@
 """Assistant context retrieval for single session queries."""
 
+import json
+import re
 from typing import List, Optional, Any, Protocol
 
 from .context_models import (
@@ -11,7 +13,11 @@ from .context_models import (
     ConversationTurn,
 )
 from .rag_models import RetrievedChunk, SourceType
+from ..config import SESSION
+from ..rag.indexer import _chunk_transcripts
+from .live_qa import collapse_overlap, strip_transcript_evidence
 from ..screenshots.search import search_session_screenshots
+from ..storage.database import fts_terms
 
 
 class DatabaseProtocol(Protocol):
@@ -28,9 +34,17 @@ class DatabaseProtocol(Protocol):
 
 # Default limits for context building
 DEFAULT_TRANSCRIPT_LIMIT = 20  # Maximum transcript excerpts to include
-DEFAULT_KEYWORD_MATCHES = 5    # Maximum keyword-matched excerpts
-MAX_TRANSCRIPT_LENGTH = 500    # Maximum characters per transcript excerpt
+DEFAULT_KEYWORD_MATCHES = 12   # Maximum keyword-matched windows (in-memory search)
+MAX_TRANSCRIPT_LENGTH = 900    # Maximum characters per transcript excerpt
 DEFAULT_CONVERSATION_LIMIT = 10  # Maximum conversation turns to include
+# In-memory search (BU141): the newest windows, up to this many characters, are
+# always included - "what did she just say" is the common live question.
+RECENT_TAIL_CHARS = 3000
+# Session statuses that mean the recording is still running (src/app/session.py).
+LIVE_STATUSES = ('active', 'paused')
+# A question with fewer search terms than this is a follow-up ("is it about a
+# report?"): the previous question is searched along with it (BU143).
+FOLLOW_UP_MAX_TERMS = 3
 
 
 class AssistantContextRetriever:
@@ -89,18 +103,36 @@ class AssistantContextRetriever:
         # Get summaries
         summaries = self._get_summaries(session_id, session_name)
 
-        # Get transcripts - try RAG first, then fallback to legacy
-        transcripts = self._get_transcripts_rag_first(
-            session_id, session_name, question
-        )
-
-        # Screenshot index, with full details for the relevant ones
-        screenshots = self._get_screenshots(
-            session_id, session_name, question, transcripts
-        )
-
         # Get conversation history
         conversation_history = self._get_conversation_history(conversation_id)
+        search_query = self._search_query(question, conversation_history)
+
+        # Transcripts: the RAG index only exists once the session is stopped
+        # and indexed (BU141). A live session, or one whose index does not
+        # cover every row yet, is searched in memory from its raw rows.
+        rows = self._load_transcript_rows(session_id)
+        live = session.get("status") in LIVE_STATUSES
+        indexed = not live and self._index_covers(session_id, rows)
+
+        # BU144: a session short enough to send whole is not searched at all.
+        full = self._full_transcript(session_id, session_name, rows)
+        if full is not None:
+            transcripts = full
+        elif indexed:
+            transcripts = self._get_transcripts_rag_first(
+                session_id, session_name, search_query, rows
+            )
+        else:
+            transcripts = self._get_transcripts(
+                session_id, session_name, search_query, rows
+            )
+
+        # Screenshot index, with full details for the relevant ones. The whole
+        # transcript anchors nothing, so only the search results do.
+        screenshots = self._get_screenshots(
+            session_id, session_name, search_query,
+            [] if full is not None else transcripts,
+        )
 
         return AssistantContext(
             query=question,
@@ -109,7 +141,95 @@ class AssistantContextRetriever:
             summaries=summaries,
             screenshots=screenshots,
             conversation_history=conversation_history,
+            transcript_live=live,
+            transcript_indexed=indexed,
+            transcript_until=max(
+                (int(r.get("timestamp") or 0) for r in rows), default=0
+            ),
+            transcript_full=full is not None,
+            transcript_chars=sum(len(t.text) for t in (full or [])),
         )
+
+    @staticmethod
+    def _full_transcript(
+        session_id: int, session_name: str, rows: List[dict[str, Any]]
+    ) -> Optional[List[TranscriptExcerpt]]:
+        """Every row of the session in time order, or None to search instead.
+
+        Consecutive rows of one source overlap (the recorder's chunks do), so
+        the repeated leading words are dropped. None when whole-transcript
+        mode is off, there is nothing to send, or the text is over the limit.
+        """
+        limit = int(SESSION.get("full_transcript_max_chars", 0) or 0)
+        if limit <= 0:
+            return None
+        excerpts = []
+        previous: dict[str, str] = {}
+        total = 0
+        for row in rows:
+            text = (row.get("text") or "").strip()
+            source = row.get("source") or "microphone"
+            collapsed = collapse_overlap(previous.get(source, ""), text)
+            previous[source] = text
+            if not collapsed:
+                continue
+            total += len(collapsed)
+            if total > limit:
+                return None
+            excerpts.append(TranscriptExcerpt(
+                session_id=session_id,
+                session_name=session_name,
+                timestamp=int(row.get("timestamp") or 0),
+                source=source,
+                text=collapsed,
+            ))
+        return excerpts or None
+
+    @staticmethod
+    def _search_query(question: str, history: List[ConversationTurn]) -> str:
+        """The text searched for ``question`` (BU143).
+
+        A short follow-up carries too few terms to find anything on its own,
+        so the previous user question is searched with it. The transcript
+        evidence a live-answer question embeds is left out (BU144): minutes of
+        speech would drive the search terms.
+        """
+        question = strip_transcript_evidence(question)
+        if len(fts_terms(question)) >= FOLLOW_UP_MAX_TERMS:
+            return question
+        previous = next(
+            (t.content for t in reversed(history) if t.role == "user"), ""
+        )
+        return f"{question} {previous}".strip()
+
+    def _load_transcript_rows(self, session_id: int) -> List[dict[str, Any]]:
+        """Raw transcript rows of a session, oldest first."""
+        try:
+            rows = self._db.get_transcripts(session_id) or []
+        except Exception:
+            return []
+        return sorted(rows, key=lambda r: r.get("timestamp") or 0)
+
+    def _index_covers(self, session_id: int, rows: List[dict[str, Any]]) -> bool:
+        """Whether the session's RAG transcript document covers every row.
+
+        Indexing runs only after Stop, so right after it (and after a
+        re-transcription) the index is missing or short. A database that
+        cannot answer is trusted, so retrieval keeps its RAG-first behaviour.
+        """
+        if not rows:
+            return True
+        try:
+            doc = self._db.get_rag_document("transcript", session_id)
+        except Exception:
+            return True
+        if doc is None:
+            return False
+        try:
+            count = json.loads(doc.get("metadata_json") or "{}").get("transcript_count")
+        except Exception:
+            return True
+        return not isinstance(count, int) or count >= len(rows)
 
     def _get_summaries(
         self, session_id: int, session_name: str
@@ -141,89 +261,59 @@ class AssistantContextRetriever:
         return excerpts
 
     def _get_transcripts(
-        self, session_id: int, session_name: str, question: str
+        self,
+        session_id: int,
+        session_name: str,
+        question: str,
+        rows: Optional[List[dict[str, Any]]] = None,
     ) -> List[TranscriptExcerpt]:
-        """Retrieve and filter transcripts for a session.
+        """Search a session's raw transcript rows in memory (BU141).
 
-        Uses simple keyword matching to filter relevant transcripts
-        and limits the number of excerpts to control prompt size.
-
-        Args:
-            session_id: ID of the session.
-            session_name: Name of the session for context.
-            question: User question for keyword matching.
-
-        Returns:
-            List of filtered TranscriptExcerpt objects.
+        Used while the session is live or not yet indexed, and when the index
+        finds nothing. Rows are grouped into the same time windows the indexer
+        builds; the windows that match the question are kept, plus the newest
+        windows up to ``RECENT_TAIL_CHARS``. Excerpts come back in time order.
         """
-        # Try to get transcripts from database
-        try:
-            transcript_rows = self._db.get_transcripts(session_id)
-        except AttributeError:
-            # Database doesn't have get_transcripts method
-            raise NotImplementedError(
-                "TODO: BU039 - Implement database.get_transcripts() method "
-                "for transcript retrieval"
-            )
-        except Exception:
+        if rows is None:
+            rows = self._load_transcript_rows(session_id)
+        windows = _chunk_transcripts(rows)
+        if not windows:
             return []
 
-        if not transcript_rows:
-            return []
-
-        # Extract keywords from question (simple approach: words > 3 chars)
+        # Terms are prefixes (BU143), as in the FTS query.
         keywords = self._extract_keywords(question)
+        scored = []
+        for index, window in enumerate(windows):
+            words = set(re.findall(r'\w+', window["content"].lower()))
+            score = sum(
+                1 for k in keywords if any(w.startswith(k) for w in words)
+            )
+            if score:
+                scored.append((score, index))
+        scored.sort(key=lambda s: (-s[0], s[1]))
+        picked = {index for _, index in scored[:DEFAULT_KEYWORD_MATCHES]}
 
-        # Score and filter transcripts
-        scored_transcripts = []
-        for row in transcript_rows:
-            text = row.get("text", "")
-            timestamp = row.get("timestamp", 0)
-            source = row.get("source", "microphone")
+        used = 0
+        for index in range(len(windows) - 1, -1, -1):
+            size = len(windows[index]["content"])
+            if used and used + size > RECENT_TAIL_CHARS:
+                break
+            picked.add(index)
+            used += size
 
-            # Calculate relevance score based on keyword matches
-            score = 0
-            if keywords:
-                text_lower = text.lower()
-                for keyword in keywords:
-                    if keyword.lower() in text_lower:
-                        score += 1
-
-            scored_transcripts.append({
-                "text": text,
-                "timestamp": timestamp,
-                "source": source,
-                "score": score,
-            })
-
-        # Sort by score (descending) then by timestamp (ascending)
-        scored_transcripts.sort(key=lambda x: (-x["score"], x["timestamp"]))
-
-        # Take top matches based on keywords, fallback to recent if no keywords
-        if keywords:
-            # Take up to DEFAULT_KEYWORD_MATCHES keyword matches
-            top_transcripts = scored_transcripts[:DEFAULT_KEYWORD_MATCHES]
-        else:
-            # No keywords, take most recent up to limit
-            top_transcripts = scored_transcripts[-DEFAULT_TRANSCRIPT_LIMIT:]
-
-        # Truncate long transcripts
         excerpts = []
-        for t in top_transcripts:
-            text = t["text"]
+        for index in sorted(picked):
+            window = windows[index]
+            text = window["content"]
             if len(text) > MAX_TRANSCRIPT_LENGTH:
                 text = text[:MAX_TRANSCRIPT_LENGTH] + "..."
-
-            excerpts.append(
-                TranscriptExcerpt(
-                    session_id=session_id,
-                    session_name=session_name,
-                    timestamp=t["timestamp"],
-                    source=t["source"],
-                    text=text,
-                )
-            )
-
+            excerpts.append(TranscriptExcerpt(
+                session_id=session_id,
+                session_name=session_name,
+                timestamp=window["start_timestamp"],
+                source=window["source"] or "microphone",
+                text=text,
+            ))
         return excerpts
 
     def _convert_rag_transcripts(
@@ -276,13 +366,15 @@ class AssistantContextRetriever:
         session_id: int,
         session_name: str,
         question: str,
+        rows: Optional[List[dict[str, Any]]] = None,
     ) -> List[TranscriptExcerpt]:
-        """Get transcripts using RAG first, then fallback to legacy keyword matching.
+        """Get transcripts using RAG first, then the in-memory search.
 
         Args:
             session_id: ID of the session.
             session_name: Name of the session for context.
             question: User question for relevance filtering.
+            rows: The session's transcript rows, when already loaded.
 
         Returns:
             List of TranscriptExcerpt objects.
@@ -302,30 +394,13 @@ class AssistantContextRetriever:
                 session_id, session_name, transcript_chunks
             )
 
-        # Fallback to legacy keyword matching
-        return self._get_transcripts(session_id, session_name, question)
+        # Nothing matched in the index: search the raw rows instead
+        return self._get_transcripts(session_id, session_name, question, rows)
 
     def _extract_keywords(self, text: str) -> List[str]:
-        """Extract keywords from text for matching.
-
-        Args:
-            text: Input text to extract keywords from.
-
-        Returns:
-            List of keywords (words longer than 3 characters).
-        """
-        # Simple word extraction
-        import re
-        words = re.findall(r'\b\w+\b', text.lower())
-        # Filter: words > 3 chars, exclude common stop words
-        stop_words = {
-            "the", "and", "for", "that", "this", "with", "are", "was",
-            "have", "has", "been", "but", "not", "you", "all", "can",
-            "had", "her", "she", "him", "his", "its", "our", "they",
-            "what", "when", "where", "who", "will", "from", "have",
-        }
-        keywords = [w for w in words if len(w) > 3 and w not in stop_words]
-        return keywords
+        """Search terms of ``text``: stems with stop words dropped, matched as
+        prefixes - the same terms the FTS query uses (BU143)."""
+        return fts_terms(text)
 
     def _get_screenshots(
         self,

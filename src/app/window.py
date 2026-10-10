@@ -6,7 +6,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
                                 QGridLayout, QTextEdit, QCheckBox,
                                 QFrame, QAbstractItemView, QSplitter, QLineEdit, QCompleter,
                                 QToolButton, QToolBar, QBoxLayout, QSizePolicy, QInputDialog,
-                                QTabWidget, QButtonGroup, QGraphicsOpacityEffect, QFileDialog)
+                                QTabWidget, QButtonGroup, QGraphicsOpacityEffect, QFileDialog,
+                                QProgressBar)
 from PySide6.QtCore import (Qt, QTimer, Slot, QThread, Signal,
                              QStringListModel, QSize, QPoint, QStandardPaths,
                              QPropertyAnimation, QEasingCurve, QObject, QEvent)
@@ -38,6 +39,7 @@ from .pixel_widgets import (
 )
 from ..audio_capture.core import ChunkedAudioRecorder
 from ..audio.importer import SUPPORTED_EXTENSIONS as UPLOAD_AUDIO_EXTENSIONS
+from ..transcription.text_import import SUPPORTED_EXTENSIONS as UPLOAD_TRANSCRIPT_EXTENSIONS
 from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import (ASSISTANT_AGENTS, SESSION, SCREENSHOT, ALLOWED_MODELS,
@@ -460,9 +462,16 @@ class AssistantQueryThread(QThread):
     # Signals to communicate with the main thread
     finished_signal = Signal(object)  # Emits the AnswerResponse
     error_signal = Signal(str)  # Emits error message
+    delta_signal = Signal(str)  # Emits the answer so far, while it streams
 
-    def __init__(self, assistant_service, question, agent_id, explicit_scope, active_session_id, selected_session_id, conversation_id, system_instruction=None, persist=True):
+    def __init__(self, assistant_service, question, agent_id, explicit_scope, active_session_id, selected_session_id, conversation_id, system_instruction=None, persist=True, use_context=True, model=None, stream=False, reasoning_effort=None, max_tokens=None):
         super().__init__()
+        self.max_tokens = max_tokens or None
+        self.model = model or None
+        self.stream = stream
+        self.reasoning_effort = reasoning_effort or None
+        # False sends no session context at all (General mode).
+        self.use_context = use_context
         self.assistant_service = assistant_service
         self.question = question
         self.agent_id = agent_id
@@ -507,6 +516,11 @@ class AssistantQueryThread(QThread):
         import asyncio
 
         agent_id = self._effective_agent_id()
+        streamed = []
+
+        def on_delta(text):
+            streamed.append(text)
+            self.delta_signal.emit("".join(streamed))
 
         async def run_query():
             return await self.assistant_service.ask_async(
@@ -517,8 +531,13 @@ class AssistantQueryThread(QThread):
                 selected_session_id=self.selected_session_id,
                 conversation_id=self.conversation_id,
                 persist=self.persist,
+                use_context=self.use_context,
+                model=self.model,
+                on_delta=on_delta if self.stream else None,
+                reasoning_effort=self.reasoning_effort,
+                max_tokens=self.max_tokens,
             )
-        
+
         try:
             # Run the async function in a new event loop
             response = asyncio.run(run_query())
@@ -773,7 +792,9 @@ class MainWindow(QMainWindow):
         
         # Flag to track if we're viewing historical transcripts (not live)
         self._viewing_historical_transcripts = False
-        
+        # BU138: the displayed session is an inserted (text-file) transcript.
+        self._displaying_inserted_transcript = False
+
         # Transcription view components (for chat-like display)
         self._transcription_scroll_area = None
         self._transcription_container = None
@@ -1392,7 +1413,8 @@ class MainWindow(QMainWindow):
             self._refresh_session_completer()
 
     def _run_transcription(self, session_id: int, combo: Optional[QComboBox] = None,
-                           on_done: Optional[Callable[[], None]] = None):
+                           on_done: Optional[Callable[[], None]] = None,
+                           dialog: Optional[QDialog] = None):
         """Transcribe a session's audio that has no transcript yet, then index it.
 
         Runs on SessionManager's background job thread and returns at once -
@@ -1407,9 +1429,35 @@ class MainWindow(QMainWindow):
             on_done: Called on the UI thread after the built-in status/dialog
                 handling, whether the job succeeded or failed (e.g. to refresh
                 an All Sessions card).
+            dialog: The All Sessions window, when started from there. Its
+                progress bar then follows the job chunk by chunk and the
+                card's Transcript chip stays busy across list reloads.
         """
+        def progress_ui(text, percent):
+            try:
+                dialog._busy_update(text, percent)
+            except RuntimeError:  # window closed meanwhile
+                pass
+
+        def on_progress(finished, total):
+            # Job thread. Chunks map onto 5-95% so the bar never looks done
+            # (or untouched) before the job really ends.
+            percent = 5 + 90 * finished / total if total else 95
+            text = f"Transcribing chunk {finished}/{total}…" if total else "Transcribing…"
+            self._post_to_ui(lambda: progress_ui(text, percent))
+
+        if dialog is not None:
+            dialog._mark_busy(session_id, 'transcript_chip', 'Transcribing')
+            dialog._busy_begin("Transcribing…", 5)
+
         def done(outcome, error):
             def apply():
+                if dialog is not None:
+                    try:
+                        dialog._clear_busy(session_id)
+                        dialog._busy_end()
+                    except RuntimeError:
+                        pass
                 if error is not None:
                     logger.error(f"Transcription failed: {error}")
                     self._on_status_update(f"Transcription failed: {error}", is_error=True)
@@ -1428,7 +1476,8 @@ class MainWindow(QMainWindow):
 
         self.session_manager.submit_job(
             f'transcribe session {session_id}',
-            lambda: self.session_manager.transcribe_session(session_id),
+            lambda: self.session_manager.transcribe_session(
+                session_id, progress=on_progress if dialog is not None else None),
             done,
         )
 
@@ -3067,6 +3116,22 @@ class MainWindow(QMainWindow):
 
         return panel
 
+    @staticmethod
+    def _make_inserted_caption(alignment) -> QLabel:
+        """Small muted "Inserted Transcript" label under a transcripts title
+        (BU138 main panel, BU139 detached window). Starts hidden."""
+        caption = QLabel("Inserted Transcript")
+        caption.setAlignment(alignment)
+        caption.setStyleSheet(
+            "QLabel { color: #7E8FC2; background: transparent; border: none; }"
+        )
+        font = QFont("Courier New")
+        font.setPointSize(9)
+        font.setBold(True)
+        caption.setFont(font)
+        caption.setVisible(False)
+        return caption
+
     def _build_transcripts_panel(self) -> QWidget:
         """Build the right transcripts panel."""
         panel = PixelPanel()
@@ -3083,6 +3148,7 @@ class MainWindow(QMainWindow):
         self.transcript_filter_button = PixelToolButton(compact=True)
         self.transcript_filter_button.setIcon(self._make_icon("icon_filter_smooth.svg"))
         self.transcript_filter_button.setToolTip("Cycle transcript filter")
+        self.transcript_filter_button.setProperty("quietDisabled", True)
         self.transcript_filter_button.clicked.connect(self._cycle_transcription_filter)
         top.addWidget(self.transcript_filter_button)
 
@@ -3100,6 +3166,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(top)
 
         layout.addWidget(PixelSectionTitle("TRANSCRIPTS WINDOW", center=True))
+
+        # BU138: shown only while an inserted transcript is displayed.
+        self._inserted_transcript_caption = self._make_inserted_caption(Qt.AlignCenter)
+        layout.addWidget(self._inserted_transcript_caption)
+
         transcription_view = self._create_transcription_view()
         layout.addWidget(transcription_view, 1)
         return panel
@@ -3338,6 +3409,64 @@ class MainWindow(QMainWindow):
         if self._transcription_autoscroll:
             self._transcription_scroll_area.verticalScrollBar().setValue(maximum)
 
+    def _sync_inserted_transcript_chrome(self):
+        """Show the "Inserted Transcript" caption and switch the filter off
+        while an inserted transcript is displayed (BU138)."""
+        inserted = self._displaying_inserted_transcript
+        caption = getattr(self, '_inserted_transcript_caption', None)
+        if caption is not None:
+            caption.setVisible(inserted)
+        button = getattr(self, 'transcript_filter_button', None)
+        if button is not None:
+            button.setEnabled(not inserted)
+            button.setToolTip(
+                "Not available for inserted transcripts" if inserted else "Cycle transcript filter")
+        self._sync_detached_inserted_mode()
+
+    DETACHED_ANSWERS_HINT = (
+        "Click or drag across transcript chunks, then right-click to ask about them")
+    DETACHED_ANSWERS_HINT_INSERTED = "Answers aren't available for inserted transcripts"
+
+    def _sync_detached_inserted_mode(self):
+        """Switch the detached window's transcript-only controls off while an
+        inserted transcript is displayed (BU139).
+
+        Disabled and unchecked, but the saved Live QA modes are never touched:
+        the chip-sync helpers repaint them from those modes as soon as a
+        recorded session is shown again.
+        """
+        if not getattr(self, '_detached_window', None):
+            return
+        inserted = self._displaying_inserted_transcript
+
+        caption = getattr(self, '_detached_inserted_caption', None)
+        if caption is not None:
+            caption.setVisible(inserted)
+
+        self._detached_filter_button.setEnabled(not inserted)
+        self._detached_filter_button.setToolTip(
+            "Not available for inserted transcripts" if inserted else "Filter transcripts")
+        self._live_qa_settings_button.setEnabled(not inserted)
+        for chip in (*self._live_qa_mode_chips.values(),
+                     *self._live_qa_answer_mode_chips.values()):
+            chip.setEnabled(not inserted)
+        self._sync_live_qa_mode_chips()
+        self._sync_live_qa_answer_mode_chips()
+
+        empty = getattr(self, '_detached_answers_empty', None)
+        if empty is not None:
+            empty.setText(
+                self.DETACHED_ANSWERS_HINT_INSERTED if inserted else self.DETACHED_ANSWERS_HINT)
+
+    def _add_inserted_paragraph_to_view(self, text: str):
+        """One plain cream bubble per paragraph: no prefix, no time, no
+        grouping (BU138)."""
+        row = aligned_bubble_with_time(
+            text, variant='cream', align='left', max_width=250, time_text='')
+        row.setProperty('source', 'inserted')
+        row.setProperty('find_text', text)
+        self._transcription_layout.insertWidget(self._transcription_layout.count() - 1, row)
+
     def _clear_transcription_view(self):
         """Clear all transcriptions from the view."""
         # Clear history
@@ -3345,6 +3474,8 @@ class MainWindow(QMainWindow):
 
         # Reset viewing flag - go back to live mode
         self._viewing_historical_transcripts = False
+        self._displaying_inserted_transcript = False
+        self._sync_inserted_transcript_chrome()
         self._transcription_autoscroll = True
         self._detached_autoscroll = True
         self._transcript_groups = {}
@@ -3659,7 +3790,10 @@ class MainWindow(QMainWindow):
             
             # Set flag to indicate we're viewing historical transcripts (unless allow_live is True)
             self._viewing_historical_transcripts = not allow_live
-            
+            inserted = self.session_manager.db.is_inserted_transcript(session_id)
+            self._displaying_inserted_transcript = inserted
+            self._sync_inserted_transcript_chrome()
+
             # Get transcripts from database
             transcripts = self.session_manager.db.get_transcripts(session_id)
             
@@ -3683,7 +3817,18 @@ class MainWindow(QMainWindow):
                 
                 if not text:
                     continue
-                
+
+                if inserted:
+                    self._transcript_records.append(TranscriptRecord(
+                        text=text, source='inserted', start_dt=None, end_dt=None,
+                        transcript_id=transcript.get('id'), display_text=text))
+                    self._add_inserted_paragraph_to_view(text)
+                    if getattr(self, '_detached_window', None):
+                        self._add_transcription_to_detached(
+                            self._transcript_records[-1], len(self._transcript_records) - 1
+                        )
+                    continue
+
                 # Normalize source: 'microphone' -> 'mic', otherwise keep as-is
                 if source == 'microphone':
                     source = 'mic'
@@ -3780,8 +3925,10 @@ class MainWindow(QMainWindow):
             filename = f"chronicle_transcript_{session_name}_{timestamp}.txt"
             file_path = os.path.join(downloads_dir, filename)
 
+            # Inserted transcripts export the paragraphs as-is, blank line between.
+            separator = "\n\n" if self._displaying_inserted_transcript else "\n"
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write("\n".join(self._transcription_history))
+                f.write(separator.join(self._transcription_history))
 
             self._on_status_update(f"Transcript downloaded: {filename}")
         except Exception as e:
@@ -3993,6 +4140,9 @@ class MainWindow(QMainWindow):
             timestamp_start: ISO-format start timestamp of the chunk, if known
             timestamp_end: ISO-format end timestamp of the chunk, if known
         """
+        if self._displaying_inserted_transcript:
+            return
+
         def _parse(value: str):
             if not value:
                 return None
@@ -4123,6 +4273,7 @@ class MainWindow(QMainWindow):
         # Copy existing transcriptions from the records already on screen
         for index, record in enumerate(self._transcript_records):
             self._add_transcription_to_detached(record, index)
+        self._sync_detached_inserted_mode()
 
         self._place_detached_compact()
         # Opened from the main window, so it comes up in front of it.
@@ -4154,6 +4305,7 @@ class MainWindow(QMainWindow):
         self._live_qa_settings_button = PixelToolButton(compact=True)
         self._live_qa_settings_button.setText("⚙")
         self._live_qa_settings_button.setToolTip("Detection settings")
+        self._live_qa_settings_button.setProperty("quietDisabled", True)
         self._live_qa_settings_button.clicked.connect(self._show_live_qa_menu)
         header.addWidget(self._live_qa_settings_button, 0)
 
@@ -4265,10 +4417,7 @@ class MainWindow(QMainWindow):
         self._detached_answers_layout.setSpacing(10)
         self._detached_answers_layout.setContentsMargins(2, 2, 2, 2)
 
-        self._detached_answers_empty = pixel_empty_hint(
-            "Click or drag across transcript chunks, then right-click to ask "
-            "about them"
-        )
+        self._detached_answers_empty = pixel_empty_hint(self.DETACHED_ANSWERS_HINT)
         self._detached_answers_layout.addWidget(self._detached_answers_empty)
         self._detached_answers_layout.addStretch()
 
@@ -4362,6 +4511,7 @@ class MainWindow(QMainWindow):
         self._detached_filter_button = PixelToolButton(compact=True)
         self._detached_filter_button.setIcon(self._make_icon("icon_filter_smooth.svg"))
         self._detached_filter_button.setToolTip("Filter transcripts")
+        self._detached_filter_button.setProperty("quietDisabled", True)
         self._detached_filter_button.clicked.connect(self._show_detached_filter_menu)
         header.addWidget(self._detached_filter_button)
 
@@ -4371,6 +4521,11 @@ class MainWindow(QMainWindow):
         header.addWidget(self._detached_pin_button)
         self._sync_detached_pin_button()
         outer.addLayout(header)
+
+        # BU139: shown only while an inserted transcript is displayed.
+        self._detached_inserted_caption = self._make_inserted_caption(
+            Qt.AlignLeft | Qt.AlignVCenter)
+        outer.addWidget(self._detached_inserted_caption)
 
         # Hidden filter combo for state management
         self._detached_filter_combo = QComboBox()
@@ -4555,7 +4710,8 @@ class MainWindow(QMainWindow):
 
     def _sync_live_qa_mode_chips(self):
         for mode, chip in getattr(self, '_live_qa_mode_chips', {}).items():
-            chip.setChecked(mode == self._live_qa_mode)
+            chip.setChecked(
+                not self._displaying_inserted_transcript and mode == self._live_qa_mode)
 
     def _set_live_qa_answer_mode(self, mode: str):
         """Switch between Transcripts and General Knowledge (BU116).
@@ -4569,7 +4725,8 @@ class MainWindow(QMainWindow):
 
     def _sync_live_qa_answer_mode_chips(self):
         for mode, chip in getattr(self, '_live_qa_answer_mode_chips', {}).items():
-            chip.setChecked(mode == self._live_qa_answer_mode)
+            chip.setChecked(
+                not self._displaying_inserted_transcript and mode == self._live_qa_answer_mode)
 
     # --- reference document (BU117) --------------------------------------
 
@@ -4764,7 +4921,8 @@ class MainWindow(QMainWindow):
         Called from the transcription path, so it swallows everything: a broken
         detector must not be able to interrupt recording.
         """
-        if not self._detection_enabled or not self._detached_window:
+        if (not self._detection_enabled or not self._detached_window
+                or self._displaying_inserted_transcript):
             return
         try:
             detector = self._ensure_question_detector()
@@ -4850,7 +5008,8 @@ class MainWindow(QMainWindow):
         # BU116: the detected question is stated, and the transcript up to it
         # follows as evidence - the answer was usually said before the
         # question, not inside the detection window.
-        history = self._transcript_records[:max(indices) + 1] if indices else []
+        history = ([] if self._live_qa_answer_mode == 'general'
+                   else self._transcript_records[:max(indices) + 1] if indices else [])
         question = build_question_for_candidate(candidate, history)
 
         position = self._detached_answers_layout.indexOf(card)
@@ -5187,7 +5346,8 @@ class MainWindow(QMainWindow):
         """Ask the chat panel's agent about the selected chunks (BU113)."""
         records = self._selected_detached_records()
         selected = sorted(set(self._detached_selected_chunks))
-        earlier = self._transcript_records[:selected[0]] if selected else []
+        earlier = ([] if self._live_qa_answer_mode == 'general'
+                   else self._transcript_records[:selected[0]] if selected else [])
         question = build_question_from_records(records, earlier)
         if not question:
             self._on_status_update("Nothing selected to ask about")
@@ -5252,6 +5412,13 @@ class MainWindow(QMainWindow):
             # Live answers live on their cards only; they are not chat
             # history and must not show up in the past-conversations list.
             persist=False,
+            # General mode answers without the session: no transcript, summary
+            # or screenshots are fetched or sent.
+            use_context=self._live_qa_answer_mode != 'general',
+            model=LIVE_QA.get('answer_model'),
+            stream=True,
+            reasoning_effort=LIVE_QA.get('answer_reasoning_effort'),
+            max_tokens=LIVE_QA.get('answer_max_tokens'),
         )
         self._detached_answer_threads[card_id] = thread
         # card_id is bound into every handler, so a late response can only ever
@@ -5261,6 +5428,9 @@ class MainWindow(QMainWindow):
         )
         thread.error_signal.connect(
             lambda message, cid=card_id: self._on_detached_answer_error(cid, message)
+        )
+        thread.delta_signal.connect(
+            lambda text, cid=card_id: self._on_detached_answer_delta(cid, text)
         )
         thread.finished.connect(
             lambda cid=card_id: self._detached_answer_threads.pop(cid, None)
@@ -5283,6 +5453,12 @@ class MainWindow(QMainWindow):
             return
         card.set_answer("Thinking...")
         self._start_detached_answer(card_id, question)
+
+    def _on_detached_answer_delta(self, card_id: int, text: str):
+        """Show the answer as it streams; the finished response replaces it."""
+        card = self._detached_answer_cards.get(card_id)
+        if card is not None:
+            card.set_answer(format_answer_html(text))
 
     def _on_detached_answer_finished(self, card_id: int, response):
         card = self._detached_answer_cards.get(card_id)
@@ -5556,6 +5732,19 @@ class MainWindow(QMainWindow):
                 so a bubble can be mapped back to the chunks it contains.
         """
         if not getattr(self, '_detached_layout', None):
+            return
+
+        if record.source == 'inserted':
+            # BU139: text only - a cream, timeless bubble per paragraph, no
+            # grouping and no selection filter, so nothing can be asked.
+            width = getattr(self, '_detached_bubble_width', DETACHED_BUBBLE_MAX_WIDTH)
+            row = aligned_bubble_with_time(
+                record.text, variant='cream', align='left', max_width=width, time_text='')
+            row.setProperty('source', 'inserted')
+            row.setProperty('find_text', record.text)
+            row.setProperty('record_indices', [index])
+            bubble_of_row(row).set_max_width(width)
+            self._detached_layout.insertWidget(self._detached_layout.count() - 1, row)
             return
 
         source = record.source if record.source in ('mic', 'system') else 'mic'
@@ -7000,6 +7189,10 @@ class MainWindow(QMainWindow):
         QLabel#AllSessionsMuted {
             color: #8EA7D8; font-family: "Courier New"; font-size: 9pt;
         }
+        QProgressBar#AllSessionsProgress {
+            background: #071D52; border: 2px solid #254D9C; border-radius: 5px;
+        }
+        QProgressBar#AllSessionsProgress::chunk { background: #E37C25; border-radius: 2px; }
         QLineEdit#AllSessionsFilter {
             border-radius: 6px;
             padding: 5px 10px;
@@ -7009,20 +7202,23 @@ class MainWindow(QMainWindow):
             font-weight: 700;
         }
         QLineEdit#AllSessionsFilter:focus { border: 2px solid #FFEFC1; }
-        QPushButton#AllSessionsUpload, QPushButton#AllSessionsClose {
+        QPushButton#AllSessionsUpload, QPushButton#AllSessionsUploadTranscript,
+        QPushButton#AllSessionsClose {
             border-radius: 5px;
             padding: 0px 16px;
             font-family: "Courier New";
             font-size: 9.5pt;
             font-weight: 700;
         }
-        QPushButton#AllSessionsUpload {
+        QPushButton#AllSessionsUpload, QPushButton#AllSessionsUploadTranscript {
             color: #071846;
             background: #E37C25;
             border: 2px solid #F4A25C;
         }
-        QPushButton#AllSessionsUpload:hover { background: #EE8C38; }
-        QPushButton#AllSessionsUpload:pressed { background: #C8661A; border-color: #E37C25; }
+        QPushButton#AllSessionsUpload:hover,
+        QPushButton#AllSessionsUploadTranscript:hover { background: #EE8C38; }
+        QPushButton#AllSessionsUpload:pressed,
+        QPushButton#AllSessionsUploadTranscript:pressed { background: #C8661A; border-color: #E37C25; }
         QPushButton#AllSessionsClose {
             color: #FFF0BF;
             background: transparent;
@@ -7095,6 +7291,10 @@ class MainWindow(QMainWindow):
             return f"Started {start_str}  ·  recording {self._format_elapsed(elapsed)}"
         if live_state == 'paused':
             return f"Started {start_str}  ·  paused"
+
+        if session.get('origin') == 'text':
+            day = start_dt.strftime('%d %b %Y') if start_dt else 'Unknown date'
+            return f"{day}  ·  Inserted transcript"
 
         if start and end and end > start:
             try:
@@ -7199,15 +7399,27 @@ class MainWindow(QMainWindow):
         hint = QLabel("Double-click a card or press Open to load a session")
         hint.setObjectName("AllSessionsMuted")
         bottom_row.addWidget(hint, 1)
+        # Upload progress: hidden until an upload is running.
+        progress = QProgressBar()
+        progress.setObjectName("AllSessionsProgress")
+        progress.setRange(0, 100)
+        progress.setTextVisible(False)
+        progress.setFixedSize(180, 12)
+        progress.hide()
+        bottom_row.addWidget(progress, 0, Qt.AlignVCenter)
         upload_btn = QPushButton("Upload Audio")
         upload_btn.setObjectName("AllSessionsUpload")
         upload_btn.setToolTip("Add a WAV, iPhone (.m4a) or WhatsApp (.opus) recording as a new session and transcribe it")
+        upload_transcript_btn = QPushButton("Upload Transcript")
+        upload_transcript_btn.setObjectName("AllSessionsUploadTranscript")
+        upload_transcript_btn.setToolTip("Add a .txt transcript as a new session and summarize it")
         close_btn = QPushButton("Close")
         close_btn.setObjectName("AllSessionsClose")
-        for btn in (upload_btn, close_btn):
+        for btn in (upload_btn, upload_transcript_btn, close_btn):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(32)
         bottom_row.addWidget(upload_btn, 0)
+        bottom_row.addWidget(upload_transcript_btn, 0)
         bottom_row.addWidget(close_btn, 0)
         layout.addLayout(bottom_row)
 
@@ -7217,6 +7429,7 @@ class MainWindow(QMainWindow):
             'order': [],       # visible session ids, top to bottom
             'selected': None,
             'live': None,      # last seen _live_session_state()
+            'busy': {},        # session_id -> (chip attribute, text) while a job runs
         }
 
         def open_session(session_id):
@@ -7315,6 +7528,9 @@ class MainWindow(QMainWindow):
                     card.actions_button.setMenu(
                         self._build_session_actions_menu(session, card, dialog, live_state)
                     )
+                    busy = state['busy'].get(session_id)
+                    if busy is not None:
+                        getattr(card, busy[0]).set_state('busy', busy[1])
                     card.clicked.connect(lambda sid=session_id: select(sid))
                     card.open_requested.connect(lambda sid=session_id: open_session(sid))
                     list_layout.addWidget(card)
@@ -7385,12 +7601,70 @@ class MainWindow(QMainWindow):
         search.returnPressed.connect(open_selected)
         filter_group.buttonClicked.connect(on_filter_changed)
         upload_btn.clicked.connect(lambda: self._upload_audio_from_all_sessions(dialog))
+        upload_transcript_btn.clicked.connect(lambda: self._upload_transcript_from_all_sessions(dialog))
         close_btn.clicked.connect(dialog.close)
+
+        # Upload progress. The bar is determinate but the work is not: it
+        # creeps toward the current stage's ceiling and jumps to full when the
+        # last job ends, so it reads as "working" without promising a time.
+        hint_text = hint.text()
+        busy_state = {'jobs': 0, 'value': 0.0, 'ceiling': 0, 'generation': 0}
+        progress_timer = QTimer(dialog)
+        progress_timer.setInterval(100)
+
+        def advance_progress():
+            busy_state['value'] += (busy_state['ceiling'] - busy_state['value']) * 0.05
+            progress.setValue(int(busy_state['value']))
+
+        progress_timer.timeout.connect(advance_progress)
+
+        def busy_update(text, ceiling):
+            hint.setText(text)
+            busy_state['ceiling'] = ceiling
+
+        def busy_begin(text, ceiling):
+            busy_state['jobs'] += 1
+            busy_state['generation'] += 1
+            if busy_state['jobs'] == 1:
+                busy_state['value'] = 0.0
+                progress.setValue(0)
+                progress.show()
+                progress_timer.start()
+            busy_update(text, ceiling)
+
+        def busy_end():
+            busy_state['jobs'] = max(0, busy_state['jobs'] - 1)
+            if busy_state['jobs']:
+                return
+            progress_timer.stop()
+            progress.setValue(100)
+            generation = busy_state['generation']
+
+            def finish():
+                if busy_state['jobs'] == 0 and busy_state['generation'] == generation:
+                    progress.hide()
+                    hint.setText(hint_text)
+
+            QTimer.singleShot(350, finish)
+
+        def mark_busy(session_id, chip, text):
+            state['busy'][session_id] = (chip, text)
+            card = state['cards'].get(session_id)
+            if card is not None:
+                getattr(card, chip).set_state('busy', text)
+
+        def clear_busy(session_id):
+            state['busy'].pop(session_id, None)
 
         # Rename / delete / transcribe / summarize refresh the list in place;
         # an upload also brings its new card into view.
         dialog._reload_sessions = reload
         dialog._focus_session = focus_session
+        dialog._busy_begin = busy_begin
+        dialog._busy_update = busy_update
+        dialog._busy_end = busy_end
+        dialog._mark_busy = mark_busy
+        dialog._clear_busy = clear_busy
 
         def on_finished(_result):
             live_timer.stop()
@@ -7420,17 +7694,19 @@ class MainWindow(QMainWindow):
         menu = QMenu(card)
         menu.setStyleSheet(self._ALL_SESSIONS_MENU_QSS)
 
-        def run_step(chip, busy_text, runner):
+        def run_step(chip, busy_text, runner, **extra):
             # Show progress on the card. runner() submits a background job
             # and returns at once; the chip stays busy until the job's own
             # callback refreshes this dialog with the outcome.
             chip.set_state('busy', busy_text)
-            runner(session_id, None, on_done=lambda: self._refresh_all_sessions_window(dialog))
+            runner(session_id, None, on_done=lambda: self._refresh_all_sessions_window(dialog),
+                   **extra)
 
         if not trans_ready:
             action = menu.addAction(
                 "Transcribe" if not is_live else "Transcribe (after recording stops)",
-                lambda: run_step(card.transcript_chip, "Transcribing", self._run_transcription),
+                lambda: run_step(card.transcript_chip, "Transcribing", self._run_transcription,
+                                 dialog=dialog),
             )
             action.setEnabled(not is_live)
         elif not sum_ready:
@@ -7450,7 +7726,7 @@ class MainWindow(QMainWindow):
         # now flips a session left mid-finalize back to 'stopped', but a
         # session can still show 'processing' for a moment before that repair
         # runs - kept resumable defensively, matching resume_stopped_session.
-        if not is_live and session.get('status') in (
+        if not is_live and session.get('origin') != 'text' and session.get('status') in (
             Session.STATUS_STOPPED, Session.STATUS_PAUSED,
             Session.STATUS_COMPLETED, Session.STATUS_PROCESSING,
         ):
@@ -7564,25 +7840,80 @@ class MainWindow(QMainWindow):
             import_done,
         )
 
-    def _transcribe_uploaded_session(self, session: Session, dialog: QDialog):
-        """Transcribe a just-uploaded session and RAG-index it (background job)."""
-        self._on_status_update(f"Transcribing '{session.name}'…")
+    def _upload_transcript_from_all_sessions(self, dialog: QDialog):
+        """Import a text transcript as a new session, then summarize it (BU137).
+
+        Mirrors the audio upload: both steps run on SessionManager's job
+        thread. If the summary fails the session stays listed as "Needs
+        summary" and can be retried from its "•••" menu.
+        """
+        start_dir = getattr(self, '_upload_transcript_dir', None) or \
+            QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
+        patterns = ' '.join(f'*{ext}' for ext in UPLOAD_TRANSCRIPT_EXTENSIONS)
+        path, _ = QFileDialog.getOpenFileName(
+            dialog, "Upload Transcript", start_dir,
+            f"Transcripts ({patterns});;All files (*)",
+        )
+        if not path:
+            return
+        self._upload_transcript_dir = os.path.dirname(path)
+        file_name = os.path.basename(path)
+
+        self._on_status_update(f"Importing {file_name}…")
+        dialog._busy_begin(f"Importing {file_name}…", 40)
+
+        def import_done(session, error):
+            def apply():
+                if error is not None:
+                    dialog._busy_end()
+                    logger.error(f"Failed to import transcript {path}: {error}")
+                    self._on_status_update(f"Could not import {file_name}: {error}", is_error=True)
+                    QMessageBox.warning(dialog, "Upload Transcript", f"Could not import {file_name}.\n\n{error}")
+                    return
+                self._refresh_session_completer()
+                dialog._mark_busy(session.id, 'summary_chip', 'Summarizing')
+                dialog._focus_session(session.id)
+                dialog._busy_update(f"Summarizing '{session.name}'…", 92)
+                self._summarize_uploaded_session(session, dialog)
+            self._post_to_ui(apply)
+
+        self.session_manager.submit_job(
+            f'import {file_name}',
+            lambda: self.session_manager.import_transcript_file(path),
+            import_done,
+        )
+
+    def _summarize_uploaded_session(self, session: Session, dialog: QDialog):
+        """Summarize a just-imported transcript session (background job)."""
+        self._on_status_update(f"Summarizing '{session.name}'…")
 
         def done(outcome, error):
             def apply():
+                # Back to the stored state before the list reloads, so the card
+                # lands on its real chips (Ready, or "Needs summary" on failure).
+                dialog._clear_busy(session.id)
+                dialog._busy_end()
                 if error is not None:
-                    logger.error(f"Failed to transcribe uploaded session {session.id}: {error}")
-                    self._on_status_update(f"Transcription failed: {error}", is_error=True)
-                    QMessageBox.warning(dialog, "Transcription Failed", str(error))
+                    logger.error(f"Failed to summarize uploaded session {session.id}: {error}")
+                    self._on_status_update(f"Summary failed: {error}", is_error=True)
+                    QMessageBox.warning(dialog, "Summary Failed", str(error))
                 else:
-                    self._on_status_update(f"Uploaded '{session.name}' transcribed")
+                    self._on_status_update(f"Uploaded '{session.name}' summarized")
                 self._refresh_all_sessions_window(dialog)
             self._post_to_ui(apply)
 
         self.session_manager.submit_job(
-            f'transcribe uploaded session {session.id}',
-            lambda: self.session_manager.transcribe_session(session.id),
+            f'summarize uploaded session {session.id}',
+            lambda: self.session_manager.summarize_session(session.id),
             done,
+        )
+
+    def _transcribe_uploaded_session(self, session: Session, dialog: QDialog):
+        """Transcribe a just-uploaded session and RAG-index it (background job)."""
+        self._on_status_update(f"Transcribing '{session.name}'…")
+        self._run_transcription(
+            session.id, dialog=dialog,
+            on_done=lambda: self._refresh_all_sessions_window(dialog),
         )
 
     def _refresh_all_sessions_window(self, dialog):
@@ -8057,7 +8388,8 @@ class MainWindow(QMainWindow):
 
         for r in db.search_transcripts(query, limit=self._SEARCH_LIMITS["transcript"]):
             ts = r.get("timestamp") or 0
-            source = "Mic" if r.get("source") in ("mic", "microphone") else "System"
+            source = {"mic": "Mic", "microphone": "Mic", "inserted": "Text"}.get(
+                r.get("source"), "System")
             name = r.get("session_name") or f"Session {r.get('session_id')}"
             try:
                 clock = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""

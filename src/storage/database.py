@@ -10,7 +10,14 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 # Bump when a step is added to Database._migrate().
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# sessions.origin (BU134): where a session's transcript came from. Uploaded
+# audio counts as recorded; 'text' marks a transcript inserted from a file.
+SESSION_ORIGIN_RECORDED = 'recorded'
+SESSION_ORIGIN_TEXT = 'text'
+# transcripts.source for rows of an inserted transcript.
+TRANSCRIPT_SOURCE_INSERTED = 'inserted'
 
 # Session states that only exist while the app is running; finding one at
 # startup means the app was closed or crashed mid-session.
@@ -29,20 +36,53 @@ FTS_OPERATORS = frozenset({'AND', 'OR', 'NOT', 'NEAR'})
 _FTS_TERM_PATTERN = re.compile(r'\w+', re.UNICODE)
 
 
+# Question words that match nearly every chunk and only add noise to ranking
+# (BU143). A query made only of these keeps them, so it still searches.
+QUERY_STOP_WORDS = frozenset({
+    'a', 'about', 'after', 'again', 'all', 'also', 'am', 'an', 'and', 'any',
+    'are', 'as', 'at', 'be', 'been', 'before', 'but', 'by', 'can', 'could',
+    'did', 'do', 'does', 'during', 'for', 'from', 'gave', 'get', 'give', 'got',
+    'had', 'has', 'have', 'he', 'her', 'him', 'his', 'how', 'i', 'if', 'in',
+    'into', 'is', 'it', 'its', 'just', 'me', 'mention', 'mentioned', 'my',
+    'no', 'not', 'of', 'on', 'or', 'our', 'please', 'said', 'say', 'she',
+    'so', 'some', 'something', 'tell', 'than', 'that', 'the', 'their', 'them',
+    'there', 'these', 'they', 'this', 'those', 'to', 'us', 'was', 'we',
+    'were', 'what', 'when', 'where', 'which', 'who', 'why', 'will', 'with',
+    'would', 'you', 'your',
+})
+
+
+def _stem(word: str) -> str:
+    """Strip a common English ending so a prefix search covers inflections
+    ("advices" -> "advic", "mentioned" -> "mention", "reports" -> "report")."""
+    for suffix, min_len in (('ing', 7), ('es', 7), ('ed', 6), ('s', 5)):
+        if len(word) >= min_len and word.endswith(suffix) and not word.endswith('ss'):
+            return word[:-len(suffix)]
+    return word
+
+
+def fts_terms(query: str) -> List[str]:
+    """Search terms of a user query: lowercase stems, stop words dropped,
+    each used as a prefix (BU143). Order kept, duplicates removed."""
+    words = [w.lower() for w in _FTS_TERM_PATTERN.findall(query or '')
+             if w.upper() not in FTS_OPERATORS]
+    content = [w for w in words if w not in QUERY_STOP_WORDS and len(w) > 1]
+    return list(dict.fromkeys(_stem(w) for w in (content or words)))
+
+
 def sanitize_fts_query(query: str) -> str:
     """Turn arbitrary user text into a safe FTS5 MATCH expression.
 
     Punctuation and FTS5 metacharacters are dropped, bare operators are
-    removed, and the remaining terms are quoted and joined with OR so that
-    partial matches still rank.
+    removed, and the remaining terms (see ``fts_terms``) are quoted as prefix
+    queries and joined with OR so that partial matches still rank.
 
     Returns an empty string when no usable term remains.
     """
-    terms = [t for t in _FTS_TERM_PATTERN.findall(query or '')
-             if t.upper() not in FTS_OPERATORS]
+    terms = fts_terms(query)
     if not terms:
         return ''
-    return ' OR '.join('"{}"'.format(t) for t in terms)
+    return ' OR '.join('"{}"*'.format(t) for t in terms)
 
 
 class Database:
@@ -204,7 +244,8 @@ class Database:
                     status TEXT NOT NULL,
                     transcription_status TEXT DEFAULT 'none',
                     summary_status TEXT DEFAULT 'none',
-                    needs_finalize INTEGER NOT NULL DEFAULT 0
+                    needs_finalize INTEGER NOT NULL DEFAULT 0,
+                    origin TEXT NOT NULL DEFAULT 'recorded'
                 )
             ''')
             # end_timestamp / audio_file: the chunk a line came from, so a batch
@@ -465,14 +506,20 @@ class Database:
             self._add_column(cursor, 'screenshots', 'preview_source TEXT')
             conn.commit()
 
+        if from_version < 4:
+            # BU134: recorded vs inserted-text sessions.
+            self._add_column(cursor, 'sessions', "origin TEXT NOT NULL DEFAULT 'recorded'")
+            conn.commit()
+
     def create_session(self, name: str, start_time: datetime, status: str = 'active', 
-                       transcription_status: str = 'none', summary_status: str = 'none') -> int:
+                       transcription_status: str = 'none', summary_status: str = 'none',
+                       origin: str = SESSION_ORIGIN_RECORDED) -> int:
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
-                INSERT INTO sessions (name, start_time, status, transcription_status, summary_status)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (name, int(start_time.timestamp()), status, transcription_status, summary_status))
+                INSERT INTO sessions (name, start_time, status, transcription_status, summary_status, origin)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (name, int(start_time.timestamp()), status, transcription_status, summary_status, origin))
             self.connection.commit()
             return cursor.lastrowid
         except sqlite3.Error as e:
@@ -487,6 +534,19 @@ class Database:
             return dict(row) if row else None
         except sqlite3.Error as e:
             raise DatabaseError(f'Session retrieval failed: {str(e)}')
+
+    def get_session_origin(self, session_id: int) -> str:
+        """The session's origin; 'recorded' when the session or value is missing."""
+        try:
+            row = self.connection.execute(
+                'SELECT origin FROM sessions WHERE id = ?', (session_id,)).fetchone()
+            return (row[0] if row else None) or SESSION_ORIGIN_RECORDED
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Session origin retrieval failed: {str(e)}')
+
+    def is_inserted_transcript(self, session_id: int) -> bool:
+        """True when the session's transcript was inserted from a text file."""
+        return self.get_session_origin(session_id) == SESSION_ORIGIN_TEXT
 
     def list_sessions_with_flags(self) -> List[Dict[str, Any]]:
         """All sessions, newest first, each with ``has_transcripts`` and

@@ -1,4 +1,4 @@
-| BU    | Name                                    | Status    | Depends On          | Next  |
+﻿﻿| BU    | Name                                    | Status    | Depends On          | Next  |
 | ----- | --------------------------------------- | --------- | ------------------- | ----- |
 | BU034 | Assistant Conversation Storage          | Pending   | none                | BU035 |
 | BU035 | Assistant Agent Options Config          | Pending   | BU034               | BU036 |
@@ -202,3 +202,24 @@ Send Due Dates To Google Calendar — user-requested: a per-entry "Send to Calen
 | BU131 | Calendar Page In The Settings Pop-Up    | Completed | BU128, BU130        | BU132 |
 | BU132 | Calendar Event Service And Sent-Event Tracking | Completed | BU129, BU130 | BU133 |
 | BU133 | "Send To Calendar" Button And Event Dialog | Completed | BU129, BU131, BU132 | none |
+
+Inserted Text Transcripts — user-requested: an "Upload Transcript" button next to Upload Audio that turns a text file into a summarized session; its transcript is flagged, shows an "Inserted Transcript" caption in both transcript windows, and disables the transcript-only controls
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU134 | Session Origin Flag For Inserted Transcripts | Completed | none             | BU135 |
+| BU135 | Text Transcript File Parser             | Completed | none                | BU136 |
+| BU136 | Import A Text Transcript As A Session   | Completed | BU134, BU135        | BU137 |
+| BU137 | "Upload Transcript" Button In All Sessions | Completed | BU136              | BU138 |
+| BU138 | Inserted Transcript View In The Main Transcripts Panel | Completed | BU137 | BU139 |
+| BU139 | Inserted Transcript Mode In The Detached Window | Completed | BU138       | BU140 |
+| BU140 | "Text" Label For Inserted Transcripts In Assistant Context | Completed | BU134 | none |
+
+Assistant Answers For Live And Fresh Sessions — user-reported: a question asked right after Stop (or during recording) got 5 unrelated transcript lines and answered "not mentioned"; answers seemed to need the transcript's exact word
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU141 | Live-Aware Transcript Retrieval         | Completed | none                | BU142 |
+| BU142 | Chronological, Timestamped Session Evidence | Completed | BU141           | BU143 |
+| BU143 | Search Terms: Stop Words, Stems, Follow-Ups | Completed | BU141           | none  |
+| BU144 | Whole Transcript For Specific Session Questions | Completed | BU141, BU142    | none  |

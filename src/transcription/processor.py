@@ -249,18 +249,24 @@ class TranscriptionProcessor:
 
         return check
 
-    def _process_audio_by_source(self, session_id: int, source: str) -> List[Dict[str, Any]]:
+    def _pending_audio_files(self, session_id: int, source: str) -> List[Path]:
+        """Audio files of one source that have no transcript yet."""
+        done = self._already_transcribed(session_id)
+        return [f for f in self._get_audio_files(source=source) if not done(f, source)]
+
+    def _process_audio_by_source(self, session_id: int, source: str,
+                                 on_chunk: Optional[Callable[[], None]] = None) -> List[Dict[str, Any]]:
         """Transcribe every audio file of one source that has no transcript yet.
 
         Args:
             session_id: Database session ID
             source: Audio source ('microphone' or 'system')
+            on_chunk: Called after each file is attempted (success or not)
 
         Returns:
             List of transcription results
         """
-        done = self._already_transcribed(session_id)
-        audio_files = [f for f in self._get_audio_files(source=source) if not done(f, source)]
+        audio_files = self._pending_audio_files(session_id, source)
         results = []
 
         for audio_file in audio_files:
@@ -275,6 +281,8 @@ class TranscriptionProcessor:
                 logger.error(f"Failed to transcribe {audio_file}: {str(e)}")
             except Exception as e:
                 logger.error(f"Unexpected error processing {audio_file}: {str(e)}")
+            if on_chunk:
+                on_chunk()
         
         logger.info(f"Processed {len(results)} {source} audio files")
         return results
@@ -656,11 +664,15 @@ class TranscriptionProcessor:
             'system': sys_results
         }
     
-    def process_all(self, session_id: int) -> Dict[str, List[Dict[str, Any]]]:
+    def process_all(self, session_id: int,
+                    progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, List[Dict[str, Any]]]:
         """Process all audio files (microphone and system) for a session.
         
         Args:
             session_id: Database session ID
+            progress: Optional ``progress(done, total)`` callback, called once
+                with ``done=0`` and again after each chunk. ``total`` counts
+                the chunks that still need a transcript.
             
         Returns:
             Dictionary with 'microphone' and 'system' lists of results
@@ -668,8 +680,22 @@ class TranscriptionProcessor:
         # No eager load_model(): transcribe_audio() loads on the first file
         # that actually needs it, so a session whose chunks were all
         # transcribed live never pulls the model into memory.
-        microphone_results = self.process_microphone_audio(session_id)
-        system_results = self.process_system_audio(session_id)
+        on_chunk = None
+        if progress:
+            total = sum(len(self._pending_audio_files(session_id, source))
+                        for source in (self.SOURCE_MICROPHONE, self.SOURCE_SYSTEM))
+            finished = 0
+            progress(0, total)
+
+            def on_chunk():
+                nonlocal finished
+                finished += 1
+                progress(finished, total)
+
+        microphone_results = self._process_audio_by_source(
+            session_id, self.SOURCE_MICROPHONE, on_chunk)
+        system_results = self._process_audio_by_source(
+            session_id, self.SOURCE_SYSTEM, on_chunk)
         
         return {
             'microphone': microphone_results,

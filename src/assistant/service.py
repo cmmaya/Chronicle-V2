@@ -2,13 +2,15 @@
 
 import logging
 from dataclasses import dataclass, fields
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from .context_models import ScreenshotReference, render_screenshot_section
+from .context_models import ScreenshotReference, TranscriptExcerpt, render_screenshot_section
 from .openrouter_client import OpenRouterClient
 from .rag_context_builder import build_any_session_context, build_routed_session_context
 from .response_contract import RESPONSE_CONTRACT, parse_answer
 from .scope_offer import ScopeOffer, build_scope_offer
+from .live_qa import strip_transcript_evidence
 from .screenshot_contract import SCREENSHOT_CONTRACT, parse_screenshot_refs
 from ..rag.router import route_sessions
 from .session_resolver import (
@@ -197,16 +199,19 @@ class AssistantAnswerService:
         needs_session_context = self._needs_session_context(agent_id, question, resolution.scope)
 
         # Step 5: Retrieve context based on scope
-        background, context_text = self._retrieve_context(
+        background, context_text, full_transcript = self._retrieve_context(
             needs_session_context, resolution, question, conversation_id
         )
         session_ids = resolution.session_ids
         is_any_session = resolution.scope == ScopeResolution.ALL_SESSIONS
 
-        # Step 6: Build messages for OpenRouter
+        # Step 6: Build messages for OpenRouter. The whole transcript replaces
+        # the earlier-transcript block a live answer question embeds (BU144).
         messages = self._build_messages(
-            agent, context_text, question, conversation_id, is_any_session,
-            background=background,
+            agent, context_text,
+            strip_transcript_evidence(question) if full_transcript else question,
+            conversation_id, is_any_session,
+            background=background, full_transcript=full_transcript,
         )
 
         # Step 6: Call OpenRouter API
@@ -238,6 +243,11 @@ class AssistantAnswerService:
         selected_session_id: Optional[int] = None,
         conversation_id: Optional[int] = None,
         persist: bool = True,
+        use_context: bool = True,
+        model: Optional[str] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+        reasoning_effort: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> AnswerResponse:
         """
         Process a user question and return an answer.
@@ -251,6 +261,14 @@ class AssistantAnswerService:
             conversation_id: Existing conversation ID to continue, or None for new.
             persist: False answers without saving a conversation (live Q&A
                 answers in the Transcripts window are not chat history).
+            use_context: False answers from general knowledge alone: no
+                session context (transcript, summary, screenshots) is
+                retrieved or sent, which is also the fastest path.
+            model: Model for this answer; None uses the selected model.
+            on_delta: Streams the answer: called with each text fragment from
+                a worker thread. The finished response is still returned.
+            reasoning_effort: Passed to reasoning models ("low" thinks less).
+            max_tokens: Caps the answer length; setting it streams the answer.
 
         Returns:
             AnswerResponse with either:
@@ -323,19 +341,23 @@ class AssistantAnswerService:
 
         # Step 4: Determine if question requires session context
         # Research Helper can answer general knowledge questions without session context
-        needs_session_context = self._needs_session_context(agent_id, question, resolution.scope)
+        needs_session_context = use_context and self._needs_session_context(
+            agent_id, question, resolution.scope)
 
         # Step 5: Retrieve context based on scope
-        background, context_text = self._retrieve_context(
+        background, context_text, full_transcript = self._retrieve_context(
             needs_session_context, resolution, question, conversation_id
         )
         session_ids = resolution.session_ids
         is_any_session = resolution.scope == ScopeResolution.ALL_SESSIONS
 
-        # Step 6: Build messages for OpenRouter
+        # Step 6: Build messages for OpenRouter. The whole transcript replaces
+        # the earlier-transcript block a live answer question embeds (BU144).
         messages = self._build_messages(
-            agent, context_text, question, conversation_id, is_any_session,
-            background=background,
+            agent, context_text,
+            strip_transcript_evidence(question) if full_transcript else question,
+            conversation_id, is_any_session,
+            background=background, full_transcript=full_transcript,
         )
 
         # Step 6: Call OpenRouter API
@@ -343,7 +365,11 @@ class AssistantAnswerService:
             # Use selected model from settings (don't pass explicit model)
             answer = await self._call_openrouter_async(
                 messages,
+                model=model,
                 temperature=ANY_SESSION_TEMPERATURE if is_any_session else ANSWER_TEMPERATURE,
+                on_delta=on_delta,
+                reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
             )
         except Exception as e:
             return AnswerResponse(
@@ -494,36 +520,42 @@ class AssistantAnswerService:
         resolution: ResolutionResult,
         question: str,
         conversation_id: Optional[int],
-    ) -> Tuple[str, str]:
-        """Return ``(background, evidence)`` prompt text for the question.
+    ) -> Tuple[str, str, str]:
+        """Return ``(background, evidence, full_transcript)`` prompt text.
 
         ``background`` is the part that stays the same for every question in
         a Specific Session conversation (session name and summary); it goes
         into the system message so the provider can cache it. ``evidence`` is
         retrieved for this question and goes next to the question. Any Session
         context is routed per question, so it is all evidence.
+
+        ``full_transcript`` (BU144) is set instead of ``background`` when the
+        session is sent whole: the session header and the transcript, for the
+        start of the system message. ``evidence`` then carries the summary,
+        the transcript note and the screenshots.
         """
         if not needs_session_context:
             # research_helper general-knowledge question: history only.
-            return "", ""
+            return "", "", ""
         if resolution.scope == ScopeResolution.ALL_SESSIONS:
-            return "", self._get_all_sessions_context(question)
+            return "", self._get_all_sessions_context(question), ""
         if resolution.session_ids:
             return self._get_single_session_context(
                 resolution.session_ids[0], question, conversation_id
             )
-        return "", ""
+        return "", "", ""
 
     def _get_single_session_context(
         self, session_id: int, question: str, conversation_id: Optional[int] = None
-    ) -> Tuple[str, str]:
-        """Get bounded context for a single session as ``(background, evidence)``."""
+    ) -> Tuple[str, str, str]:
+        """Get context for a single session as
+        ``(background, evidence, full_transcript)``."""
         try:
             context = self._tools.get_session_context(
                 session_id, question, conversation_id=conversation_id
             )
             if "error" in context:
-                return "", f"Error retrieving context: {context['error']}"
+                return "", f"Error retrieving context: {context['error']}", ""
 
             self._last_screenshot_ids = {
                 sc["screenshot_id"]
@@ -531,13 +563,22 @@ class AssistantAnswerService:
                 if sc.get("screenshot_id") is not None
             }
 
-            background = self._session_background_prompt(context)
+            state = context.get("transcript_state") or {}
+            full = bool(state.get("full"))
+            logger.info(
+                "Specific Session answer: mode=%s transcript_chars=%d",
+                "full" if full else "search",
+                state.get("chars", 0) if full
+                else sum(len(t.get("text") or "") for t in context.get("transcripts", [])),
+            )
+            full_transcript = self._full_transcript_prompt(context) if full else ""
+            background = "" if full else self._session_background_prompt(context)
             evidence = self._question_evidence_prompt(context)
-            if not background and not evidence:
+            if not background and not evidence and not full_transcript:
                 evidence = "(No context found)"
-            return background, evidence
+            return background, evidence, full_transcript
         except Exception as e:
-            return "", f"Context retrieval failed: {str(e)}"
+            return "", f"Context retrieval failed: {str(e)}", ""
 
     def _get_all_sessions_context(self, question: str) -> str:
         """Route to the relevant sessions, then build context from those only.
@@ -639,18 +680,26 @@ class AssistantAnswerService:
         Kept apart from the per-question evidence so it can sit at the start of
         the prompt, where the provider's prompt cache can reuse it.
         """
-        parts = []
-
         # Conversation history is deliberately not rendered here: _build_messages
         # already replays it as real chat turns, and rendering it again doubled
         # the history tokens on every follow-up question.
+        return "\n".join(
+            self._session_header_lines(context) + self._summary_lines(context)
+        )
 
+    @staticmethod
+    def _session_header_lines(context: Dict[str, Any]) -> List[str]:
+        parts = []
         if context.get("sessions"):
             parts.append("## Relevant Sessions")
             for s in context["sessions"]:
                 parts.append(f"[Session {s['session_id']}] {s.get('session_name', 'Unknown')}")
             parts.append("")
+        return parts
 
+    @staticmethod
+    def _summary_lines(context: Dict[str, Any]) -> List[str]:
+        parts = []
         if context.get("summaries"):
             # Full text, so the Due Dates section reaches the model (a 500-char
             # cut stopped inside the Overview). Regenerating a summary appends a
@@ -662,17 +711,50 @@ class AssistantAnswerService:
             for summary_type, content in latest.items():
                 parts.append(f"[{summary_type}]: {content[:MAX_SUMMARY_CHARS]}")
             parts.append("")
+        return parts
 
-        return "\n".join(parts)
+    def _full_transcript_prompt(self, context: Dict[str, Any]) -> str:
+        """Session header and the whole transcript, in time order (BU144).
+
+        Ends the system message, so while a session records only lines
+        appended at its end change and the provider reuses the earlier prefix.
+        """
+        known = {f.name for f in fields(TranscriptExcerpt)}
+        lines = [
+            TranscriptExcerpt(**{k: v for k, v in t.items() if k in known}).to_prompt_text()
+            for t in sorted(context["transcripts"], key=lambda t: t.get("timestamp") or 0)
+        ]
+        return "\n".join(
+            self._session_header_lines(context)
+            + ["## Full transcript (in time order)"] + lines
+        )
 
     def _question_evidence_prompt(self, context: Dict[str, Any]) -> str:
         """Transcript excerpts and screenshots retrieved for this question."""
         parts = []
 
-        if context.get("transcripts"):
-            parts.append("## Transcripts")
-            for t in context["transcripts"]:
-                parts.append(f"[{t.get('session_name', 'Session')}] ({t.get('source', 'mic')}): {t.get('text', '')[:300]}")
+        note = self._transcript_state_note(
+            context.get("transcript_state") or {}, bool(context.get("summaries"))
+        )
+        if note:
+            parts.extend([note, ""])
+
+        full = bool((context.get("transcript_state") or {}).get("full"))
+        if full:
+            # The transcript is in the system message; the summary changes
+            # later, so it rides with the question (BU144).
+            parts.extend(self._summary_lines(context))
+
+        if context.get("transcripts") and not full:
+            # BU142: time order with HH:MM:SS, so "at the end of the class" and
+            # timestamp citations work. Excerpts are already length-bounded by
+            # the retriever; the session name is in the background block.
+            parts.append("## Transcripts (in time order)")
+            known = {f.name for f in fields(TranscriptExcerpt)}
+            for t in sorted(context["transcripts"], key=lambda t: t.get("timestamp") or 0):
+                parts.append(
+                    TranscriptExcerpt(**{k: v for k, v in t.items() if k in known}).to_prompt_text()
+                )
             parts.append("")
 
         if context.get("screenshots"):
@@ -684,6 +766,31 @@ class AssistantAnswerService:
 
         return "\n".join(parts)
 
+    @staticmethod
+    def _transcript_state_note(state: Dict[str, Any], has_summary: bool) -> str:
+        """Tell the model the transcript is still growing (BU142).
+
+        Empty for a finished, indexed session. Otherwise the model learns the
+        transcript stops at a given time and may have no summary yet, so it
+        does not read missing content as "never said".
+        """
+        live = state.get("live", False)
+        if not live and state.get("indexed", True):
+            return ""
+        until = state.get("until") or 0
+        until_text = (
+            f" up to {datetime.fromtimestamp(until).strftime('%H:%M:%S')}" if until else ""
+        )
+        if live:
+            note = (f"Note: this session is still being recorded. The transcript runs"
+                    f"{until_text}; anything said after that is not in it yet.")
+        else:
+            note = (f"Note: this session was just stopped and is still being processed."
+                    f" The transcript runs{until_text}.")
+        if not has_summary:
+            note += " There is no summary yet, so answer from the transcript excerpts."
+        return note
+
     def _build_messages(
         self,
         agent: Dict[str, Any],
@@ -692,6 +799,7 @@ class AssistantAnswerService:
         conversation_id: Optional[int],
         is_any_session: bool = False,
         background: str = "",
+        full_transcript: str = "",
     ) -> List[Dict[str, str]]:
         """Build OpenRouter messages, with the text that repeats across a
         conversation's questions first.
@@ -708,11 +816,17 @@ class AssistantAnswerService:
         system_content = agent['system_instruction']
         if background:
             system_content = f"{system_content}\n\nContext:\n{background}"
+        if full_transcript:
+            # BU144: instruction, screenshot contract, then the transcript last,
+            # so a growing transcript only extends the end of the prefix.
+            if self._last_screenshot_ids:
+                system_content = f"{system_content}\n\n{SCREENSHOT_CONTRACT}"
+            system_content = f"{system_content}\n\nContext:\n{full_transcript}"
         # Any Session mode only: ask the model to self-classify its answer via
         # the metadata trailer. Specific Session prompts are left untouched.
         if is_any_session:
             system_content = f"{system_content}\n\n{RESPONSE_CONTRACT}"
-        elif self._last_screenshot_ids:
+        elif self._last_screenshot_ids and not full_transcript:
             # Specific Session with screenshots in context: let the model point
             # the user at the screenshot that holds the answer (BU108). Every
             # question of a session that has screenshots lists them, so this
@@ -772,8 +886,15 @@ class AssistantAnswerService:
         messages: List[Dict[str, str]],
         model: str = None,
         temperature: Optional[float] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+        reasoning_effort: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
-        """Call OpenRouter API and return the answer (see _call_openrouter)."""
+        """Call OpenRouter API and return the answer (see _call_openrouter).
+
+        With ``on_delta``, ``reasoning_effort`` or ``max_tokens`` the answer
+        is streamed.
+        """
         # Always use fresh selected model - don't cache the client with a fixed model
         # This ensures model changes in settings are immediately applied
         selected_model = get_selected_model()
@@ -784,6 +905,11 @@ class AssistantAnswerService:
             model=effective_model, temperature=temperature
         )
 
+        if on_delta is not None or reasoning_effort or max_tokens:
+            return await openrouter_client.chat_stream_async(
+                messages, on_delta=on_delta, reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
+            )
         return await openrouter_client.chat_async(messages)
 
     def _persist_conversation(

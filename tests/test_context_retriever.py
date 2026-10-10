@@ -6,7 +6,10 @@ from src.assistant.context import (
     DEFAULT_KEYWORD_MATCHES,
     MAX_TRANSCRIPT_LENGTH,
 )
+from unittest.mock import patch
+
 from src.assistant.rag_models import SourceType
+from src.config import SESSION
 
 
 class MockDatabase:
@@ -109,6 +112,7 @@ class TestAssistantContextRetriever(unittest.TestCase):
         # Should return recent transcripts (no keywords to filter by)
         self.assertGreater(len(context.transcripts), 0)
 
+    @patch.dict(SESSION, {"full_transcript_max_chars": 0})  # BU144: search path
     def test_long_transcripts_truncated(self):
         """Test that long transcripts are truncated."""
         long_text = "A" * 1000  # Very long transcript
@@ -191,10 +195,10 @@ class TestAssistantContextRetriever(unittest.TestCase):
         db = MockDatabase()
         retriever = AssistantContextRetriever(db)
 
-        keywords = retriever._extract_keywords("the and for that this with are was")
+        keywords = retriever._extract_keywords("the and for that budget this with are was")
 
         # Stop words should be filtered out
-        self.assertEqual(len(keywords), 0)
+        self.assertEqual(keywords, ["budget"])
 
     def test_keyword_extraction_includes_content_words(self):
         """Test that content words are extracted as keywords."""
@@ -204,7 +208,7 @@ class TestAssistantContextRetriever(unittest.TestCase):
         keywords = retriever._extract_keywords("What was discussed about the project roadmap")
 
         # Should include content words > 3 chars
-        self.assertIn("discussed", keywords)
+        self.assertIn("discuss", keywords)
         self.assertIn("project", keywords)
         self.assertIn("roadmap", keywords)
 

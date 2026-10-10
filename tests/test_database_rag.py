@@ -525,16 +525,16 @@ class TestSanitizeFTSQuery(unittest.TestCase):
 
     def test_terms_are_quoted_and_or_joined(self):
         from src.storage.database import sanitize_fts_query
-        self.assertEqual(sanitize_fts_query("budget timeline"), '"budget" OR "timeline"')
+        self.assertEqual(sanitize_fts_query("budget timeline"), '"budget"* OR "timeline"*')
 
     def test_punctuation_is_stripped(self):
         from src.storage.database import sanitize_fts_query
         self.assertEqual(sanitize_fts_query("""what's the "budget"? -- really*"""),
-                         '"what" OR "s" OR "the" OR "budget" OR "really"')
+                         '"budget"* OR "really"*')
 
     def test_bare_operators_are_dropped(self):
         from src.storage.database import sanitize_fts_query
-        self.assertEqual(sanitize_fts_query("budget AND timeline"), '"budget" OR "timeline"')
+        self.assertEqual(sanitize_fts_query("budget AND timeline"), '"budget"* OR "timeline"*')
 
     def test_empty_when_nothing_usable(self):
         from src.storage.database import sanitize_fts_query

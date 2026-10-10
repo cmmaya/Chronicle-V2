@@ -26,14 +26,14 @@ class TranscriptExcerpt:
     session_id: int
     session_name: str
     timestamp: int
-    source: str  # 'microphone' or 'system'
+    source: str  # 'microphone', 'system' or 'inserted' (text transcript)
     text: str
 
     def to_prompt_text(self) -> str:
         """Format transcript excerpt for prompt inclusion."""
         dt = datetime.fromtimestamp(self.timestamp)
         time_str = dt.strftime("%H:%M:%S")
-        source_label = "Mic" if self.source == "microphone" else "Sys"
+        source_label = {"microphone": "Mic", "inserted": "Text"}.get(self.source, "Sys")
         return f"[{time_str}] ({source_label}): {self.text}"
 
 
@@ -124,6 +124,15 @@ class AssistantContext:
     summaries: list[SummaryExcerpt] = field(default_factory=list)
     screenshots: list[ScreenshotReference] = field(default_factory=list)
     conversation_history: list[ConversationTurn] = field(default_factory=list)
+    # BU141: the session is still recording / its RAG index covers every
+    # transcript row / the newest transcript row's timestamp (0 when none).
+    transcript_live: bool = False
+    transcript_indexed: bool = True
+    transcript_until: int = 0
+    # BU144: ``transcripts`` holds every row of the session (overlap collapsed),
+    # not search results; ``transcript_chars`` is the size of that text.
+    transcript_full: bool = False
+    transcript_chars: int = 0
 
     def to_prompt_text(self) -> str:
         """Render context as prompt text for LLM."""

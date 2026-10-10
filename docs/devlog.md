@@ -3643,3 +3643,245 @@ Validation:
 Next:
 
 - none
+
+## BU134 - Session Origin Flag For Inserted Transcripts
+
+Summary:
+
+- `database.py`: `SCHEMA_VERSION = 4`. `sessions.origin TEXT NOT NULL
+  DEFAULT 'recorded'` in `CREATE TABLE` and a `from_version < 4` migration
+  step (`_add_column`, idempotent). Existing sessions, and uploaded-audio
+  sessions, are `'recorded'`.
+- Constants `SESSION_ORIGIN_RECORDED`, `SESSION_ORIGIN_TEXT` (`'text'`) and
+  `TRANSCRIPT_SOURCE_INSERTED` (`'inserted'`, for the transcript rows BU136
+  will write).
+- `create_session(..., origin='recorded')`, `get_session_origin()` (returns
+  `'recorded'` for a missing session or NULL) and `is_inserted_transcript()`.
+  `get_session` and `list_sessions_with_flags` already return the column.
+
+Validation:
+
+- `tests/test_bu134.py` (4 tests: fresh DB default, `'text'` round trip
+  through every reader, missing session, v3 -> v4 migration with backup and
+  rows kept) plus `test_bu106.py` and `test_database_perf.py` pass.
+- Manual: a copy of the real `chronicle.db` (v3, 14 sessions) migrated to
+  v4, wrote `chronicle.db.bak-v3-*`, and every session reads `'recorded'`.
+  The live file migrates the same way on the next app start.
+
+Next:
+
+- BU135
+
+## BU135 - Text Transcript File Parser
+
+Summary:
+
+- New `src/transcription/text_import.py`, shaped like `src/audio/importer.py`:
+  `SUPPORTED_EXTENSIONS = ('.txt', '.md')`, `MAX_TRANSCRIPT_BYTES` (2 MB),
+  `TranscriptImportError(ValueError)` and `read_transcript_paragraphs(path)`.
+- Decoding: `utf-8-sig`, then `cp1252`. NUL byte in the first 4 KB -> "not a
+  text file". `\r\n` / `\r` normalized to `\n`; paragraphs split on blank
+  (or whitespace-only) lines; single newlines inside a paragraph kept;
+  trailing whitespace stripped; empty paragraphs dropped.
+- Missing file, unsupported extension, oversized, binary, undecodable and
+  blank files each raise `TranscriptImportError` with a short message that
+  names the file.
+
+Validation:
+
+- `tests/test_bu135.py` (11 tests: UTF-8 / BOM / cp1252 with accents,
+  `\r\n` and multiple blank lines, the six rejections, missing file) pass.
+
+Next:
+
+- BU136
+
+## BU136 - Import A Text Transcript As A Session
+
+Summary:
+
+- `SessionManager.import_transcript_file(path)`: parse, create a stopped
+  `origin='text'` / `transcribed` session (name = file stem, time = file
+  mtime), insert one `'inserted'` row per paragraph at `start + i` seconds,
+  index it. Failure after the row exists purges the session and its folder.
+  Indexing errors are logged and surfaced via `_update_status`, not raised.
+- `transcribe_session` / `finalize_session` return early for inserted
+  sessions; `load_session(with_capture=True)` (hence
+  `resume_stopped_session`) raises `ValueError("Inserted transcripts can't be
+  recorded into")`.
+- Summary is left to the caller (BU137).
+
+Validation:
+
+- `tests/test_bu136.py` (6 tests) pass with BU134/BU135 (`.venv312`).
+- The manual real-DB `summarize_session` check was not run (needs the
+  summarizer backend).
+
+Next:
+
+- BU137
+
+## BU137 - "Upload Transcript" Button In All Sessions
+
+Summary:
+
+- New `Upload Transcript` button next to Upload Audio. It imports the file via
+  `import_transcript_file`, focuses the new card with a busy Summary chip, then
+  chains `summarize_session`. Import errors and summary failures show a status
+  line and a warning box; a failed summary leaves "Needs summary".
+- Card menu hides Resume for `origin == 'text'`; card meta shows
+  "Inserted transcript" instead of a duration.
+
+Validation:
+
+- `tests/test_bu137.py` (5 tests, offscreen Qt) pass in `.venv`.
+- Manual UI checks (real file, no-API-key summary failure) not run.
+
+Next:
+
+- BU138
+
+## BU138 - Inserted Transcript View In The Main Transcripts Panel
+
+Summary:
+
+- Opening an inserted session shows plain cream left bubbles (one per
+  paragraph, no "Mic:"/"System:" prefix, no time) and an "Inserted Transcript"
+  caption under TRANSCRIPTS WINDOW. The filter button is disabled in its
+  unselected look with a "Not available for inserted transcripts" tooltip.
+  Switching to another session restores the normal view.
+- Live chunks are ignored while an inserted session is displayed; download
+  exports the paragraphs joined by blank lines.
+- `PixelToolButton` got an opt-in `quietDisabled` property (disabled keeps the
+  default colours).
+
+Validation:
+
+- `tests/test_bu138.py` (5 tests, offscreen Qt, in-memory DB) pass in `.venv`;
+  `tests/test_bu137.py` still passes.
+- Manual UI checks (screenshot match, session switching, live recording while
+  an inserted session is open) not run.
+
+Next:
+
+- BU139
+
+## BU139 - Inserted Transcript Mode In The Detached Window
+
+Summary:
+
+- Detaching (or already having detached) an inserted session shows an
+  "Inserted Transcript" caption under TRANSCRIPTS and plain cream bubbles.
+  Filter, DETECT / ANSWER chips and the settings button are disabled and
+  unchecked; bubbles have no selection filter, so click / drag / right-click
+  ask do nothing. Pin and the answers collapse toggle are untouched.
+- Saved Live QA modes are never changed; the chip sync helpers repaint them
+  when a recorded session is shown. The Live QA detector is not fed while an
+  inserted session is displayed.
+
+Validation:
+
+- `tests/test_bu139.py` (3 tests, offscreen Qt) pass in `.venv`. The two
+  column builders were also smoke-run on a stub host.
+- Manual detached-window checks not run.
+
+Next:
+
+- BU140
+
+## BU140 - "Text" Label For Inserted Transcripts In Assistant Context
+
+Summary:
+
+- Assistant prompt context and All Sessions search label inserted transcript
+  lines "Text" instead of "Sys" / "System". Other labels are unchanged.
+- `context.py` needed no change: it already keeps the row's source.
+
+Validation:
+
+- `tests/test_bu140.py` (2 tests) pass in `.venv`.
+- Manual check with the assistant / search not run.
+
+Next:
+
+- none
+
+## BU137 follow-up - Upload Transcript progress bar and refresh
+
+Summary:
+
+- Upload Transcript now shows a progress bar in the All Sessions bottom bar
+  (with "Importing ..." then "Summarizing ..." in place of the hint) from file
+  pick until the summary job ends. The card's busy chip survives list
+  reloads, and on completion the list reloads to the stored state (Ready, or
+  "Needs summary" on failure) without manual refresh.
+- Upload Audio keeps its previous behaviour.
+
+Validation:
+
+- `tests/test_bu137.py` (9 tests, offscreen Qt) pass in `.venv`; BU134-BU140
+  suites: 40 passed.
+- Manual look at the bar not run.
+
+Next:
+
+- none
+
+## BU141-BU143 - Assistant answers for live and fresh sessions
+
+Summary:
+
+- Root cause of the 2026-10-07 "no mention of an assignment" answer: the
+  question came 10 s before session 81 was indexed, so retrieval fell back to
+  5 raw rows matched by substring keywords; live sessions always took that
+  path because indexing only runs after Stop.
+- BU141: live / not-yet-indexed sessions are searched in memory over the
+  indexer's time windows, with the newest ~3000 chars always included.
+- BU142: evidence is chronological with `[HH:MM:SS]`, uncut, with a note
+  when the session is live or still processing / has no summary.
+- BU143: stop words dropped, prefix stems in FTS and in-memory search,
+  short follow-ups searched with the previous question.
+
+Validation:
+
+- `tests/test_bu141.py`, `test_bu142.py`, `test_bu143.py` plus
+  `test_context_retriever.py`, `test_bu140.py`, `test_database_rag.py`,
+  `test_context_models.py`: 87 passed in `.venv`.
+- `test_assistant_service.py` (10) and `test_openrouter_client.py` (4)
+  failures predate these BUs (same results with the changes stashed).
+- Replayed the original question on session 81: indexed, unindexed and
+  simulated-live states all include the 21:12:26 advice; unindexed / live also
+  include 21:13:26 ("the final report ..."). No live model call made.
+
+Next:
+
+- none
+
+
+## BU144 - Whole transcript for Specific Session questions
+
+Changes:
+
+- `config.SESSION["full_transcript_max_chars"]` (300000). Under it, a
+  Specific Session question gets every transcript row (live, just stopped or
+  indexed), overlap collapsed, instead of retrieved excerpts; over it, or 0,
+  the BU141-BU143 search runs as before.
+- `_build_messages`: system message = instruction, screenshot contract,
+  session header, full transcript; summary, note, screenshots and the question
+  in the user message. Detached-window questions lose their embedded evidence
+  block in full mode (kept over the limit).
+- Retrieval searches use the question without the embedded evidence block.
+- Mode and transcript size logged per answer.
+
+Validation:
+
+- `tests/test_bu144.py` plus BU141-BU143, `test_context_retriever.py`,
+  `test_database_rag.py`: 79 passed. Two older search-path tests now pin the
+  limit to 0.
+- `test_assistant_service.py` 5 failures predate this BU (same with changes
+  stashed).
+- Not done: manual live-recording checks and OpenRouter cached-token check.
+
+Next:
+
+- none

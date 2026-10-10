@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Callable
 
 from .. import paths
-from ..storage.database import Database
+from ..storage.database import Database, SESSION_ORIGIN_TEXT, TRANSCRIPT_SOURCE_INSERTED
+from ..transcription.text_import import read_transcript_paragraphs
 from ..audio.importer import decode_audio_file, write_chunks, SAMPLE_RATE as IMPORT_SAMPLE_RATE
 from ..audio_capture.chunk import AudioChunk
 from ..audio_capture.core import DualSourceChunkedRecorder
@@ -408,6 +409,49 @@ class SessionManager:
         self._update_status(f'Imported {path.name} as session {session_id} ({chunk_count} chunks)')
         return session
 
+    def import_transcript_file(self, file_path: str) -> Session:
+        """Create a stopped, transcribed session from a text transcript (BU136).
+
+        One ``'inserted'`` transcript row per paragraph, ordered by a one
+        second step from the file's modified time. The session is indexed but
+        not summarized: the caller chains ``summarize_session``. Nothing is
+        left behind if parsing or storing fails.
+
+        Returns:
+            The new Session (``origin='text'``)
+        """
+        path = Path(file_path)
+        paragraphs = read_transcript_paragraphs(path)
+
+        start = datetime.fromtimestamp(path.stat().st_mtime)
+        name = path.stem.strip() or 'Inserted transcript'
+
+        session_id = self.db.create_session(
+            name, start, status=Session.STATUS_STOPPED,
+            transcription_status='transcribed', origin=SESSION_ORIGIN_TEXT)
+        session_path = self._get_session_path(session_id)
+        try:
+            self.db.update_session(session_id, end_time=int(start.timestamp()), needs_finalize=0)
+            session = Session(session_id, name, str(session_path), db=self.db)
+            session.start_time = session.end_time = start
+            for i, paragraph in enumerate(paragraphs):
+                self.db.add_transcript(session_id, start + timedelta(seconds=i), paragraph,
+                                       TRANSCRIPT_SOURCE_INSERTED)
+        except Exception:
+            self.db.purge_session(session_id)
+            shutil.rmtree(session_path, ignore_errors=True)
+            raise
+
+        try:
+            index_session_content(self.db, session_id)
+        except Exception as e:  # noqa: BLE001 - the session is still valid
+            logger.exception(f'Indexing inserted session {session_id} failed')
+            self._update_status(f'Indexing {path.name} failed: {e}', is_error=True)
+
+        self._update_status(
+            f'Imported {path.name} as session {session_id} ({len(paragraphs)} paragraphs)')
+        return session
+
     def load_session(self, session_id: int, with_capture: bool = True) -> Session:
         """Load an existing session from database.
 
@@ -423,6 +467,8 @@ class SessionManager:
         db_session = self.db.get_session(session_id)
         if db_session is None:
             raise ValueError(f'Session {session_id} not found')
+        if with_capture and self.db.is_inserted_transcript(session_id):
+            raise ValueError("Inserted transcripts can't be recorded into")
 
         session_path = self._get_session_path(session_id)
 
@@ -682,6 +728,8 @@ class SessionManager:
             if not db_session:
                 return outcome  # deleted meanwhile
             name = db_session['name']
+            if self.db.is_inserted_transcript(session_id):
+                return outcome  # no audio to process
 
             # Chunks recorded just before Stop may still be queued.
             if self._worker.pending(session_id):
@@ -747,22 +795,28 @@ class SessionManager:
         ``on_done(result, error)`` is called on that thread."""
         self._jobs.submit(label, fn, on_done)
 
-    def _transcribe_missing(self, session_id: int) -> int:
+    def _transcribe_missing(self, session_id: int,
+                            progress: Optional[Callable[[int, int], None]] = None) -> int:
         """Batch-transcribe the session's chunks that have no transcript yet."""
         processor = self.transcription_processor_factory(
             str(self._get_session_path(session_id)), db=self.db
         )
-        results = processor.process_all(session_id)
+        results = (processor.process_all(session_id, progress=progress) if progress
+                   else processor.process_all(session_id))
         return len(results.get('microphone', [])) + len(results.get('system', []))
 
-    def transcribe_session(self, session_id: int) -> Dict[str, Any]:
+    def transcribe_session(self, session_id: int,
+                           progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
         """Transcribe a stored session's untranscribed audio and index it.
-        Blocking: run it with :meth:`submit_job`."""
+        Blocking: run it with :meth:`submit_job`. ``progress(done, total)``
+        is called on that job thread as chunks finish."""
         db_session = self.db.get_session(session_id)
         if not db_session:
             raise ValueError(f'Session {session_id} not found')
+        if self.db.is_inserted_transcript(session_id):
+            return {'session_id': session_id, 'transcribed': 0, 'has_transcripts': True}
         self._update_status(f"Transcribing '{db_session['name']}'…")
-        count = self._transcribe_missing(session_id)
+        count = self._transcribe_missing(session_id, progress)
         if self.db.has_transcripts(session_id):
             self.db.update_session(session_id, transcription_status='transcribed')
             index_session_content(self.db, session_id)

@@ -103,6 +103,10 @@ SESSION = {
     # Auto-generate summary after session stops
     # When True, a summary will be generated automatically when the session is stopped
     "auto_summary_after_stop": True,
+    # Specific Session questions send the session's whole transcript (BU144)
+    # when it is at most this many characters (about 4-5 hours of speech);
+    # longer sessions are searched. 0 always searches.
+    "full_transcript_max_chars": 300000,
 }
 
 
@@ -139,6 +143,18 @@ SCREENSHOT = {
 # through the chat agent and get_selected_model().
 LIVE_QA = {
     "detector_model": "google/gemini-3.8-flash",
+
+    # Model for live answers in the Transcripts window, separate from the chat
+    # panel's selected model so a heavier chat model does not slow them down.
+    # Empty falls back to get_selected_model(). Answers are streamed, and
+    # answer_reasoning_effort asks reasoning models to think less (ignored by
+    # models that do not reason); empty leaves the model's default.
+    "answer_model": "anthropic/claude-haiku-5.5",
+    "answer_reasoning_effort": "low",
+    # Backstop against a runaway answer; the prompts already ask for two
+    # sentences. Kept generous: a tight cap cuts answers off mid-sentence and
+    # eats a reasoning model's thinking budget. 0 sends no cap.
+    "answer_max_tokens": 500,
 
     # Offered in the BU115 picker, each with the note shown at the point of
     # choice so the tradeoff is visible where it is made.
@@ -201,8 +217,8 @@ LIVE_QA = {
         {
             "id": "general",
             "label": "General",
-            "note": "Answer directly from general knowledge, with no "
-                    "evidence check",
+            "note": "Answer from general knowledge alone; no transcript is "
+                    "sent (fastest)",
         },
     ],
 
@@ -225,6 +241,7 @@ LIVE_QA = {
             "- Otherwise, reply with exactly these two lines:\n"
             "  From transcripts: No answer found\n"
             "  General knowledge: <answer>\n\n"
+            "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
             "At most two sentences per answer, or a short list when the "
             "question genuinely needs one. No preamble, no restating the "
             "question, no hedging about being an AI, no closing offer of "
@@ -237,6 +254,7 @@ LIVE_QA = {
             "material sent with the question is background about where the "
             "question came from, not the subject of it, and is not to be "
             "checked or cited.\n\n"
+            "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
             "At most two sentences, or a short list when the question "
             "genuinely needs one. No label or prefix, no preamble, no "
             "restating the question, no hedging about being an AI, no "
@@ -312,6 +330,7 @@ REFERENCE_DOC = {
         "    From transcripts: No answer found\n"
         "    From {name}: No answer found\n"
         "    General knowledge: <answer>\n\n"
+        "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
         "At most two sentences per answer, or a short list when the question "
         "genuinely needs one. No preamble, no restating the question, no "
         "hedging about being an AI, no closing offer of further help. Never "
@@ -377,6 +396,14 @@ AUDIO_CAPTURE = {
 }
 
 
+# OpenRouter provider routing per model. A listed model is sent to exactly
+# these providers, with no fallback to others (the OpenRouter `provider`
+# request field), so latency and behaviour stay predictable.
+MODEL_PROVIDER_ROUTING = {
+    "anthropic/claude-haiku-5.5": {"only": ["anthropic"], "allow_fallbacks": False},
+}
+
+
 # Model Selection Settings
 ALLOWED_MODELS = [
     # OpenAI
@@ -386,6 +413,7 @@ ALLOWED_MODELS = [
     "openai/gpt-5",
     "openai/o3",
     # Anthropic
+    "anthropic/claude-haiku-5.5",
     "anthropic/claude-3.5-haiku",
     "anthropic/claude-sonnet-4",
     "anthropic/claude-opus-4.5",

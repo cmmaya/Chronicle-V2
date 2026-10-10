@@ -379,6 +379,13 @@ class AssistantRetrievalTools:
             "summaries": [],
             "screenshots": [],
             "conversation_history": [],
+            "transcript_state": {
+                "live": context.transcript_live,
+                "indexed": context.transcript_indexed,
+                "until": context.transcript_until,
+                "full": context.transcript_full,
+                "chars": context.transcript_chars,
+            },
         }
 
         # Add sessions
