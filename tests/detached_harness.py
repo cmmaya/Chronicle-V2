@@ -72,9 +72,10 @@ class DetachedHarness(MainWindow):
         self._live_qa_detector_model = LIVE_QA.get('detector_model')
         self._live_qa_spend_chip = None
 
-        # BU117 reference document, held by the window and nothing else.
-        self._reference_doc = None
-        self._reference_chip = None
+        # BU151 documents chip in the header, built with the answers column.
+        self._detached_documents_chip = None
+        self._displaying_inserted_transcript = False
+        self._live_qa_answer_model = LIVE_QA.get('answer_model')
 
         self.status_messages = []
 

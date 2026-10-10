@@ -1,12 +1,12 @@
-"""Live Q&A over the transcript stream (BU113, BU114, BU116, BU117).
+"""Live Q&A over the transcript stream (BU113, BU114, BU116, BU151).
 
 Two halves, and they stay separable on purpose:
 
 - question assembly (BU113, BU116): turning the chunks a user selected in the
   detached window - or the question the detector found - into the one question
   string handed to the assistant, and choosing the instruction the answer is
-  written under - including the three-tier one an attached reference document
-  earns (BU117; the document itself lives in ``reference_doc``). Pure text, no
+  written under - including the three-tier one a session with documents earns
+  (BU151; the documents themselves are the service's business). Pure text, no
   network;
 - question detection (BU114): watching the live stream and emitting
   de-duplicated candidates. This half does call OpenRouter, on its own worker
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable, List, Optional
 
-from ..config import LIVE_QA, REFERENCE_DOC
+from ..config import LIVE_QA
 
 logger = logging.getLogger(__name__)
 
@@ -174,24 +174,25 @@ def strip_transcript_evidence(question: str) -> str:
     return question
 
 
-def answer_instruction(mode: str, reference_name: str = "") -> str:
-    """The system instruction one answer mode answers with (BU116, BU117).
+def answer_instruction(mode: str, has_documents: bool = False) -> str:
+    """The system instruction one answer mode answers with (BU116, BU151).
 
     An unknown mode falls back to ``transcripts``: the evidence-first prompt is
     the safe one to be wrong with, because it labels where its answer came
     from.
 
-    ``reference_name`` is the attached document's filename (BU117). It adds the
+    ``has_documents`` says the displayed session has documents. It adds the
     middle evidence tier, and only to Transcripts mode - General Knowledge is
-    the mode that does not check evidence, and a document is evidence.
+    the mode that does not check evidence, and a document is evidence. Without
+    documents the result is exactly ``LIVE_QA["answer_instructions"][mode]``.
     """
     instructions = LIVE_QA.get("answer_instructions", {})
     if mode == "general":
         return instructions.get("general", "")
-    if reference_name:
-        template = REFERENCE_DOC.get("answer_instruction")
-        if template:
-            return template.format(name=reference_name)
+    if has_documents:
+        variant = LIVE_QA.get("answer_instruction_with_documents")
+        if variant:
+            return variant
     return instructions.get(mode) or instructions.get("transcripts", "")
 
 
@@ -504,6 +505,8 @@ DETECTOR_COST_PER_CALL = {
     "google/gemini-3.8-flash": 0.0024,
     "qwen/qwen3-14b": 0.0004,
     "google/gemini-2.5-flash": 0.0005,
+    # Rough: ~700 tokens in, ~100 out at the listed Haiku 5.5 price.
+    "anthropic/claude-haiku-5.5": 0.0002,
 }
 DEFAULT_COST_PER_CALL = 0.001
 

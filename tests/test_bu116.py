@@ -490,9 +490,9 @@ class AnswerLabelRenderingTest(unittest.TestCase):
         self.assertIn("From transcripts:", html)
         self.assertIn("General knowledge:", html)
 
-    def test_a_reference_document_label_is_recognised(self):
-        html = format_answer_html("From syllabus.txt: exercise 4 is on page 7.")
-        self.assertIn("From syllabus.txt:", html)
+    def test_a_documents_label_is_recognised(self):
+        html = format_answer_html("From documents: exercise 4 is on page 7.")
+        self.assertIn("From documents:", html)
         self.assertIn("<b>", html)
 
     def test_an_unlabelled_answer_renders_as_before(self):

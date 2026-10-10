@@ -269,13 +269,12 @@ def simple_markdown_to_html(text: str) -> str:
     )
 
 
-# BU116/BU117: the evidence label is what tells the user how far to trust the
+# BU116/BU151: the evidence label is what tells the user how far to trust the
 # answer, so it must not dissolve into the body prose. Deliberately narrow -
-# the three labels the answer prompts emit, plus "From <name>.txt:" for an
-# attached reference document - so an ordinary sentence opening with "From the
-# slides the answer is:" is not mistaken for one.
+# the labels the answer prompts emit - so an ordinary sentence opening with
+# "From the slides the answer is:" is not mistaken for one.
 _ANSWER_LABEL_RE = re.compile(
-    r"^(From transcripts|General knowledge|From\s+\S[^:\n]{0,80}\.txt)\s*:\s*",
+    r"^(From transcripts|From documents|General knowledge)\s*:\s*",
     re.IGNORECASE,
 )
 
@@ -2274,9 +2273,14 @@ class PixelShotsChip(QWidget):
 
     ICON_SIZE = 18
     COUNT_PT = 7.5
+    ICON_FILE = "icon_camera.svg"
+    NOUN = "screenshot"
+
+    clicked = Signal()
 
     def __init__(self, count: int = 0, parent=None):
         super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
         self.setObjectName("PixelShotsChip")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(
@@ -2285,7 +2289,7 @@ class PixelShotsChip(QWidget):
         )
         self.icon_label = QLabel()
         self.icon_label.setStyleSheet("QLabel { background: transparent; border: none; }")
-        self.icon_label.setPixmap(QIcon(asset_path("icon_camera.svg")).pixmap(
+        self.icon_label.setPixmap(QIcon(asset_path(self.ICON_FILE)).pixmap(
             QSize(self.ICON_SIZE, self.ICON_SIZE)
         ))
         self.count_label = QLabel()
@@ -2306,7 +2310,7 @@ class PixelShotsChip(QWidget):
     def set_count(self, count: int):
         count = max(0, int(count or 0))
         self.count_label.setText(str(count))
-        self.setToolTip(f"{count} screenshot{'s' if count != 1 else ''}")
+        self.setToolTip(f"{count} {self.NOUN}{'s' if count != 1 else ''} - click to open")
         # Showing a chip that has no parent yet would open it as a top-level
         # window (and PixelWindowChrome would give it a title bar); unhidden,
         # it simply appears with the card it is placed in.
@@ -2314,6 +2318,20 @@ class PixelShotsChip(QWidget):
             self.hide()
         elif self.parentWidget() is not None:
             self.show()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()  # do not also select the card underneath
+            return
+        super().mousePressEvent(event)
+
+
+class PixelDocsChip(PixelShotsChip):
+    """Like the screenshots chip, for a session's documents."""
+
+    ICON_FILE = "icon_document.svg"
+    NOUN = "document"
 
 
 class PixelSessionCard(QWidget):
@@ -2326,9 +2344,12 @@ class PixelSessionCard(QWidget):
 
     clicked = Signal()
     open_requested = Signal()
+    screenshots_requested = Signal()
+    documents_requested = Signal()
 
     def __init__(self, name: str, meta: str, trans_ready: bool, sum_ready: bool,
-                 live_state=None, shot_count: int = 0, parent=None):
+                 live_state=None, shot_count: int = 0, doc_count: int = 0,
+                 parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_Hover, True)
         self.setAutoFillBackground(False)
@@ -2365,6 +2386,10 @@ class PixelSessionCard(QWidget):
         self.summary_chip.setMinimumWidth(metrics.horizontalAdvance("… Summarizing") + 18)
         self.shots_chip = PixelShotsChip(shot_count)
         self.shots_chip.setFixedHeight(self.transcript_chip.sizeHint().height())
+        self.shots_chip.clicked.connect(self.screenshots_requested.emit)
+        self.docs_chip = PixelDocsChip(doc_count)
+        self.docs_chip.setFixedHeight(self.transcript_chip.sizeHint().height())
+        self.docs_chip.clicked.connect(self.documents_requested.emit)
 
         self.open_button = QToolButton()
         self.open_button.setText("Open")
@@ -2418,6 +2443,7 @@ class PixelSessionCard(QWidget):
         layout.setContentsMargins(22, 10, 14, 10)
         layout.setSpacing(8)
         layout.addLayout(text_col, 1)
+        layout.addWidget(self.docs_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.shots_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.transcript_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.summary_chip, 0, Qt.AlignVCenter)
@@ -2438,6 +2464,9 @@ class PixelSessionCard(QWidget):
 
     def set_shot_count(self, count: int):
         self.shots_chip.set_count(count)
+
+    def set_doc_count(self, count: int):
+        self.docs_chip.set_count(count)
 
     def set_meta(self, text: str):
         if self.meta_label.text() != text:
@@ -2762,6 +2791,15 @@ class PixelAnswerCard(QWidget):
         )
         layout.addWidget(self.body_label)
 
+        # BU151: which session documents the answer used; hidden until it did.
+        self.document_badge_row = QWidget()
+        badge_layout = QHBoxLayout(self.document_badge_row)
+        badge_layout.setContentsMargins(0, 0, 0, 0)
+        self._document_badge = None
+        self._document_badge_layout = badge_layout
+        self.document_badge_row.hide()
+        layout.addWidget(self.document_badge_row)
+
     def set_answer(self, html: str):
         """Fill the card with the rendered answer."""
         self.retry_button.hide()
@@ -2769,6 +2807,19 @@ class PixelAnswerCard(QWidget):
             _label_qss("#D8E3FF", 10, extra="background: transparent;")
         )
         self.body_label.setText(html)
+
+    def set_document_badge(self, names):
+        """Badge the documents the answer used; no names clears it (BU151)."""
+        if self._document_badge is not None:
+            self._document_badge_layout.removeWidget(self._document_badge)
+            self._document_badge.deleteLater()
+            self._document_badge = None
+        names = [n for n in names if n]
+        if names:
+            self._document_badge = PixelDocumentBadge(names)
+            self._document_badge_layout.addWidget(self._document_badge, 0, Qt.AlignLeft)
+            self._document_badge_layout.addStretch(1)
+        self.document_badge_row.setVisible(bool(names))
 
     def set_error(self, message: str):
         """Show a failure the user can retry from."""
@@ -2894,67 +2945,73 @@ def pixel_spend_chip(text: str) -> QLabel:
     return label
 
 
-class PixelReferenceChip(QWidget):
-    """The attached reference document, in the answers rail header (BU117).
+REMOVED_DOCUMENT_LABEL = "(removed document)"
+BADGE_MAX_CHARS = 40
 
-    Names the document and how big it is, because "a file is attached" is not
-    the fact the user needs - "*that* file is attached" is. Clicking the name
-    replaces the document; the X detaches it. Hidden entirely when nothing is
-    attached, rather than sitting there as an empty placeholder.
+
+def document_badge_text(names) -> str:
+    """``From: a.pdf, b.md`` for the badge, elided to ``BADGE_MAX_CHARS``."""
+    text = "From: " + ", ".join(names)
+    if len(text) > BADGE_MAX_CHARS:
+        text = text[:BADGE_MAX_CHARS - 1].rstrip(" ,") + "…"
+    return text
+
+
+class PixelDocumentBadge(QWidget):
+    """Under an answer: which session documents it was built from (BU150).
+
+    A chip, not text in the bubble, so the answer reads the same with or
+    without it. Same green chip vocabulary as the BU117 reference chip it replaced. Long lists are
+    elided; the tooltip holds the full one.
     """
 
-    replace_requested = Signal()
-    remove_requested = Signal()
-
-    def __init__(self, parent=None):
+    def __init__(self, names, parent=None):
         super().__init__(parent)
-        self.setObjectName("PixelReferenceChip")
+        names = list(names)
+        self.setObjectName("PixelDocumentBadge")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(
-            "QWidget#PixelReferenceChip { background: #123A1E;"
+            "QWidget#PixelDocumentBadge { background: #123A1E;"
             " border: 1px solid #4E9A63; border-radius: 4px; }"
         )
         self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-
+        self.setToolTip("Documents this answer used: " + ", ".join(names))
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 2, 4, 2)
+        layout.setContentsMargins(8, 3, 8, 3)
         layout.setSpacing(6)
+        self.label = QLabel("📄 " + document_badge_text(names))
+        self.label.setStyleSheet(_label_qss("#A8E3B4", 8, bold=True))
+        layout.addWidget(self.label)
+        self.names = names
 
-        self.name_button = QToolButton()
-        self.name_button.setCursor(Qt.PointingHandCursor)
-        self.name_button.setToolTip("Click to attach a different document")
-        self.name_button.setStyleSheet(
-            """
-            QToolButton {
-                color: #A8E3B4;
-                background: transparent;
-                border: none;
-                padding: 2px 0px;
-                font-family: 'Courier New';
-                font-size: 8pt;
-                font-weight: 700;
-            }
-            QToolButton:hover { color: #D6F5DD; }
-            """
+
+class PixelDocumentsChip(QToolButton):
+    """"📄 N documents" beside the scope label; opens the Documents pop-up.
+
+    Hidden for zero - no empty placeholder, no "0 documents".
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PixelDocumentsChip")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("This session's documents - click to manage")
+        self.setStyleSheet(
+            "QToolButton { color: #A8E3B4; background: #123A1E;"
+            " border: 1px solid #4E9A63; border-radius: 4px; padding: 3px 8px;"
+            " font-family: 'Courier New'; font-size: 8pt; font-weight: 700; }"
+            "QToolButton:hover { color: #D6F5DD; }"
         )
-        self.name_button.clicked.connect(self.replace_requested)
-        layout.addWidget(self.name_button, 0)
-
-        self.remove_button = pixel_mini_button(
-            "✕", "Detach this document", width=20, height=18
-        )
-        self.remove_button.clicked.connect(self.remove_requested)
-        layout.addWidget(self.remove_button, 0)
-
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.hide()
 
-    def set_document(self, name: str, size_label: str):
-        self.name_button.setText(f"{name} · {size_label}")
-        self.show()
-
-    def clear_document(self):
-        self.name_button.setText("")
-        self.hide()
+    def set_count(self, count: int):
+        if count > 0:
+            self.setText(f"📄 {count} document" + ("" if count == 1 else "s"))
+            self.show()
+        else:
+            self.setText("")
+            self.hide()
 
 
 class PixelDropOverlay(QWidget):

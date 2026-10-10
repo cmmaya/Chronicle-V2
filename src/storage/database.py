@@ -7,10 +7,12 @@ import threading
 from typing import Optional, List, Dict, Any, Iterable, Set, Tuple
 from datetime import datetime
 
+from ..config import SESSION_DOCUMENTS
+
 logger = logging.getLogger(__name__)
 
 # Bump when a step is added to Database._migrate().
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # sessions.origin (BU134): where a session's transcript came from. Uploaded
 # audio counts as recorded; 'text' marks a transcript inserted from a file.
@@ -18,6 +20,28 @@ SESSION_ORIGIN_RECORDED = 'recorded'
 SESSION_ORIGIN_TEXT = 'text'
 # transcripts.source for rows of an inserted transcript.
 TRANSCRIPT_SOURCE_INSERTED = 'inserted'
+
+# Session Documents (BU146): extracted text only, one row per document.
+_SESSION_DOCUMENTS_TABLE = '''
+    CREATE TABLE IF NOT EXISTS session_documents (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        file_bytes INTEGER,
+        text TEXT NOT NULL,
+        char_count INTEGER NOT NULL,
+        added_at INTEGER NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    )
+'''
+_SESSION_DOCUMENTS_INDEX = (
+    'CREATE INDEX IF NOT EXISTS idx_session_documents_session '
+    'ON session_documents(session_id, added_at)'
+)
+_SESSION_DOCUMENT_LIST_COLUMNS = (
+    'id, session_id, name, file_type, file_bytes, char_count, added_at'
+)
 
 # Session states that only exist while the app is running; finding one at
 # startup means the app was closed or crashed mid-session.
@@ -401,6 +425,7 @@ class Database:
                     FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 )
             ''')
+            cursor.execute(_SESSION_DOCUMENTS_TABLE)
             conn.commit()
 
             if version < SCHEMA_VERSION:
@@ -422,6 +447,7 @@ class Database:
                 'CREATE INDEX IF NOT EXISTS idx_conversations_session ON assistant_conversations(session_id)',
                 'CREATE INDEX IF NOT EXISTS idx_conversations_updated ON assistant_conversations(updated_at)',
                 'CREATE INDEX IF NOT EXISTS idx_messages_conversation ON assistant_messages(conversation_id, timestamp)',
+                _SESSION_DOCUMENTS_INDEX,
             ):
                 cursor.execute(statement)
             conn.commit()
@@ -511,6 +537,12 @@ class Database:
             self._add_column(cursor, 'sessions', "origin TEXT NOT NULL DEFAULT 'recorded'")
             conn.commit()
 
+        if from_version < 5:
+            # BU146: documents added to a session (extracted text only).
+            cursor.execute(_SESSION_DOCUMENTS_TABLE)
+            cursor.execute(_SESSION_DOCUMENTS_INDEX)
+            conn.commit()
+
     def create_session(self, name: str, start_time: datetime, status: str = 'active', 
                        transcription_status: str = 'none', summary_status: str = 'none',
                        origin: str = SESSION_ORIGIN_RECORDED) -> int:
@@ -558,7 +590,8 @@ class Database:
                 SELECT s.*,
                        EXISTS (SELECT 1 FROM transcripts t WHERE t.session_id = s.id) AS has_transcripts,
                        EXISTS (SELECT 1 FROM summaries su WHERE su.session_id = s.id) AS has_summary,
-                       (SELECT COUNT(*) FROM screenshots sc WHERE sc.session_id = s.id) AS screenshot_count
+                       (SELECT COUNT(*) FROM screenshots sc WHERE sc.session_id = s.id) AS screenshot_count,
+                       (SELECT COUNT(*) FROM session_documents d WHERE d.session_id = s.id) AS document_count
                 FROM sessions s
                 ORDER BY s.start_time DESC
             ''')
@@ -633,6 +666,7 @@ class Database:
         try:
             cursor = self.connection.cursor()
             cursor.execute('DELETE FROM calendar_events WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM session_documents WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
             self.connection.commit()
         except sqlite3.Error as e:
@@ -700,6 +734,7 @@ class Database:
             cursor.execute('DELETE FROM transcripts WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM screenshots WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM calendar_events WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM session_documents WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
 
             self.connection.commit()
@@ -745,6 +780,7 @@ class Database:
             ('screenshots', 'DELETE FROM screenshots WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('summaries', 'DELETE FROM summaries WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('calendar_events', 'DELETE FROM calendar_events WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('session_documents', 'DELETE FROM session_documents WHERE session_id NOT IN (SELECT id FROM sessions)'),
         )
         removed = {}
         for table, sql in statements:
@@ -764,6 +800,91 @@ class Database:
         if any(removed.values()):
             self._reclaim_free_pages()
         return removed
+
+    # --- Session Documents (BU146) ---------------------------------------
+
+    def add_session_document(self, session_id: int, name: str, file_type: str,
+                             file_bytes: Optional[int], text: str) -> int:
+        """Store a document's extracted text for a session; returns its id.
+
+        Refused with a user-readable ``DatabaseError`` when the session is at
+        ``SESSION_DOCUMENTS["max_per_session"]`` or already has a document of
+        the same name (case-insensitive). The check and the insert share one
+        transaction.
+        """
+        limit = SESSION_DOCUMENTS['max_per_session']
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('BEGIN IMMEDIATE')
+            try:
+                count, same_name = cursor.execute(
+                    'SELECT COUNT(*), COALESCE(SUM(LOWER(name) = LOWER(?)), 0) '
+                    'FROM session_documents WHERE session_id = ?',
+                    (name, session_id),
+                ).fetchone()
+                if count >= limit:
+                    raise DatabaseError(
+                        f'This session already has {limit} documents. '
+                        'Remove one to add another.')
+                if same_name:
+                    raise DatabaseError(
+                        f'This session already has a document named {name}.')
+                cursor.execute(
+                    'INSERT INTO session_documents '
+                    '(session_id, name, file_type, file_bytes, text, char_count, added_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    (session_id, name, file_type, file_bytes, text, len(text),
+                     int(datetime.now().timestamp())),
+                )
+                document_id = cursor.lastrowid
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
+            return document_id
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Document save failed: {str(e)}')
+
+    def get_session_documents(self, session_id: int) -> List[Dict[str, Any]]:
+        """A session's documents with their text, oldest first."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'SELECT * FROM session_documents WHERE session_id = ? '
+                'ORDER BY added_at, id', (session_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Document listing failed: {str(e)}')
+
+    def list_session_documents(self, session_id: int) -> List[Dict[str, Any]]:
+        """Like ``get_session_documents`` without ``text``, for lists and
+        indicators that must not load the documents themselves."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                f'SELECT {_SESSION_DOCUMENT_LIST_COLUMNS} FROM session_documents '
+                'WHERE session_id = ? ORDER BY added_at, id', (session_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Document listing failed: {str(e)}')
+
+    def count_session_documents(self, session_id: int) -> int:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                'SELECT COUNT(*) FROM session_documents WHERE session_id = ?',
+                (session_id,))
+            return cursor.fetchone()[0]
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Document count failed: {str(e)}')
+
+    def delete_session_document(self, document_id: int) -> None:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM session_documents WHERE id = ?', (document_id,))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Document deletion failed: {str(e)}')
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         try:

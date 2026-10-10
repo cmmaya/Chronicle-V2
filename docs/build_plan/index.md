@@ -1,4 +1,4 @@
-﻿﻿| BU    | Name                                    | Status    | Depends On          | Next  |
+﻿| BU    | Name                                    | Status    | Depends On          | Next  |
 | ----- | --------------------------------------- | --------- | ------------------- | ----- |
 | BU034 | Assistant Conversation Storage          | Pending   | none                | BU035 |
 | BU035 | Assistant Agent Options Config          | Pending   | BU034               | BU036 |
@@ -223,3 +223,15 @@ Assistant Answers For Live And Fresh Sessions — user-reported: a question aske
 | BU142 | Chronological, Timestamped Session Evidence | Completed | BU141           | BU143 |
 | BU143 | Search Terms: Stop Words, Stems, Follow-Ups | Completed | BU141           | none  |
 | BU144 | Whole Transcript For Specific Session Questions | Completed | BU141, BU142    | none  |
+
+Session Documents — user-requested: add documents (.txt, .md, .pdf, .docx) to a session from the All Sessions "•••" menu, in a pop-up with drag-and-drop, Import, a list and a text preview; they become extra evidence for that session's Specific Session questions and the detached window's answers (never Any Session), answers that used one show a badge, and a session with no documents is answered exactly as before. Replaces BU117's window-held .txt with one system
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU145 | No-Document Prompt Baseline             | Completed   | none                | BU146 |
+| BU146 | Session Documents Table                 | Completed   | none                | BU147 |
+| BU147 | Document Text Extraction (.txt, .md, .pdf, .docx) | Completed | none      | BU148 |
+| BU148 | Session Documents Pop-Up From The All Sessions Menu | Completed | BU146, BU147 | BU149 |
+| BU149 | Session Documents In Specific Session Prompts | Completed | BU145, BU146  | BU150 |
+| BU150 | Document Badge On Chat Answers And A Documents Indicator | Completed | BU148, BU149 | BU151 |
+| BU151 | Detached Window On Session Documents (Replaces The BU117 Attachment) | Completed | BU145, BU148, BU149, BU150 | none |

@@ -109,6 +109,24 @@ SESSION = {
     "full_transcript_max_chars": 300000,
 }
 
+# Documents a user adds to a session (BU146): extracted text kept in the
+# database, used as extra context for that session's Specific Session answers.
+SESSION_DOCUMENTS = {
+    "max_per_session": 5,
+    "max_file_bytes": 2 * 1024 * 1024,
+    "allowed_extensions": [".txt", ".md", ".pdf", ".docx"],
+    # Extracted text outside these bounds is refused (BU147): below the
+    # minimum a scanned PDF "worked" but holds nothing to answer from; above
+    # the maximum it would be cut silently.
+    "min_text_chars": 40,
+    "max_text_chars": 400000,
+    # Specific Session prompts (BU149): documents that together fit this are
+    # sent whole, in the cached part of the prompt; otherwise each document
+    # contributes a per-question excerpt of at most excerpt_chars_per_document.
+    "whole_total_max_chars": 60000,
+    "excerpt_chars_per_document": 4000,
+}
+
 
 # Screenshot capture settings (BU110)
 SCREENSHOT = {
@@ -150,6 +168,25 @@ LIVE_QA = {
     # answer_reasoning_effort asks reasoning models to think less (ignored by
     # models that do not reason); empty leaves the model's default.
     "answer_model": "anthropic/claude-haiku-5.5",
+    # Offered in the transcript window's settings menu. An empty id means the
+    # chat panel's selected model.
+    "answer_models": [
+        {
+            "id": "anthropic/claude-haiku-5.5",
+            "label": "Claude Haiku 5.5",
+            "note": "Fast, no hidden reasoning",
+        },
+        {
+            "id": "google/gemini-3.8-flash",
+            "label": "Gemini 3.8 Flash",
+            "note": "Reasons before answering - slower",
+        },
+        {
+            "id": "",
+            "label": "Chat model",
+            "note": "Whatever the chat panel uses",
+        },
+    ],
     "answer_reasoning_effort": "low",
     # Backstop against a runaway answer; the prompts already ask for two
     # sentences. Kept generous: a tight cap cuts answers off mid-sentence and
@@ -173,6 +210,11 @@ LIVE_QA = {
             "id": "google/gemini-2.5-flash",
             "label": "Gemini 2.5 Flash",
             "note": "Weak - $0.04/session, marks rhetorical as genuine",
+        },
+        {
+            "id": "anthropic/claude-haiku-5.5",
+            "label": "Claude Haiku 5.5",
+            "note": "Fast - not yet replayed on session 46, accuracy unmeasured",
         },
     ],
 
@@ -242,8 +284,10 @@ LIVE_QA = {
             "  From transcripts: No answer found\n"
             "  General knowledge: <answer>\n\n"
             "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
-            "At most two sentences per answer, or a short list when the "
-            "question genuinely needs one. No preamble, no restating the "
+            "Keep the answer under 25 words, or a short list when the "
+            "question genuinely needs one. Give the answer itself, not the "
+            "evidence behind it: no quoting or retelling what the speaker "
+            "said, no parenthetical detail. No preamble, no restating the "
             "question, no hedging about being an AI, no closing offer of "
             "further help. Never emit a line other than the ones above."
         ),
@@ -255,12 +299,47 @@ LIVE_QA = {
             "question came from, not the subject of it, and is not to be "
             "checked or cited.\n\n"
             "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
-            "At most two sentences, or a short list when the question "
-            "genuinely needs one. No label or prefix, no preamble, no "
+            "Keep the answer under 25 words, or a short list when the "
+            "question genuinely needs one. No label or prefix, no preamble, no "
             "restating the question, no hedging about being an AI, no "
             "closing offer of further help."
         ),
     },
+
+    # BU151: Transcripts mode when the displayed session has documents. Three
+    # evidence tiers instead of two, each labelled so the user can see which
+    # one answered; the closing "Documents used:" line is how the service
+    # tells the card which documents to badge. Without documents the plain
+    # "transcripts" instruction above is used, unchanged.
+    "answer_instruction_with_documents": (
+        "You answer a question during a live meeting or lecture. Your "
+        "answer is shown in a small card next to the transcript.\n\n"
+        "You have two sources of evidence: the session transcript, and the "
+        "documents the user added to this session (each headed [D<id>] with "
+        "its file name). Check them in that order. " + _ASR_NOTE + " A source "
+        "answers the question if it states the answer, paraphrases it, or "
+        "mentions it in a partial or garbled form - look for all three before "
+        "deciding it does not.\n"
+        "- If the transcript answers the question, reply with exactly one "
+        "line:\n"
+        "  From transcripts: <answer>\n"
+        "- If it does not but a document does, reply with exactly these "
+        "lines:\n"
+        "  From transcripts: No answer found\n"
+        "  From documents: <answer>\n"
+        "  Documents used: D<id>, D<id>\n"
+        "- If neither does, reply with exactly these three lines:\n"
+        "  From transcripts: No answer found\n"
+        "  From documents: No answer found\n"
+        "  General knowledge: <answer>\n\n"
+        "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
+        "Keep the answer under 25 words, or a short list when the "
+        "question genuinely needs one. Give the answer itself, not the "
+        "evidence behind it: no quoting or retelling what the speaker "
+        "said, no parenthetical detail. No preamble, no restating the "
+        "question, no hedging about being an AI, no closing offer of "
+        "further help. Never emit a line other than the ones above."
+    ),
 
     # Handled locally, with no model call: every model tested got these right,
     # so paying for them is pure waste.
@@ -285,57 +364,6 @@ LIVE_QA = {
         "no",
         "yes",
     ],
-}
-
-
-# Reference Document Settings (BU117)
-# A plain-text file the user drops on the detached window, used as a second
-# evidence tier when answering. Scratch state attached to the open window: it
-# is never indexed, never persisted, and never re-read after the window closes.
-REFERENCE_DOC = {
-    # Hard ceiling on what may be read at all. A syllabus or a problem set is
-    # a few tens of KB; anything past this is not the kind of document this
-    # feature is for, and refusing it early is what keeps a prompt from being
-    # blown up by a dropped log file.
-    "max_bytes": 512 * 1024,
-
-    # How much of it may reach one prompt. The excerpt is chosen per question,
-    # so the cap bounds the per-answer cost rather than the document size.
-    "max_excerpt_chars": 4000,
-
-    # Plain text only, deliberately: no parsing, no extraction, no format
-    # detection. PDF/.docx/.md stay out until the plain path proves useful.
-    "allowed_extensions": [".txt"],
-
-    # Transcripts mode with a document attached: three evidence tiers instead
-    # of two, each labelled so the user can see which one answered. Replaces
-    # LIVE_QA["answer_instructions"]["transcripts"] while a document is
-    # attached; General Knowledge mode never uses it.
-    "answer_instruction": (
-        "You answer a question during a live meeting or lecture. Your answer "
-        "is shown in a small card next to the transcript.\n\n"
-        "You have two sources of evidence: the session transcript, and a "
-        "reference document the user attached, named {name}. Check them in "
-        "that order. " + _ASR_NOTE + " A source answers the question if it "
-        "states the answer, paraphrases it, or mentions it in a partial or "
-        "garbled form - look for all three before deciding it does not.\n"
-        "- If the transcript answers the question, reply with exactly one "
-        "line:\n"
-        "    From transcripts: <answer>\n"
-        "- If it does not but {name} does, reply with exactly these two "
-        "lines:\n"
-        "    From transcripts: No answer found\n"
-        "    From {name}: <answer>\n"
-        "- If neither does, reply with exactly these three lines:\n"
-        "    From transcripts: No answer found\n"
-        "    From {name}: No answer found\n"
-        "    General knowledge: <answer>\n\n"
-        "Markdown is rendered: use **bold**, `code` and - bullets; write math in $...$ with simple LaTeX. "
-        "At most two sentences per answer, or a short list when the question "
-        "genuinely needs one. No preamble, no restating the question, no "
-        "hedging about being an AI, no closing offer of further help. Never "
-        "emit a line other than the ones above."
-    ),
 }
 
 

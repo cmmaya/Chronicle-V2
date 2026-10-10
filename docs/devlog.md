@@ -3885,3 +3885,113 @@ Validation:
 Next:
 
 - none
+
+
+## BU145 - No-document prompt baseline
+
+Changes:
+
+- `tests/test_bu145.py` + `tests/fixtures/prompt_baseline/` (13 golden files): every Specific Session chat layout, the detached cards (manual, candidate, General), Any Session and `answer_instruction` for each mode. Regenerate only with `CHRONICLE_UPDATE_BASELINE=1`.
+
+Validation:
+
+- 13 passed on the unchanged `src/`.
+
+Next:
+
+- BU146
+
+
+## BU146 - Session documents table
+
+Changes:
+
+- Schema v5 `session_documents`; `Database.add/get/list/count/delete_session_document`; purge and orphan sweep updated; `SESSION_DOCUMENTS` config.
+
+Validation:
+
+- `tests/test_bu146.py` (10 passed): add / read, listing without text, per-session scope, limit and case-insensitive duplicate refusals, purge, orphans, migration of a v4 file.
+
+Next:
+
+- BU147
+
+
+## BU147 - Document text extraction
+
+Changes:
+
+- `src/assistant/session_documents.py` (`extract_document`, `is_allowed_document`, `DocumentError`); `reference_doc.decode_text` made public; `pypdf==6.20.0` and `python-docx==1.2.0` in `requirements.txt`; `chronicle.spec` bundles them.
+
+Validation:
+
+- `tests/test_bu147.py` (11 passed; PDFs and .docx are built in the tests, no binary fixtures).
+- Not done: a PyInstaller build to confirm both libraries import in the frozen app, and manual extraction of real syllabus / handout files.
+
+Next:
+
+- BU148
+
+
+## BU148 - Session documents pop-up
+
+Changes:
+
+- `src/app/documents_dialog.py`; `Documents…` in the All Sessions card menu; `MainWindow.documents_changed`, `_open_session_documents`, `_run_document_job`.
+
+Validation:
+
+- `tests/test_bu148.py` (24 passed together with `test_bu137.py`).
+- Not done: manual drag-and-drop checks and a restart check.
+
+Next:
+
+- BU149
+
+
+## BU149 - Session documents in Specific Session prompts
+
+Changes:
+
+- `document_contract.py`, `render_documents` in `session_documents.py`, `AssistantAnswerService._load_session_documents` / `_with_document_prompt`, `AnswerResponse.document_refs`, stored `Documents used:` line.
+- Config: `whole_total_max_chars` (60000), `excerpt_chars_per_document` (4000).
+
+Validation:
+
+- `tests/test_bu149.py` (25 passed) plus the BU145 goldens, imported not copied; `test_bu144.py` unchanged and passing.
+- Not done: manual runs against OpenRouter (contradiction wording, cached-token check).
+
+Next:
+
+- BU150
+
+
+## BU150 - Document badge and indicator
+
+Changes:
+
+- `PixelDocumentBadge`, `PixelDocumentsChip`; badge in live and reopened chat answers; indicator beside the scope label.
+
+Validation:
+
+- `tests/test_bu150.py` (12 passed).
+
+Next:
+
+- BU151
+
+
+## BU151 - Detached window on session documents
+
+Changes:
+
+- Detached drop / chip / answer-card badge on session documents; `answer_instruction(mode, has_documents)`; BU117's attachment code and `REFERENCE_DOC` removed. `tests/test_bu117.py` cut to the decode and excerpt cases that remain; `tests/detached_harness.py` seeds the attributes the current `MainWindow` reads; `test_bu116.py` label case changed to `From documents:`.
+
+Validation:
+
+- `tests/test_bu151.py` (18 passed). BU111-BU151, database, response-contract, scope-offer and screenshot tests: 799 passed, 7 failed. The 7 fail on the uncommitted prompt / model-list edits and a stale thread double in `test_bu116.py`, not on this work (`test_bu114` expects three detector models, `test_bu116` expects "two sentences" and a thread double without `delta_signal`).
+- `test_bu034.py` cannot be collected (`import storage`), as before.
+
+Next:
+
+- none

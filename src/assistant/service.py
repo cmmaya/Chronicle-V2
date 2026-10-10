@@ -12,6 +12,8 @@ from .response_contract import RESPONSE_CONTRACT, parse_answer
 from .scope_offer import ScopeOffer, build_scope_offer
 from .live_qa import strip_transcript_evidence
 from .screenshot_contract import SCREENSHOT_CONTRACT, parse_screenshot_refs
+from .document_contract import DOCUMENT_CONTRACT, citation_line, parse_document_refs
+from .session_documents import WHOLE, render_documents
 from ..rag.router import route_sessions
 from .session_resolver import (
     AssistantSessionResolver,
@@ -58,8 +60,12 @@ class AnswerResponse:
     scope_offer: Optional[ScopeOffer] = None
     # Screenshot ids the Specific Session answer points the user to (BU108).
     screenshot_refs: List[int] = None
+    # Session documents the answer used (BU149): ``{"id", "name"}`` each.
+    document_refs: List[Dict[str, Any]] = None
 
     def __post_init__(self):
+        if self.document_refs is None:
+            self.document_refs = []
         if self.screenshot_refs is None:
             self.screenshot_refs = []
         if self.candidates is None:
@@ -101,6 +107,9 @@ class AssistantAnswerService:
         # Screenshot ids placed in the last Specific Session context (BU108);
         # the only ids an answer may cite.
         self._last_screenshot_ids: Set[int] = set()
+        # Session documents placed in the last Specific Session context
+        # (BU149): ``{"mode", "block", "names"}``; empty when it had none.
+        self._last_documents: Dict[str, Any] = {}
         # Scope offers the user declined, per conversation (BU092). In-memory
         # only - not persisted, and cleared with the process.
         self._declined_offers: Dict[Optional[int], Set[int]] = {}
@@ -135,6 +144,7 @@ class AssistantAnswerService:
         # non-Any-Session response.
         self._last_routed_sessions = []
         self._last_screenshot_ids = set()
+        self._last_documents = {}
 
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
@@ -280,6 +290,7 @@ class AssistantAnswerService:
         # non-Any-Session response.
         self._last_routed_sessions = []
         self._last_screenshot_ids = set()
+        self._last_documents = {}
 
         # Step 1: Resolve session scope
         resolution = self._resolver.resolve(
@@ -401,13 +412,25 @@ class AssistantAnswerService:
         candidate_sessions: List[Dict[str, Any]] = []
         scope_offer: Optional[ScopeOffer] = None
         screenshot_refs: List[int] = []
+        document_refs: List[Dict[str, Any]] = []
+        stored_suffix = ""
         answer = raw_answer
+
+        if not is_any_session and self._last_documents:
+            # BU149: the documents line is the last one, so it comes off first
+            # and the screenshot line is again among the last two.
+            names = self._last_documents["names"]
+            answer, cited = parse_document_refs(answer, names)
+            document_refs = [{"id": i, "name": names[i]} for i in cited]
+            if cited:
+                stored_suffix = f"\n\n{citation_line(cited)}"
+            logger.info("Specific Session answer documents: cited=%s", cited or "none")
 
         if not is_any_session and self._last_screenshot_ids:
             # BU108: validate the screenshot pointer line before persisting, so
             # a hallucinated id never reaches the chat or the history.
             answer, screenshot_refs = parse_screenshot_refs(
-                raw_answer, self._last_screenshot_ids
+                answer, self._last_screenshot_ids
             )
 
         if is_any_session:
@@ -439,7 +462,7 @@ class AssistantAnswerService:
                     conversation_id,
                     session_ids[0] if session_ids else None,
                     question,
-                    answer,
+                    answer + stored_suffix,
                 )
             except Exception:
                 # Don't fail the answer if persistence fails - just log
@@ -456,6 +479,7 @@ class AssistantAnswerService:
             candidate_sessions=candidate_sessions,
             scope_offer=scope_offer,
             screenshot_refs=screenshot_refs,
+            document_refs=document_refs,
         )
 
     def decline_scope_offer(
@@ -576,9 +600,35 @@ class AssistantAnswerService:
             evidence = self._question_evidence_prompt(context)
             if not background and not evidence and not full_transcript:
                 evidence = "(No context found)"
+            self._load_session_documents(session_id, question)
             return background, evidence, full_transcript
         except Exception as e:
             return "", f"Context retrieval failed: {str(e)}", ""
+
+    def _load_session_documents(self, session_id: int, question: str) -> None:
+        """Put the session's documents in ``_last_documents`` (BU149).
+
+        Specific Session only. With no documents nothing is stored, so the
+        prompt is exactly what it was before documents existed. A failure to
+        read them costs the documents, never the answer.
+        """
+        try:
+            documents = self._db.get_session_documents(session_id)
+            if not isinstance(documents, list) or not documents:
+                return
+            mode, block = render_documents(documents, question)
+        except Exception as e:
+            logger.warning("Session documents unavailable for session %s: %s", session_id, e)
+            return
+        self._last_documents = {
+            "mode": mode,
+            "block": block,
+            "names": {d["id"]: d["name"] for d in documents},
+        }
+        logger.info(
+            "Specific Session documents: count=%d mode=%s chars=%d",
+            len(documents), mode, len(block),
+        )
 
     def _get_all_sessions_context(self, question: str) -> str:
         """Route to the relevant sessions, then build context from those only.
@@ -813,14 +863,23 @@ class AssistantAnswerService:
         """
         messages = []
 
+        # Session documents (BU149) are Specific Session only; Any Session
+        # never reads them.
+        documents = {} if is_any_session else self._last_documents
+
         system_content = agent['system_instruction']
+        if documents and not full_transcript:
+            system_content = self._with_document_prompt(system_content, documents)
         if background:
             system_content = f"{system_content}\n\nContext:\n{background}"
         if full_transcript:
             # BU144: instruction, screenshot contract, then the transcript last,
-            # so a growing transcript only extends the end of the prefix.
+            # so a growing transcript only extends the end of the prefix. The
+            # documents sit before the transcript for the same reason.
             if self._last_screenshot_ids:
                 system_content = f"{system_content}\n\n{SCREENSHOT_CONTRACT}"
+            if documents:
+                system_content = self._with_document_prompt(system_content, documents)
             system_content = f"{system_content}\n\nContext:\n{full_transcript}"
         # Any Session mode only: ask the model to self-classify its answer via
         # the metadata trailer. Specific Session prompts are left untouched.
@@ -850,12 +909,24 @@ class AssistantAnswerService:
 
         # Current question, preceded by the context retrieved for it. Only the
         # bare question is persisted, so history never carries old context.
+        if documents and documents["mode"] != WHOLE:
+            # Excerpts depend on the question, so they ride with it.
+            context = f"{context}\n\n{documents['block']}" if context else documents["block"]
         user_content = question
         if context:
             user_content = f"Context for this question:\n{context}\n\nQuestion: {question}"
         messages.append({"role": "user", "content": user_content})
 
         return messages
+
+    @staticmethod
+    def _with_document_prompt(system_content: str, documents: Dict[str, Any]) -> str:
+        """``system_content`` plus the document contract, and the documents
+        themselves when they are sent whole (the same for every question)."""
+        system_content = f"{system_content}\n\n{DOCUMENT_CONTRACT}"
+        if documents["mode"] == WHOLE:
+            system_content = f"{system_content}\n\n{documents['block']}"
+        return system_content
 
     def _call_openrouter(
         self,

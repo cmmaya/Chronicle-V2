@@ -37,6 +37,8 @@ if (ROOT / "google_oauth_client.json").is_file():
 # onnx_asr ships its preprocessor ONNX graphs as package data.
 datas += collect_data_files("soundcard")
 datas += collect_data_files("onnx_asr")
+# python-docx reads its default .docx template and XML schemas as package data.
+datas += collect_data_files("docx")
 
 # PortAudio and libsndfile ship in the _sounddevice_data / _soundfile_data
 # packages; FFmpeg in av's own folder.
@@ -50,6 +52,9 @@ hiddenimports = (
     # keyring chooses its Windows backend through an entry point.
     + collect_submodules("keyring.backends")
     + ["win32ctypes.core"]
+    # Session Documents (BU147): read .pdf and .docx.
+    + collect_submodules("pypdf")
+    + ["docx", "lxml._elementpath"]
 )
 
 excludes = [

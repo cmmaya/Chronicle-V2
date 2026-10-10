@@ -39,5 +39,10 @@ tokenizers==0.23.1
 # Upload Audio (BU104): decodes .m4a / WAV / MP3 uploads. Wheels bundle FFmpeg.
 av==17.0.1
 
+# Session Documents (BU147): text of .pdf and .docx files. Both pure Python;
+# python-docx pulls in lxml.
+pypdf==6.20.0
+python-docx==1.2.0
+
 # OpenRouter API key storage in the Windows Credential Manager (BU122).
 keyring==25.7.0

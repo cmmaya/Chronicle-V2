@@ -22,6 +22,7 @@ import re
 from datetime import datetime, timedelta
 
 from .session_manager import SessionManager
+from .documents_dialog import SessionDocumentsDialog
 from .pixel_theme import app_qss, asset_path
 from . import theme
 from .. import paths
@@ -33,7 +34,8 @@ from .pixel_widgets import (
     pixel_group_header, transcript_gap_separator, pixel_empty_hint,
     PixelAnswerCard, PixelCandidateCard,
     pixel_spend_chip, pixel_rail_notice, pixel_group_label,
-    format_answer_html, PixelDropOverlay, PixelReferenceChip,
+    format_answer_html, PixelDropOverlay,
+    PixelDocumentBadge, PixelDocumentsChip, REMOVED_DOCUMENT_LABEL,
     PixelTitleBar, PixelResizeFrame, set_accent, enable_native_snap, snap_overhang,
     PixelDueDateCard, PixelDueDateList, PixelSearchResultCard, search_snippet,
 )
@@ -43,19 +45,17 @@ from ..transcription.text_import import SUPPORTED_EXTENSIONS as UPLOAD_TRANSCRIP
 from .session import Session
 from ..summarization import SummaryGenerator
 from ..config import (ASSISTANT_AGENTS, SESSION, SCREENSHOT, ALLOWED_MODELS,
-                      LIVE_QA, REFERENCE_DOC, get_selected_model,
+                      LIVE_QA, SESSION_DOCUMENTS, get_selected_model,
                       set_selected_model)
 from ..assistant.service import AssistantAnswerService
 from ..assistant.screenshot_contract import parse_screenshot_refs
+from ..assistant.document_contract import parse_document_refs
 from ..assistant.live_qa import (
     answer_instruction, build_question_for_candidate,
     build_question_from_records, strip_transcript_evidence, timestamp_range,
     QuestionDetector, mode_policy_reason,
 )
-from ..assistant.reference_doc import (
-    ReferenceDocError, build_reference_block, is_allowed_extension,
-    load_reference_text, select_relevant_excerpt,
-)
+from ..assistant.session_documents import extract_document, is_allowed_document
 from ..assistant.scope_offer import (
     format_scope_offer_prompt,
     decline_scope_offer as apply_scope_offer_decline,
@@ -269,28 +269,27 @@ def normalize_live_qa_answer_mode(value) -> str:
     return LIVE_QA_DEFAULT_ANSWER_MODE
 
 
-def reference_drop_error(paths) -> Optional[str]:
-    """Why a dropped payload cannot be attached, or None when it can (BU117).
+def document_drop_error(paths) -> Optional[str]:
+    """Why a dropped payload cannot be added as documents, or None when it can
+    (BU117, BU151).
 
-    Qt-free, so the rule is testable without a drag. Follows BU104's audio
-    import in shape - an extension allow-list and a message fit for the status
-    bar - rather than inventing a second validation vocabulary.
+    Qt-free, so the rule is testable without a drag. Several files may be
+    dropped at once; the drop is taken when at least one is an allowed
+    document, and the others report their own refusal while importing.
     """
+    allowed = ", ".join(SESSION_DOCUMENTS['allowed_extensions'])
     if not paths:
-        return "Only a local .txt file can be attached"
-    if len(paths) > 1:
-        return "Drop one .txt file at a time"
-    path = paths[0]
-    if os.path.isdir(path):
-        return "Folders cannot be attached - drop a .txt file"
-    if not is_allowed_extension(path):
-        allowed = ", ".join(REFERENCE_DOC.get('allowed_extensions', ['.txt']))
-        return f"Only {allowed} files can be attached"
-    return None
+        return f"Only local {allowed} files can be added"
+    if any(is_allowed_document(p) for p in paths):
+        return None
+    if len(paths) == 1 and os.path.isdir(paths[0]):
+        return f"Folders cannot be added - drop {allowed} files"
+    return f"Only {allowed} files can be added"
 
 
 class DetachedTranscriptsDialog(QDialog):
-    """The detached transcripts window, which also takes a dropped .txt (BU117).
+    """The detached transcripts window, which also takes dropped documents
+    (BU117, BU151).
 
     A plain QDialog cannot refuse a drop *visibly*: with no handlers it ignores
     the drag silently, and with Qt's default highlight it says only that
@@ -301,7 +300,7 @@ class DetachedTranscriptsDialog(QDialog):
     The dialog only reports; MainWindow decides what to do with the file.
     """
 
-    file_dropped = Signal(str)
+    files_dropped = Signal(object)  # list of local paths
     drop_rejected = Signal(str)
 
     # A drag we ignore may never deliver dragLeaveEvent, so the refusal
@@ -313,6 +312,9 @@ class DetachedTranscriptsDialog(QDialog):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self._drop_ready = False
+        # Set by MainWindow: returns why nothing can be added right now (no
+        # session displayed), or None.
+        self.drop_gate = None
         self._drop_overlay = PixelDropOverlay(self)
         self._drop_overlay.setGeometry(self.rect())
         self._reject_timer = QTimer(self)
@@ -327,9 +329,12 @@ class DetachedTranscriptsDialog(QDialog):
             return []
         return [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
 
+    def _drop_error(self, paths) -> Optional[str]:
+        return (self.drop_gate() if self.drop_gate else None) or document_drop_error(paths)
+
     def dragEnterEvent(self, event):
         paths = self._local_paths(event.mimeData())
-        error = reference_drop_error(paths)
+        error = self._drop_error(paths)
         if error:
             self._drop_ready = False
             self._drop_overlay.show_state(error.upper(), accepting=False)
@@ -340,7 +345,8 @@ class DetachedTranscriptsDialog(QDialog):
         self._reject_timer.stop()
         self._drop_ready = True
         self._drop_overlay.show_state(
-            f"DROP TO ATTACH {os.path.basename(paths[0]).upper()}"
+            "DROP TO ADD TO THIS SESSION" if len(paths) > 1
+            else f"DROP TO ADD {os.path.basename(paths[0]).upper()}"
         )
         event.acceptProposedAction()
 
@@ -357,13 +363,13 @@ class DetachedTranscriptsDialog(QDialog):
     def dropEvent(self, event):
         self._hide_drop_overlay()
         paths = self._local_paths(event.mimeData())
-        error = reference_drop_error(paths)
+        error = self._drop_error(paths)
         if error:
             self.drop_rejected.emit(error)
             event.ignore()
             return
         event.acceptProposedAction()
-        self.file_dropped.emit(paths[0])
+        self.files_dropped.emit(paths)
 
     def _hide_drop_overlay(self):
         self._reject_timer.stop()
@@ -745,6 +751,8 @@ class MainWindow(QMainWindow):
     # zero-arg callable to run on the UI thread instead of a fixed payload.
     # See _post_to_ui().
     _ui_callback_ready = Signal(object)
+    # A session's documents were added or removed (BU148); carries its id.
+    documents_changed = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -844,12 +852,12 @@ class MainWindow(QMainWindow):
         # BU117: the reference document belongs to the open detached window and
         # to nothing else - not preferences, not the database, not the RAG
         # corpus. Closing the window drops it.
-        self._reference_doc = None
-        self._reference_chip = None
+        self._detached_documents_chip = None
         self._live_qa_answer_mode_chips = {}
         self._live_qa_directed_only = False
         self._live_qa_window_chunks = LIVE_QA.get('window_chunks', 3)
         self._live_qa_detector_model = LIVE_QA.get('detector_model')
+        self._live_qa_answer_model = LIVE_QA.get('answer_model')
         self._live_transcription_ready.connect(
             self._append_transcription, Qt.QueuedConnection
         )
@@ -857,6 +865,7 @@ class MainWindow(QMainWindow):
         self._session_finalized_ready.connect(
             self._apply_session_finalized, Qt.QueuedConnection
         )
+        self.documents_changed.connect(self._update_documents_chip)
         self._ui_callback_ready.connect(self._run_ui_callback, Qt.QueuedConnection)
 
         # Assistant panel state
@@ -1276,7 +1285,12 @@ class MainWindow(QMainWindow):
             for msg in messages:
                 role = msg.get('role', 'unknown')
                 content = msg.get('content', '')
+                document_names = []
                 if role == 'assistant':
+                    # BU150: the stored "Documents used:" line is the last one.
+                    content, document_ids = parse_document_refs(content, None)
+                    if document_ids:
+                        document_names = self._stored_document_names(conv_id, document_ids)
                     stripped, _ = parse_screenshot_refs(content, ())
                     if stripped != content:
                         if self._screenshot_refs_shown:
@@ -1285,6 +1299,7 @@ class MainWindow(QMainWindow):
 
                 # Use the same method as new messages to ensure proper formatting
                 self._add_message_to_conversation(role, content)
+                self._add_document_badge_to_conversation(document_names)
             
             # Update the scroll area
             self._answer_scroll_area.setWidget(self._answer_container)
@@ -2973,7 +2988,17 @@ class MainWindow(QMainWindow):
         self._scope_label.setAlignment(Qt.AlignCenter)
         self._scope_label.setStyleSheet("color: #0078d4; font-weight: bold;")
         self._scope_label.setVisible(False)
-        layout.addWidget(self._scope_label)
+        # "📄 N documents" (BU150): beside the label, only for a Specific
+        # Session that has documents.
+        self._documents_chip = PixelDocumentsChip()
+        self._documents_chip.clicked.connect(self._open_scoped_session_documents)
+        scope_row = QHBoxLayout()
+        scope_row.setContentsMargins(0, 0, 0, 0)
+        scope_row.addStretch(1)
+        scope_row.addWidget(self._scope_label)
+        scope_row.addWidget(self._documents_chip)
+        scope_row.addStretch(1)
+        layout.addLayout(scope_row)
 
         self.session_name_label = QLabel("Session Name:")
         self.session_name_label.setVisible(False)
@@ -3437,6 +3462,7 @@ class MainWindow(QMainWindow):
         """
         if not getattr(self, '_detached_window', None):
             return
+        self._update_detached_documents_chip()
         inserted = self._displaying_inserted_transcript
 
         caption = getattr(self, '_detached_inserted_caption', None)
@@ -4228,7 +4254,8 @@ class MainWindow(QMainWindow):
 
         # Connect the finished signal to restore the transcripts panel when closed
         self._detached_window.finished.connect(self._on_close_detached_window)
-        self._detached_window.file_dropped.connect(self._attach_reference_doc)
+        self._detached_window.files_dropped.connect(self._add_documents_to_displayed_session)
+        self._detached_window.drop_gate = self._detached_drop_gate
         self._detached_window.drop_rejected.connect(
             lambda message: self._on_status_update(message, is_error=True)
         )
@@ -4391,16 +4418,15 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self._live_qa_spend_chip, 0)
         status_row.addStretch(1)
 
-        # BU117: only present once something is attached. An empty placeholder
-        # chip would take the same room and say nothing.
-        self._reference_chip = PixelReferenceChip()
-        self._reference_chip.replace_requested.connect(self._pick_reference_doc)
-        self._reference_chip.remove_requested.connect(self._clear_reference_doc)
-        status_row.addWidget(self._reference_chip, 0)
+        # BU151: "N documents" for the displayed session, hidden when it has
+        # none so the header looks as it did before documents existed.
+        self._detached_documents_chip = PixelDocumentsChip()
+        self._detached_documents_chip.clicked.connect(self._open_detached_documents)
+        status_row.addWidget(self._detached_documents_chip, 0)
         body.addLayout(status_row)
 
         self._refresh_live_qa_spend_chip()
-        self._sync_reference_chip()
+        self._update_detached_documents_chip()
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -4728,87 +4754,68 @@ class MainWindow(QMainWindow):
             chip.setChecked(
                 not self._displaying_inserted_transcript and mode == self._live_qa_answer_mode)
 
-    # --- reference document (BU117) --------------------------------------
+    # --- session documents in the detached window (BU151) ------------------
 
-    def _attach_reference_doc(self, path: str):
-        """Attach a dropped or picked .txt as answer-side evidence.
+    def _detached_drop_gate(self) -> Optional[str]:
+        """Why a drop on the detached window cannot be taken right now."""
+        if self._current_display_session_id() is None:
+            return "No session is displayed - open a session to add documents"
+        return None
 
-        Exactly one document at a time: a second one replaces the first, and
-        says so. Any failure leaves whatever was attached before untouched -
-        a bad drop must not cost the user the document that was working.
+    def _add_documents_to_displayed_session(self, paths):
+        """Add dropped files to the session on display, one background job each.
+
+        The same flow as the Documents pop-up: extract, then store. Limit,
+        duplicate and extraction errors come back through the status bar, and
+        one bad file never stops the others.
         """
-        previous = self._reference_doc
+        session_id = self._current_display_session_id()
+        if session_id is None:
+            self._on_status_update(self._detached_drop_gate(), is_error=True)
+            return
+        db = self.session_manager.db
+        for path in paths:
+            name = os.path.basename(path)
+
+            def work(path=path):
+                doc = extract_document(path)
+                return db.add_session_document(
+                    session_id, doc.name, doc.file_type, doc.file_bytes, doc.text)
+
+            self._on_status_update(f"Reading {name}…")
+            self._run_document_job(
+                work,
+                lambda _result, error, name=name: self._document_added(session_id, name, error))
+
+    def _document_added(self, session_id: int, name: str, error):
+        if error is not None:
+            logger.warning(f"Could not add {name}: {error}")
+            self._on_status_update(str(error) or f"Could not add {name}", is_error=True)
+            return
+        self._on_status_update(f"Added {name} to this session")
+        self.documents_changed.emit(session_id)
+
+    def _displayed_document_count(self) -> int:
+        session_id = self._current_display_session_id()
+        if session_id is None:
+            return 0
         try:
-            doc = load_reference_text(path)
-        except ReferenceDocError as e:
-            self._on_status_update(str(e), is_error=True)
-            return
-        except Exception as e:  # noqa: BLE001 - an unreadable file, whatever the cause
-            logger.error(f"Reference document could not be loaded: {e}")
-            self._on_status_update(f"Could not read that file: {e}", is_error=True)
-            return
+            return self.session_manager.db.count_session_documents(session_id)
+        except Exception as e:
+            logger.error(f"Failed to count session documents: {e}")
+            return 0
 
-        self._reference_doc = doc
-        self._sync_reference_chip()
-        if previous is not None and previous.path != doc.path:
-            self._on_status_update(
-                f"Replaced {previous.name} with {doc.name} ({doc.size_label})"
-            )
-        else:
-            self._on_status_update(f"Attached {doc.name} ({doc.size_label})")
+    def _update_detached_documents_chip(self, *_args):
+        chip = getattr(self, '_detached_documents_chip', None)
+        if chip is not None:
+            chip.set_count(self._displayed_document_count())
 
-    def _clear_reference_doc(self):
-        """Detach the document. Answers go back to transcript-only."""
-        doc = self._reference_doc
-        self._reference_doc = None
-        self._sync_reference_chip()
-        if doc is not None:
-            self._on_status_update(f"Detached {doc.name}")
-
-    def _pick_reference_doc(self):
-        """Replace the attached document through a file picker."""
-        patterns = ' '.join(
-            f"*{ext}" for ext in REFERENCE_DOC.get('allowed_extensions', ['.txt'])
-        )
-        path, _ = QFileDialog.getOpenFileName(
-            self._detached_window or self, "Attach a reference document", "",
-            f"Text files ({patterns})"
-        )
-        if path:
-            self._attach_reference_doc(path)
-
-    def _sync_reference_chip(self):
-        chip = getattr(self, '_reference_chip', None)
-        if chip is None:
-            return
-        doc = self._reference_doc
-        if doc is None:
-            chip.clear_document()
-        else:
-            chip.set_document(doc.name, doc.size_label)
-
-    def _reference_evidence_name(self) -> str:
-        """The attached document's name, when this answer mode uses it.
-
-        Empty in General Knowledge mode: that is the mode that does not check
-        evidence, and an attached document is evidence.
-        """
-        doc = self._reference_doc
-        if doc is None or self._live_qa_answer_mode == 'general':
-            return ''
-        return doc.name
-
-    def _with_reference_evidence(self, question: str) -> str:
-        """Append the document excerpt this question earns, if any.
-
-        The excerpt is chosen per question rather than sent whole, so a long
-        handout costs the same per answer as a short one.
-        """
-        if not self._reference_evidence_name():
-            return question
-        block = build_reference_block(select_relevant_excerpt(
-            self._reference_doc, strip_transcript_evidence(question)))
-        return f"{question}\n\n{block}" if block else question
+    def _open_detached_documents(self):
+        session_id = self._current_display_session_id()
+        if session_id is not None:
+            self._open_session_documents(
+                session_id, self._session_name_for_id(session_id) or "Session",
+                self._detached_window or self)
 
     @property
     def _detection_enabled(self) -> bool:
@@ -4849,6 +4856,15 @@ class MainWindow(QMainWindow):
                 lambda _checked=False, v=entry['id']: self._set_live_qa_detector_model(v)
             )
 
+        answer_menu = menu.addMenu("Answer model")
+        for entry in LIVE_QA.get('answer_models', []):
+            action = answer_menu.addAction(f"{entry['label']} - {entry['note']}")
+            action.setCheckable(True)
+            action.setChecked(entry['id'] == self._live_qa_answer_model)
+            action.triggered.connect(
+                lambda _checked=False, v=entry['id']: self._set_live_qa_answer_model(v)
+            )
+
         menu.addSeparator()
 
         # No "Answer automatically" here any more: that is the Auto chip in the
@@ -4873,6 +4889,11 @@ class MainWindow(QMainWindow):
         self._live_qa_detector_model = model_id
         if self._question_detector is not None:
             self._question_detector.set_detector_model(model_id)
+        self._save_live_qa_preferences()
+
+    def _set_live_qa_answer_model(self, model_id: str):
+        # Read when an answer starts, so it applies to the next answer.
+        self._live_qa_answer_model = model_id
         self._save_live_qa_preferences()
 
     def _set_live_qa_directed_only(self, enabled: bool):
@@ -5078,6 +5099,7 @@ class MainWindow(QMainWindow):
             'live_qa_auto_answer': self._live_qa_auto_answer,
             'live_qa_window_chunks': self._live_qa_window_chunks,
             'live_qa_detector_model': self._live_qa_detector_model,
+            'live_qa_answer_model': self._live_qa_answer_model,
             'live_qa_directed_only': self._live_qa_directed_only,
         })
 
@@ -5103,6 +5125,12 @@ class MainWindow(QMainWindow):
         model = prefs.get('live_qa_detector_model')
         self._live_qa_detector_model = (
             model if model in offered else LIVE_QA.get('detector_model'))
+
+        offered_answer = [m['id'] for m in LIVE_QA.get('answer_models', [])]
+        answer_model = prefs.get('live_qa_answer_model')
+        self._live_qa_answer_model = (
+            answer_model if answer_model in offered_answer
+            else LIVE_QA.get('answer_model'))
 
         self._live_qa_directed_only = bool(prefs.get('live_qa_directed_only', False))
 
@@ -5396,9 +5424,7 @@ class MainWindow(QMainWindow):
         """
         thread = AssistantQueryThread(
             assistant_service=self.assistant_service,
-            # BU117: the reference excerpt rides with the question, so both the
-            # manual and the candidate path get it from this one place.
-            question=self._with_reference_evidence(question),
+            question=question,
             agent_id=self.agent_combo.currentData(),
             explicit_scope="current_session",
             active_session_id=self._current_display_session_id(),
@@ -5406,16 +5432,17 @@ class MainWindow(QMainWindow):
             conversation_id=None,
             # BU116: the answer mode's instruction, not the chat agent's. The
             # agent and get_selected_model() still decide which model runs.
-            # BU117: naming the document is what earns the middle tier.
+            # BU151: a session with documents earns the middle tier. The
+            # documents themselves reach the prompt through the service.
             system_instruction=answer_instruction(
-                self._live_qa_answer_mode, self._reference_evidence_name()),
+                self._live_qa_answer_mode, self._displayed_document_count() > 0),
             # Live answers live on their cards only; they are not chat
             # history and must not show up in the past-conversations list.
             persist=False,
             # General mode answers without the session: no transcript, summary
             # or screenshots are fetched or sent.
             use_context=self._live_qa_answer_mode != 'general',
-            model=LIVE_QA.get('answer_model'),
+            model=self._live_qa_answer_model,
             stream=True,
             reasoning_effort=LIVE_QA.get('answer_reasoning_effort'),
             max_tokens=LIVE_QA.get('answer_max_tokens'),
@@ -5458,7 +5485,8 @@ class MainWindow(QMainWindow):
         """Show the answer as it streams; the finished response replaces it."""
         card = self._detached_answer_cards.get(card_id)
         if card is not None:
-            card.set_answer(format_answer_html(text))
+            # The "Documents used:" line is for the badge, not the card text.
+            card.set_answer(format_answer_html(parse_document_refs(text, None)[0]))
 
     def _on_detached_answer_finished(self, card_id: int, response):
         card = self._detached_answer_cards.get(card_id)
@@ -5466,6 +5494,8 @@ class MainWindow(QMainWindow):
             return  # dismissed while in flight
         if getattr(response, 'success', False):
             card.set_answer(format_answer_html(response.answer or ""))
+            card.set_document_badge(
+                [ref['name'] for ref in (getattr(response, 'document_refs', None) or [])])
             self._on_status_update("Answer received")
         else:
             card.set_error(getattr(response, 'error', None) or "No answer returned")
@@ -5902,11 +5932,7 @@ class MainWindow(QMainWindow):
             self._live_qa_spend_chip = None
             self._live_qa_mode_chips = {}
             self._live_qa_answer_mode_chips = {}
-            # BU117: the reference document is held by the window, so it goes
-            # with it. Nothing was persisted, so there is no stale path to
-            # re-read on the next detach.
-            self._reference_doc = None
-            self._reference_chip = None
+            self._detached_documents_chip = None
 
     def _update_ui_state(self):
         """Update UI based on current session state."""
@@ -6646,6 +6672,9 @@ class MainWindow(QMainWindow):
             )
             # Replace "Thinking..." with the actual response
             self._replace_thinking_message(answer_text + self._scope_suffix())
+            # BU150: documents the answer used -> badge under the bubble.
+            self._add_document_badge_to_conversation(
+                [ref['name'] for ref in response.document_refs])
             # BU108/BU109: the answer points at screenshots -> "View" buttons.
             if response.screenshot_refs:
                 self._add_screenshot_refs_to_conversation(response.screenshot_refs)
@@ -6697,6 +6726,39 @@ class MainWindow(QMainWindow):
         self._on_status_update(f"Assistant error: {error_message}", is_error=True)
         # Clear candidates on exception
         self._clear_candidates()
+
+    # ---- BU150: document badge ----------------------------------------------
+
+    def _add_document_badge_to_conversation(self, names):
+        """Right under the answer bubble: "From: syllabus.pdf". Rebuilt from
+        the stored ``Documents used:`` line when a conversation is reopened."""
+        names = [n for n in names if n]
+        if not names:
+            return
+        if hasattr(self, '_answer_layout') and self._answer_layout:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(PixelDocumentBadge(names), 0, Qt.AlignLeft)
+            row_layout.addStretch(1)
+            self._answer_layout.insertWidget(self._answer_layout.count() - 1, row)
+            self._scroll_answer_to_bottom()
+
+        if hasattr(self, '_detached_answer_layout') and self._detached_answer_layout:
+            label = QLabel("From: " + ", ".join(names))
+            label.setToolTip("Documents this answer used: " + ", ".join(names))
+            self._detached_answer_layout.insertWidget(
+                self._detached_answer_layout.count() - 1, label)
+
+    def _stored_document_names(self, conversation_id, ids):
+        """Names for the ids a stored answer cites; a removed one is marked."""
+        try:
+            session_id = self.session_manager.db.get_conversation(conversation_id).get('session_id')
+            current = {d['id']: d['name'] for d in
+                       self.session_manager.db.list_session_documents(session_id)} if session_id else {}
+        except Exception:
+            current = {}
+        return [current.get(i, REMOVED_DOCUMENT_LABEL) for i in ids]
 
     # ---- BU109: screenshot citations ----------------------------------------
 
@@ -7115,9 +7177,43 @@ class MainWindow(QMainWindow):
             self._scope_label.setStyleSheet("color: gray; font-style: italic;")
             self._scope_label.setVisible(True)
 
+        self._update_documents_chip()
+
         # Also update summary icon state
         self._update_summary_icon_state()
     
+    def _scoped_session_id(self) -> Optional[int]:
+        """The session the chat is scoped to, or None under Any Session."""
+        scope_value = self.scope_combo.currentData() if hasattr(self, 'scope_combo') else 'any'
+        if scope_value != 'current':
+            return None
+        session_id = self._selected_session_id
+        if session_id is None and self.session_manager:
+            active_session = self.session_manager.get_active_session()
+            session_id = active_session.id if active_session else None
+        return session_id
+
+    def _update_documents_chip(self, *_args):
+        """Show "N documents" only for a Specific Session that has some (BU150)."""
+        chip = getattr(self, '_documents_chip', None)
+        if chip is None:
+            return
+        count = 0
+        try:
+            session_id = self._scoped_session_id()
+            if session_id is not None:
+                count = self.session_manager.db.count_session_documents(session_id)
+        except Exception as e:
+            logger.error(f"Failed to update documents indicator: {e}")
+        chip.set_count(count)
+        self._update_detached_documents_chip()
+
+    def _open_scoped_session_documents(self):
+        session_id = self._scoped_session_id()
+        if session_id is not None:
+            self._open_session_documents(
+                session_id, self._session_name_for_id(session_id) or "Session", self)
+
     def _update_summary_icon_state(self):
         """Update the summary icon button based on selected session."""
         if not hasattr(self, 'view_summary_icon_button'):
@@ -7524,7 +7620,14 @@ class MainWindow(QMainWindow):
                         session['summary_status'] == 'summarized',
                         live_state=live_state,
                         shot_count=session.get('screenshot_count', 0),
+                        doc_count=session.get('document_count', 0),
                     )
+                    card.screenshots_requested.connect(
+                        lambda sid=session_id, name=session['name']:
+                        self._show_screenshots_by_session_id(sid, name))
+                    card.documents_requested.connect(
+                        lambda sid=session_id, name=session['name']:
+                        self._open_session_documents(sid, name, dialog))
                     card.actions_button.setMenu(
                         self._build_session_actions_menu(session, card, dialog, live_state)
                     )
@@ -7720,6 +7823,13 @@ class MainWindow(QMainWindow):
                            lambda: self._show_summary_by_session_id(session_id, session_name))
         menu.addAction("View screenshots",
                        lambda: self._show_screenshots_by_session_id(session_id, session_name))
+        try:
+            document_count = self.session_manager.db.count_session_documents(session_id)
+        except Exception:
+            document_count = 0
+        menu.addAction(
+            f"Documents ({document_count})…" if document_count else "Documents…",
+            lambda: self._open_session_documents(session_id, session_name, dialog))
         menu.addAction("Rename…",
                        lambda: self._rename_session_from_dialog(session_id, session_name, dialog))
         # STATUS_PROCESSING: startup repair (SessionManager._recover_after_restart)
@@ -7743,6 +7853,26 @@ class MainWindow(QMainWindow):
         )
         delete_action.setEnabled(not is_live)
         return menu
+
+    def _run_document_job(self, fn, on_done):
+        """Run ``fn`` on the job thread; ``on_done(result, error)`` on the UI thread."""
+        self.session_manager.submit_job(
+            'read document', fn,
+            lambda result, error: self._post_to_ui(lambda: on_done(result, error)))
+
+    def _open_session_documents(self, session_id: int, session_name: str,
+                                parent: Optional[QWidget] = None):
+        """Open the Documents pop-up of a session (BU148)."""
+        documents = SessionDocumentsDialog(
+            self.session_manager.db, session_id, session_name,
+            self._run_document_job, parent or self)
+        documents.setAttribute(Qt.WA_DeleteOnClose, True)
+        documents.documents_changed.connect(self.documents_changed)
+        if self._all_sessions_dialog is not None:
+            documents.documents_changed.connect(
+                lambda _sid: self._refresh_all_sessions_window(self._all_sessions_dialog))
+        documents.open()
+        return documents
 
     def _rename_session_from_dialog(self, session_id: int, old_name: str, dialog: QDialog):
         """Prompt for a new session name and persist it."""
@@ -9131,6 +9261,8 @@ class MainWindow(QMainWindow):
                 )
                 # Add assistant's response to conversation view
                 self._add_message_to_conversation('assistant', answer_text + self._scope_suffix())
+                self._add_document_badge_to_conversation(
+                    [ref['name'] for ref in response.document_refs])
                 if response.screenshot_refs:
                     self._add_screenshot_refs_to_conversation(response.screenshot_refs)
                 if response.scope_offer is not None:
