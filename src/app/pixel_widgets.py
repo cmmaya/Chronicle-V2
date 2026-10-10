@@ -3066,6 +3066,204 @@ class PixelDropOverlay(QWidget):
         painter.drawText(rect, Qt.AlignCenter, self._text)
 
 
+# =========================
+# Attachments (Start Session popover, Documents window)
+# =========================
+
+ATTACH_OK = "#8FE39B"
+ATTACH_ERROR = "#FF8A7A"
+
+# One attached file. ``selected`` is set by the Documents window.
+FILE_ROW_QSS = """
+QWidget#FileRow {
+    background: #0B2260;
+    border: 2px solid #284B94;
+    border-radius: 5px;
+}
+QWidget#FileRow:hover { border: 2px solid #3A67C7; }
+QWidget#FileRow[selected="true"] {
+    background: #14337F;
+    border: 2px solid #F6E0A6;
+}
+"""
+
+# A borderless glyph button (✕, Yes / No): muted, red on hover.
+FLAT_GLYPH_QSS = """
+QToolButton {
+    color: #8EA7D8;
+    background: transparent;
+    border: none;
+    font-family: 'Courier New';
+    font-size: 10pt;
+    font-weight: 700;
+    padding: 0px 3px;
+}
+QToolButton:hover { color: #FF8A7A; }
+QToolButton[tone="quiet"]:hover { color: #FFF0BF; }
+"""
+
+# The one cream call to action of a small window.
+PRIMARY_BUTTON_QSS = """
+QPushButton#PrimaryButton {
+    color: #071846;
+    background: #F6E0A6;
+    border: 2px solid #FFEFC1;
+    border-radius: 7px;
+    padding: 8px 14px;
+    font-family: 'Courier New';
+    font-size: 10.5pt;
+    font-weight: 900;
+    letter-spacing: 2px;
+}
+QPushButton#PrimaryButton:hover { background: #FFE7B4; }
+QPushButton#PrimaryButton:pressed { background: #E8CF8E; padding-top: 10px; }
+QPushButton#PrimaryButton:disabled {
+    color: #8090B8;
+    background: #18336F;
+    border: 2px solid #284B94;
+}
+"""
+
+
+def pixel_caption(text: str, color: str, pt: float, bold: bool = False,
+                  spacing: float = 0) -> QLabel:
+    """A small label; ``spacing`` letter-spaces it (for ALL-CAPS captions)."""
+    label = QLabel(text)
+    extra = f"letter-spacing: {spacing}px;" if spacing else ""
+    label.setStyleSheet(_label_qss(color, pt, bold=bold, extra=extra))
+    return label
+
+
+def pixel_flat_glyph(text: str, tooltip: str = "", quiet: bool = False,
+                     size: QSize = QSize(22, 22)) -> QToolButton:
+    """A borderless glyph button; ``quiet`` hovers cream instead of red."""
+    button = QToolButton()
+    button.setText(text)
+    button.setToolTip(tooltip)
+    button.setCursor(Qt.PointingHandCursor)
+    button.setAutoRaise(True)
+    if quiet:
+        button.setProperty("tone", "quiet")
+    button.setMinimumSize(size)
+    button.setFixedHeight(size.height())
+    button.setStyleSheet(FLAT_GLYPH_QSS)
+    return button
+
+
+def attachment_icon(is_image: bool, size: int = 15) -> QLabel:
+    icon = QLabel()
+    icon.setPixmap(QIcon(asset_path(
+        "icon_camera.svg" if is_image else "icon_document.svg")).pixmap(QSize(size, size)))
+    icon.setFixedSize(size + 1, size + 1)
+    return icon
+
+
+def short_char_count(chars: int) -> str:
+    return f"{chars / 1000:.1f}k chars" if chars >= 1000 else f"{chars} chars"
+
+
+def pending_text(is_image: bool, tick: int) -> str:
+    """"reading." / "describing.." ... - padded so the width never jumps."""
+    verb = "describing" if is_image else "reading"
+    return verb + "." * (1 + tick % 3) + " " * (2 - tick % 3)
+
+
+class PixelDropZone(QWidget):
+    """Dashed pixel box: click to browse, and the target a drag lights up.
+
+    ``set_drag("accept" | "reject" | None, text)`` is driven by whichever
+    window takes the drop. Disabled, it says why (``disabled_text``).
+    """
+
+    clicked = Signal()
+
+    def __init__(self, title: str, hint: str, height: int = 54, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(height)
+        self._title = title
+        self._hint = hint
+        self._hover = False
+        self._drag = None
+        self._drag_text = ""
+        self.disabled_text = ""
+
+    @property
+    def drag_state(self):
+        return self._drag
+
+    def set_drag(self, state, text: str = ""):
+        self._drag = state
+        self._drag_text = text
+        self.update()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.EnabledChange:
+            self.setCursor(Qt.PointingHandCursor if self.isEnabled() else Qt.ArrowCursor)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        rect = self.rect().adjusted(1, 1, -2, -2)
+        enabled = self.isEnabled()
+        if not enabled:
+            border, fill = theme.qcolor("#284B94"), QColor(0, 0, 0, 0)
+        elif self._drag == "reject":
+            border, fill = QColor(ATTACH_ERROR), QColor(255, 138, 122, 22)
+        elif self._drag == "accept" or self._hover:
+            border = theme.qcolor("#F6E0A6")
+            fill = QColor(border)
+            fill.setAlpha(26 if self._drag else 14)
+        else:
+            border, fill = theme.qcolor("#3A67C7"), QColor(0, 0, 0, 0)
+        path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 6)
+        p.fillPath(path, fill)
+        pen = QPen(border, 2)
+        pen.setStyle(Qt.CustomDashLine)
+        pen.setDashPattern([3, 2])
+        p.setPen(pen)
+        p.drawPath(path)
+
+        if not enabled or self._drag:
+            p.setFont(self._font(9 if not enabled else 9.5, True, 1.5))
+            p.setPen(theme.qcolor("#8EA7D8") if not enabled else border)
+            p.drawText(rect, Qt.AlignCenter,
+                       self.disabled_text if not enabled else self._drag_text)
+            return
+        middle = rect.center().y()
+        top = rect.adjusted(0, 0, 0, -(rect.bottom() - middle) - 1)
+        bottom = rect.adjusted(0, middle - rect.y() + 3, 0, 0)
+        p.setFont(self._font(9.5, True))
+        p.setPen(theme.qcolor("#FFF0BF") if self._hover else theme.qcolor("#FFE9A8"))
+        p.drawText(top, Qt.AlignHCenter | Qt.AlignBottom, self._title)
+        p.setFont(self._font(8, False, 1))
+        p.setPen(theme.qcolor("#8EA7D8"))
+        p.drawText(bottom, Qt.AlignHCenter | Qt.AlignTop, self._hint)
+
+    @staticmethod
+    def _font(pt: float, bold: bool, spacing: float = 0) -> QFont:
+        font = QFont("Courier New")
+        font.setPointSizeF(pt)
+        font.setBold(bold)
+        if spacing:
+            font.setLetterSpacing(QFont.AbsoluteSpacing, spacing)
+        return font
+
+
 def pixel_group_label(text: str) -> QLabel:
     """A small caption naming what the chips beside it control (BU116).
 

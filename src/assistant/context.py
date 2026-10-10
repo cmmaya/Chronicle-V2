@@ -44,7 +44,24 @@ RECENT_TAIL_CHARS = 3000
 LIVE_STATUSES = ('active', 'paused')
 # A question with fewer search terms than this is a follow-up ("is it about a
 # report?"): the previous question is searched along with it (BU143).
-FOLLOW_UP_MAX_TERMS = 3
+FOLLOW_UP_MAX_TERMS = 4
+
+
+def search_query(question: str, history: List[ConversationTurn]) -> str:
+    """The text searched for ``question`` (BU143), in both session scopes (BU152).
+
+    A short follow-up carries too few terms to find anything on its own,
+    so the previous user question is searched with it. The transcript
+    evidence a live-answer question embeds is left out (BU144): minutes of
+    speech would drive the search terms.
+    """
+    question = strip_transcript_evidence(question)
+    if len(fts_terms(question)) >= FOLLOW_UP_MAX_TERMS:
+        return question
+    previous = next(
+        (t.content for t in reversed(history) if t.role == "user"), ""
+    )
+    return f"{question} {previous}".strip()
 
 
 class AssistantContextRetriever:
@@ -185,22 +202,7 @@ class AssistantContextRetriever:
             ))
         return excerpts or None
 
-    @staticmethod
-    def _search_query(question: str, history: List[ConversationTurn]) -> str:
-        """The text searched for ``question`` (BU143).
-
-        A short follow-up carries too few terms to find anything on its own,
-        so the previous user question is searched with it. The transcript
-        evidence a live-answer question embeds is left out (BU144): minutes of
-        speech would drive the search terms.
-        """
-        question = strip_transcript_evidence(question)
-        if len(fts_terms(question)) >= FOLLOW_UP_MAX_TERMS:
-            return question
-        previous = next(
-            (t.content for t in reversed(history) if t.role == "user"), ""
-        )
-        return f"{question} {previous}".strip()
+    _search_query = staticmethod(search_query)
 
     def _load_transcript_rows(self, session_id: int) -> List[dict[str, Any]]:
         """Raw transcript rows of a session, oldest first."""

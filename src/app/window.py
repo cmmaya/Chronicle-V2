@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 
 from .session_manager import SessionManager
 from .documents_dialog import SessionDocumentsDialog
+from .start_session_popover import StartSessionPopover, default_session_name
 from .pixel_theme import app_qss, asset_path
 from . import theme
 from .. import paths
@@ -55,7 +56,9 @@ from ..assistant.live_qa import (
     build_question_from_records, strip_transcript_evidence, timestamp_range,
     QuestionDetector, mode_policy_reason,
 )
-from ..assistant.session_documents import extract_document, is_allowed_document
+from ..assistant.session_documents import (
+    attachment_extensions, extract_attachment, is_allowed_attachment,
+)
 from ..assistant.scope_offer import (
     format_scope_offer_prompt,
     decline_scope_offer as apply_scope_offer_decline,
@@ -277,10 +280,10 @@ def document_drop_error(paths) -> Optional[str]:
     dropped at once; the drop is taken when at least one is an allowed
     document, and the others report their own refusal while importing.
     """
-    allowed = ", ".join(SESSION_DOCUMENTS['allowed_extensions'])
+    allowed = ", ".join(attachment_extensions())
     if not paths:
         return f"Only local {allowed} files can be added"
-    if any(is_allowed_document(p) for p in paths):
+    if any(is_allowed_attachment(p) for p in paths):
         return None
     if len(paths) == 1 and os.path.isdir(paths[0]):
         return f"Folders cannot be added - drop {allowed} files"
@@ -1429,7 +1432,8 @@ class MainWindow(QMainWindow):
 
     def _run_transcription(self, session_id: int, combo: Optional[QComboBox] = None,
                            on_done: Optional[Callable[[], None]] = None,
-                           dialog: Optional[QDialog] = None):
+                           dialog: Optional[QDialog] = None,
+                           on_transcribed: Optional[Callable[[], None]] = None):
         """Transcribe a session's audio that has no transcript yet, then index it.
 
         Runs on SessionManager's background job thread and returns at once -
@@ -1447,6 +1451,8 @@ class MainWindow(QMainWindow):
             dialog: The All Sessions window, when started from there. Its
                 progress bar then follows the job chunk by chunk and the
                 card's Transcript chip stays busy across list reloads.
+            on_transcribed: Called on the UI thread, before ``on_done``, only
+                when the job succeeded and the session has transcripts.
         """
         def progress_ui(text, percent):
             try:
@@ -1485,6 +1491,8 @@ class MainWindow(QMainWindow):
                 else:
                     self._on_status_update('No audio files found to transcribe')
                 self._refresh_session_completer()
+                if on_transcribed and error is None and outcome.get('has_transcripts'):
+                    on_transcribed()
                 if on_done:
                     on_done()
             self._post_to_ui(apply)
@@ -4778,7 +4786,7 @@ class MainWindow(QMainWindow):
             name = os.path.basename(path)
 
             def work(path=path):
-                doc = extract_document(path)
+                doc = extract_attachment(path)
                 return db.add_session_document(
                     session_id, doc.name, doc.file_type, doc.file_bytes, doc.text)
 
@@ -5992,27 +6000,29 @@ class MainWindow(QMainWindow):
                 Session.STATUS_ACTIVE, Session.STATUS_PAUSED)
         ))
 
-    def _on_start_session(self):
-        """Handle start session button click."""
+    def _on_start_session(self, session_name: Optional[str] = None, documents=()):
+        """Start a session, attaching ``documents`` (already extracted
+        ``ExtractedDocument``s from the Start Session popover)."""
         try:
             # Clear live transcription display for new session
             self._clear_transcription_view()
-            
-            # Generate session name with timestamp
-            from datetime import datetime
-            now = datetime.now()
-            session_name = f"Session {now.strftime('%Y-%m-%d %H:%M')}"
-            
+
+            session_name = (session_name or '').strip() or default_session_name()
+
             # Start session via manager (auto-starts recording)
             enable_live = self.live_transcription_action.isChecked()
             self.session_manager.start_session(session_name, auto_record=True, enable_live_transcription=enable_live)
             
             # Update UI
             self._update_ui_state()
-            self._on_status_update('Session recording started')
-            
-            # Update scope to "Specific Session" with the newly started session
+
             active_session = self.session_manager.get_active_session()
+            attached = self._attach_start_documents(active_session, documents)
+            self._on_status_update(
+                'Session recording started'
+                + (f' · {attached} file{"s" if attached != 1 else ""} attached' if attached else ''))
+
+            # Update scope to "Specific Session" with the newly started session
             if active_session:
                 self._selected_session_id = active_session.id
                 self.scope_combo.setCurrentIndex(0)  # "Specific Session"
@@ -6025,6 +6035,23 @@ class MainWindow(QMainWindow):
             self._on_status_update(f'Failed to start session: {str(e)}', is_error=True)
             QMessageBox.critical(self, 'Error', f'Failed to start session: {str(e)}')
     
+    def _attach_start_documents(self, session, documents) -> int:
+        """Store the popover's documents on the new session; returns how many."""
+        if session is None or not documents:
+            return 0
+        attached = 0
+        for doc in documents:
+            try:
+                self.session_manager.db.add_session_document(
+                    session.id, doc.name, doc.file_type, doc.file_bytes, doc.text)
+                attached += 1
+            except Exception as e:  # noqa: BLE001 - one bad file never stops the others
+                logger.warning("Could not attach %s: %s", doc.name, e)
+                self._on_status_update(f"Could not attach {doc.name}: {e}", is_error=True)
+        if attached:
+            self.documents_changed.emit(session.id)
+        return attached
+
     def _on_stop_session(self):
         """Handle stop session button click.
 
@@ -6240,8 +6267,20 @@ class MainWindow(QMainWindow):
             self._on_status_update('Session Resumed')
             self._update_ui_state()
         else:
-            # No session running - start one
-            self._on_start_session()
+            # No session running - name it and attach context first
+            self._toggle_start_session_popover()
+
+    def _toggle_start_session_popover(self):
+        """Open the Start Session popover over the Start button, or close it."""
+        popover = getattr(self, '_start_popover', None)
+        if popover is not None:
+            popover.dismiss()
+            return
+        popover = StartSessionPopover(self, self.play_stop_button, self._run_document_job)
+        popover.start_requested.connect(self._on_start_session)
+        popover.closed.connect(lambda: setattr(self, '_start_popover', None))
+        self._start_popover = popover
+        popover.open()
     
     def _on_view_screenshots_icon_clicked(self):
         """Handle view screenshots icon button click - uses selected session."""
@@ -8039,11 +8078,25 @@ class MainWindow(QMainWindow):
         )
 
     def _transcribe_uploaded_session(self, session: Session, dialog: QDialog):
-        """Transcribe a just-uploaded session and RAG-index it (background job)."""
+        """Transcribe a just-uploaded session and RAG-index it, then summarize it.
+
+        The summary follows the same ``auto_summary_after_stop`` setting as a
+        recorded session (BU152); when it is off, or transcription produced
+        nothing, the session stays "Needs summary" / "Needs transcript".
+        """
         self._on_status_update(f"Transcribing '{session.name}'…")
+
+        def summarize_after():
+            if not SESSION.get('auto_summary_after_stop', False):
+                return
+            dialog._mark_busy(session.id, 'summary_chip', 'Summarizing')
+            dialog._busy_begin(f"Summarizing '{session.name}'…", 92)
+            self._summarize_uploaded_session(session, dialog)
+
         self._run_transcription(
             session.id, dialog=dialog,
             on_done=lambda: self._refresh_all_sessions_window(dialog),
+            on_transcribed=summarize_after,
         )
 
     def _refresh_all_sessions_window(self, dialog):

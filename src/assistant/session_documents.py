@@ -94,6 +94,81 @@ def extract_document(path: str) -> ExtractedDocument:
         char_count=len(text))
 
 
+def is_allowed_image(path: str) -> bool:
+    """Whether ``path`` is an image a session can take as context."""
+    if not path or os.path.isdir(path):
+        return False
+    return os.path.splitext(path)[1].lower() in SESSION_DOCUMENTS["image_extensions"]
+
+
+def image_document_text(name: str, summary: str, visible_text: List[str]) -> str:
+    """The text an image is stored as: its description, then its words."""
+    parts = [f"Image: {name}", "", "Description:", summary.strip() or "(none)"]
+    lines = [line.strip() for line in visible_text if line and line.strip()]
+    if lines:
+        parts.extend(["", "Visible text:", *lines])
+    return "\n".join(parts)
+
+
+def extract_image(path: str, describe=None) -> ExtractedDocument:
+    """Turn an image into an ``ExtractedDocument`` through a vision model.
+
+    ``describe(path) -> {"summary", "visible_text"}`` defaults to
+    ``ScreenshotContextGenerator.describe_image``; it makes a network call, so
+    run this on a background job. Raises ``DocumentError`` on any failure.
+    """
+    name = os.path.basename(path or "")
+    if not path or not os.path.isfile(path):
+        raise DocumentError(f"{name or 'That file'} no longer exists")
+    extension = os.path.splitext(path)[1].lower()
+    if extension not in SESSION_DOCUMENTS["image_extensions"]:
+        raise DocumentError(f"{name} is not a supported image")
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise DocumentError(f"Could not read {name}: {e}") from e
+    cap = SESSION_DOCUMENTS["max_image_bytes"]
+    if size > cap:
+        raise DocumentError(
+            f"{name} is {_megabytes(size)}; the limit is {_megabytes(cap)}")
+
+    if describe is None:
+        from ..screenshots.context_generator import ScreenshotContextGenerator
+        describe = ScreenshotContextGenerator().describe_image
+    try:
+        context = describe(path)
+    except Exception as e:  # network, key or model errors
+        raise DocumentError(f"Could not describe {name}: {e}") from e
+
+    summary = str(context.get("summary") or "")
+    visible = list(context.get("visible_text") or [])
+    if not summary.strip() and not visible:
+        raise DocumentError(f"Nothing could be read from {name}")
+    text = image_document_text(name, summary, visible)
+    return ExtractedDocument(
+        name=name, file_type=extension[1:], file_bytes=size, text=text,
+        char_count=len(text))
+
+
+def is_allowed_attachment(path: str) -> bool:
+    """Whether ``path`` can be added to a session, as a document or an image."""
+    return is_allowed_document(path) or is_allowed_image(path)
+
+
+def is_image_type(file_type: str) -> bool:
+    """Whether a stored document's ``file_type`` came from an image."""
+    return f".{(file_type or '').lower()}" in SESSION_DOCUMENTS["image_extensions"]
+
+
+def attachment_extensions() -> List[str]:
+    return SESSION_DOCUMENTS["allowed_extensions"] + SESSION_DOCUMENTS["image_extensions"]
+
+
+def extract_attachment(path: str) -> ExtractedDocument:
+    """``extract_image`` for images, ``extract_document`` for everything else."""
+    return extract_image(path) if is_allowed_image(path) else extract_document(path)
+
+
 def _megabytes(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 

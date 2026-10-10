@@ -3995,3 +3995,18 @@ Validation:
 Next:
 
 - none
+
+
+## BU152 - Any Session context for unsummarized sessions
+
+Changes:
+
+- Upload Audio summarizes after transcription (`auto_summary_after_stop`); unsummarized sessions get a transcript-based router profile; `context.search_query` shared by Any Session (routing and Tier-2 query carry the previous question); routed sessions with no summary and no matching chunk add their opening chunks. `FOLLOW_UP_MAX_TERMS` 3 -> 4, because the reported follow-up has exactly 3 terms (also affects Specific Session retrieval).
+
+Validation:
+
+- `tests/test_bu152.py` (13 passed); BU137, BU143, BU144, router and context-retriever tests pass (69 in all). Manual checks (real audio upload, S84 questions) not run.
+
+Next:
+
+- none

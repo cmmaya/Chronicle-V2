@@ -1,9 +1,11 @@
 """The Documents pop-up of a session (BU148).
 
-:class:`SessionDocumentsDialog` is where a user adds documents to a session
-(drag and drop, or Import), sees what is stored, previews the text the
-assistant reads, and removes documents. Extraction and the database write run
-through ``run_job`` so a long PDF never freezes the window.
+:class:`SessionDocumentsDialog` is where a user adds documents and images to
+a session (drag and drop anywhere on the window, or click the drop zone),
+sees what is stored, previews the text the assistant reads, and removes
+entries. A document's text is extracted; an image is described by a vision
+model, which also transcribes its text. Both run through ``run_job`` so a long
+PDF or a slow model never freezes the window.
 
 ``run_job(fn, on_done)`` runs ``fn()`` off the UI thread and calls
 ``on_done(result, error)`` on the UI thread. ``MainWindow`` supplies one built
@@ -19,44 +21,49 @@ from typing import Callable, List, Optional
 from PySide6.QtCore import QStandardPaths, QTimer, Qt, Signal
 from PySide6.QtGui import QPainter, QPen
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QHBoxLayout, QPushButton, QTextEdit,
-    QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QHBoxLayout, QPushButton, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 from ..assistant.session_documents import (
-    DocumentError, extract_document, is_allowed_document,
+    DocumentError, attachment_extensions, extract_attachment,
+    is_allowed_attachment, is_allowed_image, is_image_type,
 )
 from ..config import SESSION_DOCUMENTS
-from .pixel_widgets import NAVY, PANEL_BORDER_INNER, PixelDropOverlay, _label_qss
-from .settings_dialog import (
-    CREAM, GOLD, MUTED, _centered_button, _label, _Scrim, _SettingCard,
+from . import theme
+from .pixel_widgets import (
+    ATTACH_ERROR, FILE_ROW_QSS, NAVY, PANEL_BORDER_INNER, PRIMARY_BUTTON_QSS,
+    PixelDropZone, PixelElidedLabel, _label_qss, attachment_icon,
+    pending_text, pixel_caption, pixel_flat_glyph, short_char_count,
 )
+from .settings_dialog import _Scrim
 
 logger = logging.getLogger(__name__)
 
-ERROR = "#FF8A7A"
-EMPTY_TEXT = ("No documents yet. Answers for this session use only its "
-              "transcript, summary and screenshots.")
-SCOPE_TEXT = ("Used for this session's Specific Session questions and the "
-              "transcripts window. Not used in Any Session.")
+CREAM = theme.hex("#FFF0BF")
+GOLD = theme.hex("#FFE9A8")
+MUTED = theme.hex("#8EA7D8")
+ERROR = ATTACH_ERROR
+
+EMPTY_TEXT = "No documents yet. Answers use the transcript, summary and screenshots."
+SCOPE_TEXT = "Used in this session's questions and transcripts."
 
 # Remembered for the app session, like the upload dialogs.
 _last_folder: Optional[str] = None
 
-_ROW_QSS = (
-    "QWidget#DocRow { background: #0B2260; border: 2px solid #254D9C; }"
-    "QWidget#DocRow[selected=\"true\"] { background: #14337F; border: 2px solid #F6E0A6; }"
-)
-_REMOVE_QSS = (
-    "QPushButton { color: #FF8A7A; background: transparent; border: 2px solid #254D9C;"
-    " font-family: 'Courier New'; font-size: 11pt; font-weight: 700; padding: 0 6px; }"
-    "QPushButton:hover { border: 2px solid #FF8A7A; }"
-    "QPushButton:disabled { color: #4A5C8C; }"
-)
-_PREVIEW_QSS = (
-    "QTextEdit { background: #F6E0A6; color: #071846; border: 2px solid #254D9C;"
-    " font-family: 'Courier New'; font-size: 10pt; }"
-)
+_PREVIEW_QSS = """
+QTextEdit {
+    background: #071D52;
+    color: #C9D6F5;
+    border: 2px solid #284B94;
+    border-radius: 6px;
+    padding: 6px 4px;
+    font-family: 'Courier New';
+    font-size: 9.5pt;
+    selection-background-color: #274F9B;
+    selection-color: #FFF0BF;
+}
+"""
 
 
 def _size_label(size: Optional[int]) -> str:
@@ -74,61 +81,75 @@ def _date_label(epoch: Optional[int]) -> str:
         return ""
 
 
+def _hint() -> str:
+    types = "  ".join(e.lstrip(".") for e in attachment_extensions() if e != ".jpeg")
+    return types
+
+
+class _NameLabel(PixelElidedLabel):
+    """Elides on screen; ``text()`` is still the whole name."""
+
+    def text(self) -> str:  # noqa: D102
+        return self.full_text()
+
+
 class _DocRow(QWidget):
-    """One document (or one being read) in the list."""
+    """One stored document or image (or one being read), on a single line."""
 
     selected = Signal(object)
     remove_requested = Signal(object)
 
-    def __init__(self, key, name: str, meta: str, removable: bool):
+    def __init__(self, key, name: str, meta: str, removable: bool,
+                 is_image: bool = False):
         super().__init__()
         self.key = key  # the document id, or a token for a pending import
-        self.setObjectName("DocRow")
+        self.is_image = is_image
+        self.setObjectName("FileRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet(_ROW_QSS)
+        self.setStyleSheet(FILE_ROW_QSS)
         self.setProperty("selected", False)
+        self.setFixedHeight(38)
+        if removable:
+            self.setCursor(Qt.PointingHandCursor)
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 6, 6)
+        layout.setContentsMargins(10, 2, 6, 2)
         layout.setSpacing(8)
-        text = QVBoxLayout()
-        text.setSpacing(2)
-        self.name_label = _label(name, CREAM, 10.5, bold=True)
-        self.meta_label = _label(meta, MUTED, 9)
-        text.addWidget(self.name_label)
-        text.addWidget(self.meta_label)
-        layout.addLayout(text, 1)
-        self.remove_button = QPushButton("✕")
-        self.remove_button.setToolTip("Remove this document")
-        self.remove_button.setFixedSize(30, 28)
-        self.remove_button.setStyleSheet(_REMOVE_QSS)
+        layout.addWidget(attachment_icon(is_image))
+        self.name_label = _NameLabel(name)
+        self.name_label.setStyleSheet(_label_qss(CREAM, 9.5, bold=True))
+        layout.addWidget(self.name_label, 1)
+        self.meta_label = pixel_caption(meta, GOLD if not removable else MUTED,
+                                        8.5, bold=not removable)
+        layout.addWidget(self.meta_label)
+
+        self.remove_button = pixel_flat_glyph("✕", "Remove")
         self.remove_button.clicked.connect(self._ask_confirm)
         # Parent it before touching its visibility: showing a parentless
-        # widget opens it as its own top-level window, and once reparented its
-        # click area no longer matches where the ✕ is drawn.
+        # widget opens it as its own top-level window.
         layout.addWidget(self.remove_button)
         self.remove_button.setVisible(removable)
 
         # Confirmation sits in the row itself: a separate message box over this
         # window-modal pop-up never reliably answered, so the delete never ran.
-        self.confirm_label = _label("Remove?", GOLD, 9.5, bold=True)
-        self.confirm_yes = QPushButton("Yes")
-        self.confirm_no = QPushButton("No")
-        for button in (self.confirm_yes, self.confirm_no):
-            button.setFixedSize(46, 28)
-            button.setStyleSheet(_REMOVE_QSS)
-            button.setAutoDefault(False)
+        self.confirm_label = pixel_caption("Remove?", GOLD, 8.5, bold=True)
+        self.confirm_yes = pixel_flat_glyph("Yes", "Remove it")
+        self.confirm_no = pixel_flat_glyph("No", "Keep it", quiet=True)
         self.confirm_yes.clicked.connect(lambda: self.remove_requested.emit(self.key))
         self.confirm_no.clicked.connect(lambda: self._set_confirming(False))
         for widget in (self.confirm_label, self.confirm_yes, self.confirm_no):
-            widget.hide()
             layout.addWidget(widget)
-        self._removable = removable
+            widget.setVisible(False)
+
+    def set_pending_tick(self, tick: int):
+        self.meta_label.setText(pending_text(self.is_image, tick))
 
     def _ask_confirm(self):
         self._set_confirming(True)
 
     def _set_confirming(self, value: bool):
-        self.remove_button.setVisible(self._removable and not value)
+        self.meta_label.setVisible(not value)
+        self.remove_button.setVisible(not value)
         for widget in (self.confirm_label, self.confirm_yes, self.confirm_no):
             widget.setVisible(value)
 
@@ -138,12 +159,13 @@ class _DocRow(QWidget):
         self.style().polish(self)
 
     def mousePressEvent(self, event):
-        self.selected.emit(self.key)
+        if event.button() == Qt.LeftButton:
+            self.selected.emit(self.key)
         super().mousePressEvent(event)
 
 
 class SessionDocumentsDialog(QDialog):
-    """Add, list, preview and remove one session's documents."""
+    """Add, list, preview and remove one session's documents and images."""
 
     documents_changed = Signal(int)  # session_id
 
@@ -161,71 +183,105 @@ class SessionDocumentsDialog(QDialog):
         self._pending = {}  # token -> _DocRow of an import in flight
         self._next_token = 0
         self._selected = None
-        self._drop_ready = False
+        self._tick = 0
 
         self.setObjectName("SessionDocumentsDialog")
         self.setWindowTitle(f"Documents — {session_name}")
         self.setWindowModality(Qt.WindowModal)
         self.setAcceptDrops(True)
-        self.resize(640, 700)
-        self.setMinimumSize(540, 560)
-        self.setStyleSheet(_PREVIEW_QSS)
+        self.resize(540, 640)
+        self.setMinimumSize(440, 500)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 14, 18, 16)
-        root.setSpacing(10)
-        root.addWidget(_label("Documents", CREAM, 17, bold=True))
-        root.addWidget(_label(f"For “{session_name}”", MUTED, 9.5, wrap=True))
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(0)
 
-        # Drop area + Import.
-        self.drop_card = _SettingCard("Drag files here or Import")
-        types = ", ".join(e.lstrip(".") for e in SESSION_DOCUMENTS["allowed_extensions"])
-        self.limits_label = _label(
-            f"{types} · up to {SESSION_DOCUMENTS['max_per_session']} · "
-            f"{_size_label(SESSION_DOCUMENTS['max_file_bytes'])} each", MUTED, 9.5)
-        self.import_button = _centered_button("Import…", 130)
-        self.import_button.setAutoDefault(False)
-        row = QHBoxLayout()
-        row.addWidget(self.limits_label, 1)
-        row.addWidget(self.import_button)
-        self.drop_card.body.addLayout(row)
-        root.addWidget(self.drop_card)
+        # Header: caption over the session's name, count on the right.
+        header = QHBoxLayout()
+        title = QVBoxLayout()
+        title.setSpacing(3)
+        title.addWidget(pixel_caption("DOCUMENTS", theme.role("section_title"), 9, True, 2.5))
+        self.session_label = _NameLabel(session_name)
+        self.session_label.setStyleSheet(_label_qss(CREAM, 13, bold=True))
+        title.addWidget(self.session_label)
+        header.addLayout(title, 1)
+        self.count_label = pixel_caption("", MUTED, 9, True, 1.5)
+        header.addWidget(self.count_label, 0, Qt.AlignBottom)
+        root.addLayout(header)
+        root.addSpacing(16)
 
-        self.status_label = _label("", GOLD, 9.5, wrap=True)
+        # Drop zone: click to browse; drops are taken anywhere on the window.
+        self.drop_zone = PixelDropZone("+  Drop files or browse", _hint(), height=58)
+        self.drop_zone.disabled_text = (
+            f"LIMIT OF {SESSION_DOCUMENTS['max_per_session']} REACHED")
+        self.drop_zone.setToolTip(
+            f"Documents up to {_size_label(SESSION_DOCUMENTS['max_file_bytes'])}, "
+            f"images up to {_size_label(SESSION_DOCUMENTS['max_image_bytes'])}. "
+            "Images are described and their text transcribed.")
+        self.import_button = self.drop_zone
+        root.addWidget(self.drop_zone)
+        root.addSpacing(8)
+
+        self.status_label = pixel_caption("", GOLD, 8.5)
+        self.status_label.setWordWrap(True)
         self.status_label.hide()
         root.addWidget(self.status_label)
+        root.addSpacing(6)
 
         # List.
-        self.empty_label = _label(EMPTY_TEXT, MUTED, 10, wrap=True)
+        self.empty_label = pixel_caption(EMPTY_TEXT, MUTED, 9)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAlignment(Qt.AlignCenter)
         root.addWidget(self.empty_label)
         self.list_layout = QVBoxLayout()
         self.list_layout.setSpacing(6)
         root.addLayout(self.list_layout)
+        root.addSpacing(16)
 
         # Preview.
-        self.preview_title = _label("Preview — what the assistant reads", MUTED, 9.5)
+        preview_header = QHBoxLayout()
+        self.preview_title = pixel_caption("PREVIEW", MUTED, 8.5, True, 2)
+        self.preview_meta = pixel_caption("what the assistant reads", MUTED, 8)
+        preview_header.addWidget(self.preview_title)
+        preview_header.addStretch(1)
+        preview_header.addWidget(self.preview_meta)
+        self.preview_header = QWidget()
+        self.preview_header.setLayout(preview_header)
+        preview_header.setContentsMargins(0, 0, 0, 6)
+        root.addWidget(self.preview_header)
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setAcceptRichText(False)
-        self.preview.setMinimumHeight(140)
-        root.addWidget(self.preview_title)
+        self.preview.setMinimumHeight(120)
+        self.preview.setStyleSheet(_PREVIEW_QSS)
         root.addWidget(self.preview, 1)
+        self.preview_spacer = QWidget()
+        root.addWidget(self.preview_spacer, 1)
+        root.addSpacing(14)
 
-        root.addWidget(_label(SCOPE_TEXT, MUTED, 9, wrap=True))
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.close_button = _centered_button("Close", 120)
+        # Footer.
+        footer = QHBoxLayout()
+        footer.setSpacing(12)
+        scope = pixel_caption(SCOPE_TEXT, MUTED, 8)
+        scope.setWordWrap(True)
+        footer.addWidget(scope, 1)
+        self.close_button = QPushButton("DONE")
+        self.close_button.setObjectName("PrimaryButton")
+        self.close_button.setCursor(Qt.PointingHandCursor)
+        self.close_button.setStyleSheet(PRIMARY_BUTTON_QSS)
+        self.close_button.setMinimumWidth(110)
         self.close_button.setAutoDefault(False)
-        buttons.addWidget(self.close_button)
-        root.addLayout(buttons)
+        footer.addWidget(self.close_button)
+        root.addLayout(footer)
 
-        self._drop_overlay = PixelDropOverlay(self)
-        self._drop_overlay.setGeometry(self.rect())
         self._reject_timer = QTimer(self)
         self._reject_timer.setSingleShot(True)
-        self._reject_timer.timeout.connect(self._hide_drop_overlay)
+        self._reject_timer.timeout.connect(lambda: self.drop_zone.set_drag(None))
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(360)
+        self._tick_timer.timeout.connect(self._tick_pending)
 
-        self.import_button.clicked.connect(self._pick_files)
+        self.drop_zone.clicked.connect(self._pick_files)
         self.close_button.clicked.connect(self.accept)
         self.reload()
 
@@ -242,15 +298,22 @@ class SessionDocumentsDialog(QDialog):
         pending = list(self._pending.items())
         for row in self._rows:
             self.list_layout.removeWidget(row)
+            row.hide()
             row.deleteLater()
         self._rows = []
         for doc in self._documents:
+            image = is_image_type(doc["file_type"])
             meta = " · ".join(part for part in (
                 doc["file_type"].upper(), _size_label(doc.get("file_bytes")),
-                f"{doc['char_count']:,} chars", _date_label(doc.get("added_at"))) if part)
-            self._add_row(_DocRow(doc["id"], doc["name"], meta, removable=True))
+                "described" if image else short_char_count(doc["char_count"])) if part)
+            row = _DocRow(doc["id"], doc["name"], meta, removable=True, is_image=image)
+            added = _date_label(doc.get("added_at"))
+            if added:
+                row.setToolTip(f"Added {added}")
+            self._add_row(row)
         for token, old in pending:
-            row = _DocRow(token, old.name_label.text(), "Reading…", removable=False)
+            row = _DocRow(token, old.name_label.text(), pending_text(old.is_image, self._tick),
+                          removable=False, is_image=old.is_image)
             self._pending[token] = row
             self._add_row(row)
         if self._selected not in {r.key for r in self._rows}:
@@ -274,20 +337,34 @@ class SessionDocumentsDialog(QDialog):
         for row in self._rows:
             row.set_selected(row.key == self._selected)
         self.empty_label.setVisible(not self._rows)
+        limit = SESSION_DOCUMENTS["max_per_session"]
+        used = len(self._documents) + len(self._pending)
+        self.count_label.setText(f"{used} / {limit}")
         full = self._free_slots() <= 0
         self.import_button.setEnabled(not full)
         if full:
             self._set_status(
-                f"This session already has {SESSION_DOCUMENTS['max_per_session']} "
-                "documents. Remove one to add another.")
-        if self._selected is None:
-            self.preview.clear()
-            self.preview_title.setVisible(False)
-            self.preview.setVisible(False)
+                f"This session already has {limit} documents. Remove one to add another.")
+        if self._pending and not self._tick_timer.isActive():
+            self._tick_timer.start()
+        elif not self._pending:
+            self._tick_timer.stop()
+
+        has_preview = self._selected is not None
+        self.preview_header.setVisible(has_preview)
+        self.preview.setVisible(has_preview)
+        self.preview_spacer.setVisible(not has_preview)
+        if has_preview:
+            text = self._document_text(self._selected)
+            self.preview.setPlainText(text)
+            self.preview_meta.setText(f"{len(text):,} chars · what the assistant reads")
         else:
-            self.preview_title.setVisible(True)
-            self.preview.setVisible(True)
-            self.preview.setPlainText(self._document_text(self._selected))
+            self.preview.clear()
+
+    def _tick_pending(self):
+        self._tick += 1
+        for row in self._pending.values():
+            row.set_pending_tick(self._tick)
 
     def _document_text(self, document_id: int) -> str:
         try:
@@ -304,7 +381,7 @@ class SessionDocumentsDialog(QDialog):
 
     def _set_status(self, text: str, error: bool = False):
         self.status_label.setText(text)
-        self.status_label.setStyleSheet(_label_qss(ERROR if error else GOLD, 9.5))
+        self.status_label.setStyleSheet(_label_qss(ERROR if error else GOLD, 8.5))
         self.status_label.setVisible(bool(text))
 
     # -- import ---------------------------------------------------------------
@@ -313,9 +390,11 @@ class SessionDocumentsDialog(QDialog):
         global _last_folder
         start = _last_folder or QStandardPaths.writableLocation(
             QStandardPaths.DocumentsLocation)
-        patterns = " ".join(f"*{e}" for e in SESSION_DOCUMENTS["allowed_extensions"])
+        docs = " ".join(f"*{e}" for e in SESSION_DOCUMENTS["allowed_extensions"])
+        images = " ".join(f"*{e}" for e in SESSION_DOCUMENTS["image_extensions"])
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add documents", start, f"Documents ({patterns})")
+            self, "Add documents or images", start,
+            f"Documents and images ({docs} {images});;Documents ({docs});;Images ({images})")
         if paths:
             _last_folder = os.path.dirname(paths[0])
             self.import_paths(paths)
@@ -335,7 +414,9 @@ class SessionDocumentsDialog(QDialog):
         token = f"pending-{self._next_token}"
         self._next_token += 1
         name = os.path.basename(path)
-        row = _DocRow(token, name, "Reading…", removable=False)
+        image = is_allowed_image(path)
+        row = _DocRow(token, name, pending_text(image, self._tick), removable=False,
+                      is_image=image)
         self._pending[token] = row
         self._add_row(row)
         self._refresh_state()
@@ -343,7 +424,7 @@ class SessionDocumentsDialog(QDialog):
         db, session_id = self._db, self._session_id
 
         def work():
-            doc = extract_document(path)
+            doc = extract_attachment(path)
             return db.add_session_document(
                 session_id, doc.name, doc.file_type, doc.file_bytes, doc.text)
 
@@ -393,54 +474,44 @@ class SessionDocumentsDialog(QDialog):
             return "Document limit reached"
         if not paths:
             return "Only local files can be added"
-        if not any(is_allowed_document(p) for p in paths):
+        if not any(is_allowed_attachment(p) for p in paths):
             if len(paths) == 1 and os.path.isdir(paths[0]):
                 return "Folders cannot be added"
-            return "Use " + ", ".join(SESSION_DOCUMENTS["allowed_extensions"]) + " files"
+            return "Use " + ", ".join(attachment_extensions()) + " files"
         return None
 
     def dragEnterEvent(self, event):
         paths = self._local_paths(event.mimeData())
         error = self.drop_error(paths)
         if error:
-            self._drop_ready = False
-            self._drop_overlay.show_state(error.upper(), accepting=False)
+            self.drop_zone.set_drag("reject", error.upper())
             self._reject_timer.start(self.REJECT_LINGER_MS)
             self._set_status(error, error=True)
             event.ignore()
             return
         self._reject_timer.stop()
-        self._drop_ready = True
-        self._drop_overlay.show_state("DROP TO ADD TO THIS SESSION")
+        self.drop_zone.set_drag("accept", "DROP TO ADD")
         event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        if self._drop_ready:
+        if self.drop_zone.drag_state == "accept":
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragLeaveEvent(self, event):
-        self._hide_drop_overlay()
+        if self.drop_zone.drag_state == "accept":
+            self.drop_zone.set_drag(None)
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
-        self._hide_drop_overlay()
+        self.drop_zone.set_drag(None)
         paths = self._local_paths(event.mimeData())
         if self.drop_error(paths):
             event.ignore()
             return
         event.acceptProposedAction()
         self.import_paths(paths)
-
-    def _hide_drop_overlay(self):
-        self._reject_timer.stop()
-        self._drop_ready = False
-        self._drop_overlay.hide()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._drop_overlay.setGeometry(self.rect())
 
     # -- window ---------------------------------------------------------------
 

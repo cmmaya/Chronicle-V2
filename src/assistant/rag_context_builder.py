@@ -7,6 +7,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from ..rag.indexer import _chunk_transcripts
+
 # Per-excerpt and total budgets shared by every Any Session context builder.
 MAX_EXCERPT_CHARS = 500
 MAX_CONTEXT_CHARS = 12000
@@ -199,6 +201,10 @@ def build_routed_session_context(
             chunks = db.search_rag_fts(query, limit=MAX_CHUNKS_PER_SESSION, session_id=session_id)
         except Exception:
             chunks = []
+        # No summary and nothing matched: the opening of the transcript tells
+        # the model what the session is about (BU152).
+        if not chunks and not summary_text:
+            chunks = _opening_chunks(db, session_id)
         for chunk in chunks:
             if not add(_format_result(chunk)):
                 return "\n".join(parts)
@@ -206,6 +212,23 @@ def build_routed_session_context(
     if not any(p.strip() and not p.startswith("\n## ") for p in parts):
         return "(No relevant context found in any session)"
     return "\n".join(parts)
+
+
+def _opening_chunks(db: Any, session_id: int) -> List[Dict[str, Any]]:
+    """The session's first transcript chunks, in time order (BU152)."""
+    try:
+        rows = db.get_transcripts(session_id) or []
+    except Exception:
+        return []
+    chunks = _chunk_transcripts(rows)[:MAX_CHUNKS_PER_SESSION]
+    return [
+        {
+            "source_type": "transcript",
+            "timestamp": chunk["start_timestamp"],
+            "content": chunk["content"],
+        }
+        for chunk in chunks
+    ]
 
 
 def _truncate(text: str, limit: int = MAX_EXCERPT_CHARS) -> str:

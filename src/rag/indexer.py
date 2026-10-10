@@ -15,6 +15,9 @@ DEFAULT_CHUNK_OVERLAP = 100
 TRANSCRIPT_WINDOW_SECONDS = 60
 TRANSCRIPT_WINDOW_CHARS = 800
 
+# Router profile of a session with no summary: transcript characters kept.
+PROFILE_TRANSCRIPT_CHARS = 2000
+
 
 def _chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE,
                 overlap: int = DEFAULT_CHUNK_OVERLAP) -> List[Dict[str, Any]]:
@@ -373,11 +376,25 @@ def extract_keywords(text: str, max_keywords: int = 12) -> List[str]:
     return ranked[:max_keywords]
 
 
+def _profile_transcript_text(db, session_id: int) -> str:
+    """The session's transcript rows as one text, for a profile with no summary."""
+    try:
+        rows = db.get_transcripts(session_id) or []
+    except Exception:
+        return ""
+    return " ".join(
+        (row.get("text") or "").strip() for row in rows if (row.get("text") or "").strip()
+    )
+
+
 def build_session_profile(db, session_id: int) -> Optional[Dict[str, Any]]:
     """Assemble the router profile text + keywords for a session.
 
     Profile text = session name + start date + summary text. Keywords are
-    extracted from name + summary. Returns ``None`` when the session is unknown.
+    extracted from name + summary. A session with no summary uses its
+    transcript instead (BU152): the first ``PROFILE_TRANSCRIPT_CHARS``
+    characters as text, keywords from all of it. Returns ``None`` when the
+    session is unknown.
     """
     try:
         session = db.get_session(session_id)
@@ -404,13 +421,18 @@ def build_session_profile(db, session_id: int) -> Optional[Dict[str, Any]]:
         (s.get("content") or "").strip() for s in summaries if s.get("content")
     ).strip()
 
-    keywords = extract_keywords(f"{name}\n{summary_text}")
+    # No summary yet (an uploaded recording, BU152): the transcript stands in,
+    # so the session routes on what was said. The summary replaces it later.
+    transcript_text = "" if summary_text else _profile_transcript_text(db, session_id)
+    keywords = extract_keywords(f"{name}\n{summary_text or transcript_text}")
 
     parts = [name]
     if date_str:
         parts.append(date_str)
     if summary_text:
         parts.append(summary_text)
+    elif transcript_text:
+        parts.append(transcript_text[:PROFILE_TRANSCRIPT_CHARS])
     if keywords:
         parts.append("Keywords: " + ", ".join(keywords))
     profile_text = "\n".join(parts).strip()

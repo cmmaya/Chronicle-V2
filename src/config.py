@@ -115,6 +115,10 @@ SESSION_DOCUMENTS = {
     "max_per_session": 5,
     "max_file_bytes": 2 * 1024 * 1024,
     "allowed_extensions": [".txt", ".md", ".pdf", ".docx"],
+    # Images attached when a session starts: a vision model's description and
+    # the text it reads off the image are stored as a document.
+    "image_extensions": [".png", ".jpg", ".jpeg", ".webp"],
+    "max_image_bytes": 8 * 1024 * 1024,
     # Extracted text outside these bounds is refused (BU147): below the
     # minimum a scanned PDF "worked" but holds nothing to answer from; above
     # the maximum it would be cut silently.

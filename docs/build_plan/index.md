@@ -235,3 +235,9 @@ Session Documents — user-requested: add documents (.txt, .md, .pdf, .docx) to 
 | BU149 | Session Documents In Specific Session Prompts | Completed | BU145, BU146  | BU150 |
 | BU150 | Document Badge On Chat Answers And A Documents Indicator | Completed | BU148, BU149 | BU151 |
 | BU151 | Detached Window On Session Documents (Replaces The BU117 Attachment) | Completed | BU145, BU148, BU149, BU150 | none |
+
+Any Session For Unsummarized Sessions — user-reported: an All Sessions question about an uploaded-audio session (S84) answered "no transcript or summary content", although its transcript is indexed
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU152 | Any Session Context For Unsummarized (Uploaded Audio) Sessions | Completed | BU143 | none  |

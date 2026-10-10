@@ -344,6 +344,48 @@ The JSON must always be valid and all fields must always be present."""
             logger.error(f"Failed to generate screenshot context: {e}")
             raise ScreenshotContextGeneratorError(f"Failed to generate context: {e}")
     
+    IMAGE_PROMPT = """You are reading an image a user attached to a session before it started, so an assistant can answer questions about it during the session.
+
+Return ONLY valid JSON, no markdown or code fences, with exactly this schema:
+
+{
+  "summary": "",
+  "visible_text": []
+}
+
+summary:
+A concise paragraph (40-120 words) describing what the image shows: its kind (slide, diagram, chart, photo, document page, UI...), its subject, and the information it conveys. Do not speculate or invent details. Do not start with "This image shows".
+
+visible_text:
+The meaningful text in the image, in reading order, one entry per line or block. Transcribe it faithfully. Leave out decorative or insignificant UI text. Use an empty list when there is none."""
+
+    def describe_image(self, image_path: str) -> dict:
+        """Describe a standalone image and transcribe its text.
+
+        Unlike :meth:`generate_context` there is no transcript to anchor on and
+        nothing is stored. Returns ``{"summary": str, "visible_text": [str]}``.
+        Tries the default vision model, then the fallback.
+        """
+        from ..assistant.openrouter_client import OpenRouterClient
+
+        image_data = self._encode_image(image_path)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": self.IMAGE_PROMPT},
+                {"type": "image_url", "image_url": {"url": image_data}},
+            ],
+        }]
+        first_error = None
+        for model_id in (self.DEFAULT_VISION_MODEL, self.FALLBACK_VISION_MODEL):
+            try:
+                parsed = self._parse_response(OpenRouterClient(model=model_id).chat(messages=messages))
+                return {"summary": parsed["summary"], "visible_text": parsed["visible_text"]}
+            except Exception as e:  # noqa: BLE001 - try the fallback, then report the first
+                logger.warning("Describing %s with %s failed: %s", image_path, model_id, e)
+                first_error = first_error or e
+        raise ScreenshotContextGeneratorError(f"Could not describe the image: {first_error}")
+
     def _store_context(self, screenshot_path: str, context: dict) -> None:
         """Store the generated context in the database.
         

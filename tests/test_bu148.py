@@ -112,10 +112,10 @@ def test_row_shows_reading_until_the_job_finishes(qapp, db, session_id, tmp_path
     jobs = []
     dlg = SessionDocumentsDialog(db, session_id, 'Class', lambda fn, done: jobs.append((fn, done)))
     dlg.import_paths([_file(tmp_path, 'a.txt')])
-    assert [r.meta_label.text() for r in dlg._rows] == ['Reading…']
+    assert [r.meta_label.text().startswith('reading') for r in dlg._rows] == [True]
     fn, done = jobs[0]
     done(fn(), None)
-    assert 'Reading' not in dlg._rows[0].meta_label.text()
+    assert 'reading' not in dlg._rows[0].meta_label.text()
 
 
 def test_refused_file_shows_its_message_and_later_files_still_import(dialog, db, session_id, tmp_path):
@@ -205,3 +205,19 @@ def test_window_opens_the_dialog_and_relays_the_signal(qapp, db, session_id):
         assert relayed == [session_id]
     finally:
         dialog.reject()
+
+
+def test_dropped_image_is_described_and_stored(dialog, db, session_id, tmp_path, monkeypatch):
+    from src.screenshots.context_generator import ScreenshotContextGenerator
+    monkeypatch.setattr(
+        ScreenshotContextGenerator, 'describe_image',
+        lambda self, path: {'summary': 'A whiteboard of the onboarding flow.',
+                            'visible_text': ['Sign up', 'Verify email']})
+    image = tmp_path / 'whiteboard.png'
+    image.write_bytes(b'\x89PNG fake')
+    assert dialog.drop_error([str(image)]) is None
+    dialog.import_paths([str(image)])
+    [doc] = db.get_session_documents(session_id)
+    assert doc['file_type'] == 'png'
+    assert 'onboarding flow' in doc['text'] and 'Verify email' in doc['text']
+    assert dialog._rows[0].is_image and 'described' in dialog._rows[0].meta_label.text()

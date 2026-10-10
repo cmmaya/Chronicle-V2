@@ -5,7 +5,10 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from .context_models import ScreenshotReference, TranscriptExcerpt, render_screenshot_section
+from .context import search_query
+from .context_models import (
+    ConversationTurn, ScreenshotReference, TranscriptExcerpt, render_screenshot_section,
+)
 from .openrouter_client import OpenRouterClient
 from .rag_context_builder import build_any_session_context, build_routed_session_context
 from .response_contract import RESPONSE_CONTRACT, parse_answer
@@ -562,7 +565,7 @@ class AssistantAnswerService:
             # research_helper general-knowledge question: history only.
             return "", "", ""
         if resolution.scope == ScopeResolution.ALL_SESSIONS:
-            return "", self._get_all_sessions_context(question), ""
+            return "", self._get_all_sessions_context(question, conversation_id), ""
         if resolution.session_ids:
             return self._get_single_session_context(
                 resolution.session_ids[0], question, conversation_id
@@ -630,16 +633,20 @@ class AssistantAnswerService:
             len(documents), mode, len(block),
         )
 
-    def _get_all_sessions_context(self, question: str) -> str:
+    def _get_all_sessions_context(
+        self, question: str, conversation_id: Optional[int] = None
+    ) -> str:
         """Route to the relevant sessions, then build context from those only.
 
         Two-tier (BU089): Tier-1 picks the handful of sessions the question is
         about; Tier-2 chunk search runs only inside them. Falls back to the
-        legacy unified/keyword search when routing yields nothing.
+        legacy unified/keyword search when routing yields nothing. A short
+        follow-up is routed and searched with the previous question (BU152).
         """
+        query = search_query(question, self._previous_turns(conversation_id))
         routed = []
         try:
-            routed = route_sessions(self._db, question, k=5)
+            routed = route_sessions(self._db, query, k=5)
         except Exception:
             routed = []
 
@@ -656,7 +663,7 @@ class AssistantAnswerService:
 
         if routed:
             try:
-                context = build_routed_session_context(self._db, question, routed)
+                context = build_routed_session_context(self._db, query, routed)
                 if context and not context.startswith("(No relevant context"):
                     return context
             except Exception:
@@ -671,6 +678,19 @@ class AssistantAnswerService:
             pass
 
         return self._get_all_sessions_context_legacy(question)
+
+    def _previous_turns(self, conversation_id: Optional[int]) -> List[ConversationTurn]:
+        """The conversation's recent messages, for the follow-up search rule."""
+        if conversation_id is None:
+            return []
+        try:
+            rows = self._db.get_messages(conversation_id)[-MAX_HISTORY_MESSAGES:]
+        except Exception:
+            return []
+        return [
+            ConversationTurn(role=r.get("role", "user"), content=r["content"])
+            for r in rows if r.get("content")
+        ]
 
     def _get_all_sessions_context_legacy(self, question: str) -> str:
         """Get cross-session context using separate search tools (legacy fallback)."""
