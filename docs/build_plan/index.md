@@ -241,3 +241,16 @@ Any Session For Unsummarized Sessions — user-reported: an All Sessions questio
 | BU    | Name                                    | Status    | Depends On          | Next  |
 | ---   | ---                                     | ---       | ---                 | ---   |
 | BU152 | Any Session Context For Unsummarized (Uploaded Audio) Sessions | Completed | BU143 | none  |
+
+Boring Corporate Appearance — user-requested: a third appearance, "Boring Corporate", that redesigns every window as a dark corporate minimalist interface after a ChatGPT-style reference (black canvas, grey surfaces, thin line icons, rounded edges, sans-serif type); Classic and Synthwave unchanged
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU153 | Theme Engine: Style Tokens Beyond Colour | Completed | BU129               | BU154 |
+| BU154 | Monochrome Palette                      | Completed | BU153               | BU155 |
+| BU155 | Line Icon Set                           | Completed | BU153               | BU156 |
+| BU156 | Core Widgets                            | Completed | BU153, BU154        | BU157 |
+| BU157 | Main Window Layout                      | Completed | BU155, BU156        | BU158 |
+| BU158 | Secondary Windows                       | Completed | BU156               | BU159 |
+| BU159 | Dialogs                                 | Completed | BU156               | BU160 |
+| BU160 | Visual QA                               | Completed | BU157, BU158, BU159 | none  |

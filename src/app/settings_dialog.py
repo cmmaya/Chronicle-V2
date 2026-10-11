@@ -28,7 +28,7 @@ from . import theme
 from .pixel_theme import asset_path
 from .pixel_widgets import (
     PANEL_BORDER_INNER, NAVY, PixelButton, PixelPanel, PixelSectionTitle,
-    _label_qss, pixel_round_rect_path,
+    _label_qss, pixel_round_rect_path, set_accent,
 )
 
 MUTED = theme.hex("#8EA7D8")
@@ -89,6 +89,8 @@ class PixelToggle(QWidget):
     toggled = Signal(bool)
 
     W, H, KNOB = 60, 28, 18
+    if not theme.is_pixel():
+        W, H, KNOB = 40, 22, 16  # BU159: a slim pill switch
 
     def __init__(self, checked: bool = False, parent=None):
         super().__init__(parent)
@@ -141,15 +143,34 @@ class PixelToggle(QWidget):
             return
         super().keyPressEvent(event)
 
+    def _paint_pill(self, p):
+        """Boring Corporate: white track and black knob when on, grey track
+        and light knob when off; no ON/OFF text."""
+        on = self._checked
+        track = QColor("#F9F9F9") if on else QColor("#3A3A3A")
+        knob = QColor("#0D0D0D") if on else QColor("#D4D4D4")
+        p.setPen(QPen(QColor("#8F8F8F"), 1) if self.hasFocus() else Qt.NoPen)
+        p.setBrush(track)
+        p.drawPath(theme.rounded_rect_path(0, 0, self.W - 1, self.H - 1, self.H / 2))
+        inset = (self.H - self.KNOB) / 2
+        x = inset + (self.W - self.KNOB - 2 * inset) * self._pos
+        p.setPen(Qt.NoPen)
+        p.setBrush(knob)
+        p.drawEllipse(QRectF(x, inset, self.KNOB, self.KNOB))
+
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setRenderHint(QPainter.Antialiasing, theme.antialias())
+        if not theme.is_pixel():
+            self._paint_pill(p)
+            p.end()
+            return
         on = self._checked
         track = QColor(GOLD) if on else theme.qcolor("#071D52")
         border = QColor(FOCUS) if self.hasFocus() else theme.qcolor("#FFEFC1" if on else "#3A67C7")
         knob = theme.qcolor("#071846") if on else QColor(MUTED)
 
-        p.setPen(QPen(border, 2))
+        p.setPen(QPen(border, theme.pen_width(2)))
         p.setBrush(track)
         p.drawPath(pixel_round_rect_path(1, 1, self.W - 3, self.H - 3, 5))
 
@@ -188,6 +209,17 @@ QSlider::handle:horizontal {{
 }}
 QSlider::handle:horizontal:hover {{ background: #FFFFFF; }}
 """
+if not theme.is_pixel():
+    _SLIDER_QSS = theme.NATIVE_QSS + """
+    QSlider { background: transparent; min-height: 26px; }
+    QSlider::groove:horizontal { height: 4px; background: #3A3A3A; border: none; border-radius: 2px; }
+    QSlider::sub-page:horizontal { background: #ECECEC; border: none; border-radius: 2px; }
+    QSlider::handle:horizontal {
+        background: #FAFAFA; border: none; width: 14px; height: 14px;
+        margin: -5px 0px; border-radius: 7px;
+    }
+    QSlider::handle:horizontal:hover { background: #FFFFFE; }
+    """
 
 _NAV_QSS = f"""
 QPushButton#SettingsNav {{
@@ -201,6 +233,15 @@ QPushButton#SettingsNav:checked {{
     background: #F6E0A6; color: #071846; border: 2px solid #FFEFC1;
 }}
 """
+if not theme.is_pixel():
+    _NAV_QSS = theme.NATIVE_QSS + """
+    QPushButton#SettingsNav {
+        color: #B4B4B4; background: transparent; border: none; border-radius: 8px;
+        padding: 8px 10px; text-align: left; font-size: 14px; font-weight: 400;
+    }
+    QPushButton#SettingsNav:hover { background: #1A1A1A; color: #ECECEC; }
+    QPushButton#SettingsNav:checked { background: #212121; color: #ECECEC; }
+    """
 
 
 def _label(text: str, color: str = CREAM, pt: float = 11, bold: bool = False,
@@ -214,7 +255,8 @@ def _label(text: str, color: str = CREAM, pt: float = 11, bold: bool = False,
 def _centered_button(text: str, min_width: int) -> PixelButton:
     button = PixelButton(text)
     button.setMinimumWidth(min_width)
-    button.setStyleSheet(button.styleSheet() + "QPushButton#PixelButton { text-align: center; }")
+    if theme.is_pixel():  # Boring Corporate buttons are centred already
+        button.setStyleSheet(button.styleSheet() + "QPushButton#PixelButton { text-align: center; }")
     return button
 
 
@@ -262,6 +304,7 @@ class _ThemePreview(QWidget):
 
     def __init__(self, name: str, parent=None):
         super().__init__(parent)
+        self._name = name
         self.setFixedHeight(92)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         mapping = theme.REMAP[name]
@@ -279,10 +322,52 @@ class _ThemePreview(QWidget):
             if not pixmap.isNull():
                 self._background = pixmap
 
+    def _paint_corporate(self, p):
+        """Boring Corporate thumbnail (BU159): black canvas, a flush sidebar
+        behind a hairline, a centred heading over a grey input pill, line
+        rows for the sidebar and rounded grey bubbles for the transcripts."""
+        from PySide6.QtGui import QPainterPath
+
+        def pill(x, y, w, h, r, fill, pen=None):
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(x, y, w, h), r, r)
+            p.setPen(pen or Qt.NoPen)
+            p.setBrush(fill)
+            p.drawPath(path)
+
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor("#000000"))
+        side = right = max(34, w // 5)
+        hairline = QColor("#262626")
+        p.fillRect(side, 0, 1, h, hairline)
+        p.fillRect(w - right, 0, 1, h, hairline)
+        # Sidebar: brand, three nav rows (the first hovered).
+        pill(8, 9, side - 26, 4, 2, QColor("#ECECEC"))
+        pill(6, 19, side - 12, 10, 3, QColor("#212121"))
+        for i in range(3):
+            pill(10, 22 + i * 13, 5, 4, 1, QColor("#B4B4B4"))
+            pill(18, 22 + i * 13, side - 32, 4, 2, QColor("#8F8F8F"))
+        # Centre: heading and input pill.
+        mid_x, mid_w = side + 1, w - side - right - 1
+        pill(mid_x + mid_w * 0.3, h * 0.36, mid_w * 0.4, 5, 2.5, QColor("#ECECEC"))
+        pill(mid_x + 12, h * 0.5, mid_w - 24, 13, 6.5, QColor("#262626"),
+             QPen(QColor("#333333"), 1))
+        pill(mid_x + mid_w - 24, h * 0.5 + 2.5, 8, 8, 4, QColor("#F9F9F9"))
+        # Transcripts: two grey bubbles.
+        rx = w - right + 1
+        pill(rx + 6, 12, right - 22, 3, 1.5, QColor("#8F8F8F"))
+        pill(rx + 6, 22, right - 14, 24, 6, QColor("#1A1A1A"))
+        pill(rx + 6, 52, right - 14, 18, 6, QColor("#262626"))
+
     def paintEvent(self, event):
         c = self._c
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
+        if self._name == theme.BORING_CORPORATE:
+            self._paint_corporate(p)
+            p.end()
+            return
+        p.setRenderHint(QPainter.Antialiasing, theme.antialias())
         w, h = self.width(), self.height()
         p.fillRect(0, 0, w, h, c["backdrop"])
 
@@ -339,13 +424,14 @@ class _ThemeOption(QWidget):
         self._selected = False
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setMinimumWidth(190)
+        # Three themes share one row of the page (BU159).
+        self.setMinimumWidth(140)
         label, description = theme.THEMES[name]
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
         layout.addWidget(_ThemePreview(name))
-        self.title = _label(label, CREAM, 11.5, bold=True)
+        self.title = _label(label, CREAM, 11.5, bold=True, wrap=True)
         self.description = _label(description, MUTED, 9, wrap=True)
         self.state = _label("", GOLD, 9, bold=True)
         for child in (self.title, self.description, self.state):
@@ -376,14 +462,14 @@ class _ThemeOption(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setRenderHint(QPainter.Antialiasing, theme.antialias())
         if self._selected:
             border, width = QColor(GOLD), 3
         elif self.hasFocus():
             border, width = QColor(FOCUS), 2
         else:
             border, width = theme.qcolor("#3A67C7"), 2
-        p.setPen(QPen(border, width))
+        p.setPen(QPen(border, theme.pen_width(width)))
         p.setBrush(NAVY)
         p.drawPath(pixel_round_rect_path(1, 1, self.width() - 3, self.height() - 3, 7))
         p.end()
@@ -399,7 +485,7 @@ class _Scrim(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(3, 10, 32, 150))
+        p.fillRect(self.rect(), QColor(3, 10, 32, 150) if theme.is_pixel() else QColor(0, 0, 0, 170))
         p.end()
 
 
@@ -438,6 +524,10 @@ class SettingsDialog(QDialog):
         rail_layout = QVBoxLayout(rail)
         rail_layout.setContentsMargins(10, 14, 10, 12)
         rail_layout.setSpacing(4)
+        if not theme.is_pixel():
+            rail.set_flat(True)  # BU159: the nav sits flush, like the sidebar
+            rail_layout.setContentsMargins(4, 8, 4, 4)
+            rail_layout.setSpacing(2)
         rail_layout.addWidget(PixelSectionTitle("SETTINGS"))
         rail_layout.addSpacing(8)
 
@@ -456,7 +546,7 @@ class SettingsDialog(QDialog):
             button.setCursor(Qt.PointingHandCursor)
             button.setFocusPolicy(Qt.NoFocus)  # arrow keys / Ctrl+Tab would fight the pages' fields
             button.setStyleSheet(_NAV_QSS)
-            button.setText("  " + name)
+            button.setText("  " + name if theme.is_pixel() else name)
             button.setProperty("pageName", name)
             self.nav_group.addButton(button, index)
             self.nav_buttons.append(button)
@@ -466,6 +556,11 @@ class SettingsDialog(QDialog):
         rail_layout.addWidget(_label("Esc to close", MUTED, 8.5))
         self.nav_group.idToggled.connect(self._on_nav_toggled)
         body.addWidget(rail)
+        if not theme.is_pixel():
+            divider = QFrame()
+            divider.setFixedWidth(1)
+            divider.setStyleSheet(theme.NATIVE_QSS + "QFrame { background: #262626; border: none; }")
+            body.addWidget(divider)
         body.addWidget(self.stack, 1)
 
         # Footer.
@@ -474,10 +569,13 @@ class SettingsDialog(QDialog):
         dot = QLabel()
         dot.setFixedSize(8, 8)
         dot.setStyleSheet(f"QLabel {{ background: {GOLD}; border: none; }}")
+        dot.setVisible(theme.is_pixel())
         footer.addWidget(dot, 0, Qt.AlignVCenter)
         footer.addWidget(_label("Changes save automatically", MUTED, 9.5), 0, Qt.AlignVCenter)
         footer.addStretch(1)
         self.done_button = _centered_button("Done", 120)
+        if not theme.is_pixel():
+            set_accent(self.done_button, "primary")
         self.done_button.clicked.connect(self.accept)
         footer.addWidget(self.done_button)
         root.addLayout(footer)
@@ -500,7 +598,7 @@ class SettingsDialog(QDialog):
         subtitle = _label("", MUTED, 9.5, wrap=True)
         layout.addWidget(subtitle)
         rule = QFrame()
-        rule.setFixedHeight(2)
+        rule.setFixedHeight(2 if theme.is_pixel() else 1)
         rule.setStyleSheet(f"QFrame {{ background: {PANEL_BORDER_INNER.name()}; border: none; }}")
         layout.addWidget(rule)
         subtitle.setText(build(layout))
@@ -522,7 +620,10 @@ class SettingsDialog(QDialog):
     def _on_nav_toggled(self, index: int, checked: bool):
         button = self.nav_buttons[index]
         name = button.property("pageName")
-        button.setText(("▶ " if checked else "  ") + name)
+        if theme.is_pixel():
+            button.setText(("▶ " if checked else "  ") + name)
+        else:
+            button.setText(name)
         if checked:
             self.stack.setCurrentIndex(index)
 
@@ -599,6 +700,8 @@ class SettingsDialog(QDialog):
                 text = "APPLIES AFTER RESTART"
             else:
                 text = ""
+            if not theme.is_pixel():
+                text = text.capitalize()
             option.set_state(name == saved, text)
         pending = saved != running
         self.theme_restart_label.setVisible(pending)
@@ -1040,7 +1143,7 @@ class SettingsDialog(QDialog):
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), NAVY)
-        p.setPen(QPen(PANEL_BORDER_INNER, 2))
+        p.setPen(QPen(PANEL_BORDER_INNER, theme.pen_width(2)))
         p.setBrush(Qt.NoBrush)
         p.drawRect(self.rect().adjusted(1, 1, -1, -1))
         p.end()

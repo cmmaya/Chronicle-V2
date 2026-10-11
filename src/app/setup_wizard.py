@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from .. import model_manager, paths, secrets
 from ..config import APP_VERSION
+from . import theme
 from .pixel_theme import app_qss
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,23 @@ QProgressBar {
 }
 QProgressBar::chunk { background: #3A67C7; border-radius: 5px; }
 """
+if not theme.is_pixel():
+    # Boring Corporate (BU159): the field text was navy on cream; pill buttons.
+    WIZARD_QSS += theme.NATIVE_QSS + """
+    QWizard, QWizardPage { background: #000000; }
+    QLineEdit { color: #ECECEC; background: #262626; border: 1px solid #333333; border-radius: 10px; padding: 7px 10px; }
+    QLineEdit:disabled { color: #8F8F8F; background: #1A1A1A; }
+    QPushButton {
+        color: #ECECEC; background: #212121; border: 1px solid #424242;
+        border-radius: 15px; padding: 6px 18px; min-height: 18px;
+    }
+    QPushButton:hover { background: #2C2C2C; }
+    QPushButton:default { color: #0D0D0D; background: #F9F9F9; border-color: #F9F9F9; }
+    QPushButton:disabled { color: #5C5C5C; background: #141414; border-color: #262626; }
+    QProgressBar { color: #ECECEC; background: #1A1A1A; border: none; border-radius: 6px; min-height: 12px; }
+    QProgressBar::chunk { background: #ECECEC; border-radius: 6px; }
+    QLabel#SetupNote { color: #B4B4B4; }
+    """
 
 
 def _label(text: str = "", name: str = "") -> QLabel:

@@ -265,7 +265,7 @@ class SessionDocumentsDialog(QDialog):
         scope = pixel_caption(SCOPE_TEXT, MUTED, 8)
         scope.setWordWrap(True)
         footer.addWidget(scope, 1)
-        self.close_button = QPushButton("DONE")
+        self.close_button = QPushButton("DONE" if theme.is_pixel() else "Done")
         self.close_button.setObjectName("PrimaryButton")
         self.close_button.setCursor(Qt.PointingHandCursor)
         self.close_button.setStyleSheet(PRIMARY_BUTTON_QSS)
@@ -518,7 +518,7 @@ class SessionDocumentsDialog(QDialog):
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), NAVY)
-        p.setPen(QPen(PANEL_BORDER_INNER, 2))
+        p.setPen(QPen(PANEL_BORDER_INNER, theme.pen_width(2)))
         p.setBrush(Qt.NoBrush)
         p.drawRect(self.rect().adjusted(1, 1, -1, -1))
         p.end()

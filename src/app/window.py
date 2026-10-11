@@ -39,6 +39,7 @@ from .pixel_widgets import (
     PixelDocumentBadge, PixelDocumentsChip, REMOVED_DOCUMENT_LABEL,
     PixelTitleBar, PixelResizeFrame, set_accent, enable_native_snap, snap_overhang,
     PixelDueDateCard, PixelDueDateList, PixelSearchResultCard, search_snippet,
+    corporate_button_qss,
 )
 from ..audio_capture.core import ChunkedAudioRecorder
 from ..audio.importer import SUPPORTED_EXTENSIONS as UPLOAD_AUDIO_EXTENSIONS
@@ -340,17 +341,21 @@ class DetachedTranscriptsDialog(QDialog):
         error = self._drop_error(paths)
         if error:
             self._drop_ready = False
-            self._drop_overlay.show_state(error.upper(), accepting=False)
+            self._drop_overlay.show_state(error.upper() if theme.is_pixel() else error,
+                                          accepting=False)
             self._reject_timer.start(self.REJECT_LINGER_MS)
             self.drop_rejected.emit(error)
             event.ignore()
             return
         self._reject_timer.stop()
         self._drop_ready = True
-        self._drop_overlay.show_state(
-            "DROP TO ADD TO THIS SESSION" if len(paths) > 1
-            else f"DROP TO ADD {os.path.basename(paths[0]).upper()}"
-        )
+        if theme.is_pixel():
+            text = ("DROP TO ADD TO THIS SESSION" if len(paths) > 1
+                    else f"DROP TO ADD {os.path.basename(paths[0]).upper()}")
+        else:
+            text = ("Drop to add to this session" if len(paths) > 1
+                    else f"Drop to add {os.path.basename(paths[0])}")
+        self._drop_overlay.show_state(text)
         event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
@@ -925,7 +930,10 @@ class MainWindow(QMainWindow):
         self._sidebar_collapsed = False
         self._sidebar_expanded_min_width = 250
         self._sidebar_expanded_max_width = 278
-        self._sidebar_collapsed_width = 86
+        self._sidebar_collapsed_width = 86 if theme.is_pixel() else 64
+        # Square icon buttons on the sidebar rail (BU157: smaller ghost
+        # circles in Boring Corporate).
+        self._rail_button_size = 54 if theme.is_pixel() else 40
         self._center_control_max_width = 1620  # Expanded horizontal width
         self._search_bar_max_width = 750  # Session scope/search bar at the top
         
@@ -941,6 +949,13 @@ class MainWindow(QMainWindow):
         self._init_session_manager(sessions_path)
 
     def eventFilter(self, obj, event):
+        if (event.type() in (event.Type.ChildAdded, event.Type.ChildRemoved,
+                             event.Type.LayoutRequest)
+                and obj is getattr(self, '_answer_container', None)):
+            # Deferred: ChildAdded arrives in the middle of the row's
+            # reparenting, and showing the answers area then leaves the new
+            # row hidden (the first message never appeared). BU157
+            QTimer.singleShot(0, self._sync_empty_chat_state)
         if (event.type() == event.Type.Resize
                 and obj is getattr(self, '_detached_find_host', None)):
             self._position_detached_find_bar()
@@ -1306,6 +1321,10 @@ class MainWindow(QMainWindow):
             
             # Update the scroll area
             self._answer_scroll_area.setWidget(self._answer_container)
+            if getattr(self, '_empty_chat_heading', None) is not None:
+                # BU157: watch the new container for the empty-chat state.
+                self._answer_container.installEventFilter(self)
+                self._sync_empty_chat_state()
             
             # Store conversation ID for follow-up questions
             self._current_conversation_id = conv_id
@@ -2338,7 +2357,7 @@ class MainWindow(QMainWindow):
         button.setIcon(self._make_icon(icon_filename))
         button.setText(fallback_text)
         button.setIconSize(QSize(28, 28))
-        button.setMinimumSize(54, 54)
+        button.setMinimumSize(self._rail_button_size, self._rail_button_size)
         button.clicked.connect(callback)
         return button
 
@@ -2476,11 +2495,28 @@ class MainWindow(QMainWindow):
         # - center_shell is the only column with horizontal stretch
         # Inside center_shell, only the answers viewport consumes the extra width.
         central_layout.addWidget(self.left_shell, 0)
+        if not theme.is_pixel():
+            # Boring Corporate (BU157): the columns sit flush on one black
+            # canvas, separated by hairlines instead of floating boxes.
+            central_layout.setSpacing(0)
+            self._sidebar_divider = self._make_column_divider()
+            central_layout.addWidget(self._sidebar_divider, 0)
         central_layout.addWidget(self.center_shell, 1)
+        if not theme.is_pixel():
+            central_layout.addWidget(self._make_column_divider(), 0)
         central_layout.addWidget(self.right_shell, 0)
 
         self._wire_pane_focus()
         self._wire_find_bar()
+
+    @staticmethod
+    def _make_column_divider() -> QWidget:
+        """A 1px vertical hairline between two flush columns (BU157)."""
+        divider = QWidget()
+        divider.setFixedWidth(1)
+        divider.setAttribute(Qt.WA_StyledBackground, True)
+        divider.setStyleSheet(theme.NATIVE_QSS + "QWidget { background: #262626; }")
+        return divider
 
     # =========================
     # Active pane focus model (BU098)
@@ -2698,10 +2734,15 @@ class MainWindow(QMainWindow):
             "QListWidget, QPushButton, QToolButton { font-family: 'Courier New';"
             " font-size: 11pt; font-weight: 700; color: #FFF0BF; }"
         )
+        corporate = not theme.is_pixel()
+        if corporate:
+            panel.setStyleSheet(theme.NATIVE_QSS + (
+                "QListWidget { font-size: 14px; font-weight: 400; color: #ECECEC; }"))
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setSpacing(2 if corporate else 10)
         self._sidebar_layout = layout
+        nav_icon = QSize(20, 20) if corporate else QSize(28, 28)
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
@@ -2716,31 +2757,36 @@ class MainWindow(QMainWindow):
         self.sidebar_menu_button.setText("☰")
         self.sidebar_menu_button.setToolTip("Collapse sidebar")
         self.sidebar_menu_button.setMinimumSize(50, 50)
+        if corporate:
+            self.sidebar_menu_button.setText("")
+            self.sidebar_menu_button.setFixedSize(36, 36)
         self.sidebar_menu_button.clicked.connect(self._toggle_left_sidebar)
         set_accent(self.sidebar_menu_button, "menu")
         header.addWidget(self.sidebar_menu_button, 0)
         self.sidebar_header_layout = header
         layout.addLayout(header)
+        if corporate:
+            layout.addSpacing(14)
 
         self.new_chat_button = PixelButton("  New Chat", sidebar=True)
         self.new_chat_button.setIcon(self._make_icon(
             "icon_grid_light.svg" if theme.is_classic() else "icon_grid.svg"))
         set_accent(self.new_chat_button, "primary")
-        self.new_chat_button.setIconSize(QSize(28, 28))
+        self.new_chat_button.setIconSize(nav_icon)
         self.new_chat_button.clicked.connect(self._on_new_chat_clicked)
         layout.addWidget(self.new_chat_button)
 
         self.search_chats_button = PixelButton("  Search Chats", sidebar=True)
         self.search_chats_button.setIcon(self._make_icon(
             "icon_search_light.svg" if theme.is_classic() else "icon_search_synth.svg"))
-        self.search_chats_button.setIconSize(QSize(28, 28))
+        self.search_chats_button.setIconSize(nav_icon)
         self.search_chats_button.clicked.connect(self._open_search_dialog)
         layout.addWidget(self.search_chats_button)
 
         self.settings_button = PixelButton("  Settings", sidebar=True)
         self.settings_button.setIcon(self._make_icon(
             "icon_settings.svg" if theme.is_classic() else "icon_settings_synth.svg"))
-        self.settings_button.setIconSize(QSize(28, 28))
+        self.settings_button.setIconSize(nav_icon)
         self.settings_button.clicked.connect(self._open_settings_dialog)
         layout.addWidget(self.settings_button)
 
@@ -2755,6 +2801,12 @@ class MainWindow(QMainWindow):
         history_layout = QVBoxLayout(history_panel)
         history_layout.setContentsMargins(8, 8, 8, 8)
         history_layout.setSpacing(6)
+        if corporate:
+            # Flush on the sidebar under a small grey "Chats" label.
+            history_panel.set_flat(True)
+            history_layout.setContentsMargins(0, 18, 0, 0)
+            history_layout.setSpacing(2)
+            layout.addSpacing(6)
         history_layout.addWidget(PixelSectionTitle("PAST CONVERSATIONS", alt=True))
 
         self.conversations_list = QListWidget()
@@ -2776,6 +2828,17 @@ class MainWindow(QMainWindow):
         self.sidebar_collapse_spacer.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
         self.sidebar_collapse_spacer.setVisible(False)
         layout.addWidget(self.sidebar_collapse_spacer, 1)
+
+        if corporate:
+            # Session controls sit under a hairline, like a chat app's
+            # account area at the foot of the sidebar.
+            rule = QWidget()
+            rule.setFixedHeight(1)
+            rule.setAttribute(Qt.WA_StyledBackground, True)
+            rule.setStyleSheet(theme.NATIVE_QSS + "QWidget { background: #262626; }")
+            layout.addSpacing(6)
+            layout.addWidget(rule)
+            layout.addSpacing(4)
 
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 4, 0, 0)
@@ -2839,17 +2902,18 @@ class MainWindow(QMainWindow):
             self.sidebar_history_panel.setVisible(False)
             self.sidebar_collapse_spacer.setVisible(True)
 
-            self.sidebar_menu_button.setText("›")
+            rail = self._rail_button_size
+            self.sidebar_menu_button.setText("›" if theme.is_pixel() else "")
             self.sidebar_menu_button.setToolTip("Expand sidebar")
-            self.sidebar_menu_button.setMinimumSize(54, 54)
-            self.sidebar_menu_button.setMaximumSize(54, 54)
+            self.sidebar_menu_button.setMinimumSize(rail, rail)
+            self.sidebar_menu_button.setMaximumSize(rail, rail)
 
             for button, _expanded_text, tooltip in self._sidebar_action_buttons:
                 button.setText("")
                 button.setToolTip(tooltip)
                 self._set_style_property(button, "iconOnly", True)
-                button.setMinimumSize(54, 54)
-                button.setMaximumSize(54, 54)
+                button.setMinimumSize(rail, rail)
+                button.setMaximumSize(rail, rail)
                 self._sidebar_layout.setAlignment(button, Qt.AlignHCenter)
             self.sidebar_header_layout.setAlignment(self.sidebar_menu_button, Qt.AlignHCenter)
 
@@ -2857,8 +2921,8 @@ class MainWindow(QMainWindow):
             self.sidebar_controls_layout.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
             self.sidebar_controls_layout.setSpacing(8)
             for button in self._sidebar_session_control_buttons:
-                button.setMinimumSize(54, 54)
-                button.setMaximumSize(54, 54)
+                button.setMinimumSize(rail, rail)
+                button.setMaximumSize(rail, rail)
                 self.sidebar_controls_layout.setAlignment(button, Qt.AlignHCenter)
 
             self._answer_layout.setContentsMargins(32, 18, 32, 18)
@@ -2869,16 +2933,19 @@ class MainWindow(QMainWindow):
             self.sidebar_history_panel.setVisible(True)
             self.sidebar_collapse_spacer.setVisible(False)
 
-            self.sidebar_menu_button.setText("☰")
             self.sidebar_menu_button.setToolTip("Collapse sidebar")
-            self.sidebar_menu_button.setMinimumSize(50, 50)
-            self.sidebar_menu_button.setMaximumSize(16777215, 16777215)
+            if theme.is_pixel():
+                self.sidebar_menu_button.setText("☰")
+                self.sidebar_menu_button.setMinimumSize(50, 50)
+                self.sidebar_menu_button.setMaximumSize(16777215, 16777215)
+            else:
+                self.sidebar_menu_button.setFixedSize(36, 36)
 
             for button, expanded_text, tooltip in self._sidebar_action_buttons:
                 button.setText(expanded_text)
                 button.setToolTip(tooltip)
                 self._set_style_property(button, "iconOnly", False)
-                button.setMinimumHeight(52)
+                button.setMinimumHeight(52 if theme.is_pixel() else 38)
                 button.setMaximumSize(16777215, 16777215)
                 self._sidebar_layout.setAlignment(button, Qt.Alignment())
             self.sidebar_header_layout.setAlignment(self.sidebar_menu_button, Qt.Alignment())
@@ -2887,8 +2954,10 @@ class MainWindow(QMainWindow):
             self.sidebar_controls_layout.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
             self.sidebar_controls_layout.setSpacing(8)
             for button in self._sidebar_session_control_buttons:
-                button.setMinimumSize(54, 54)
+                button.setMinimumSize(self._rail_button_size, self._rail_button_size)
                 button.setMaximumSize(16777215, 16777215)
+                if not theme.is_pixel():
+                    button.setMaximumSize(self._rail_button_size, self._rail_button_size)
                 self.sidebar_controls_layout.setAlignment(button, Qt.Alignment())
 
             self._answer_layout.setContentsMargins(42, 18, 42, 18)
@@ -2916,6 +2985,9 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout(top_bar_frame)
         top_bar.setContentsMargins(12, 4, 8, 4)
         top_bar.setSpacing(8)
+        if not theme.is_pixel():
+            top_bar_frame.setFixedHeight(46)
+            top_bar.setContentsMargins(14, 0, 6, 0)
 
         self.scope_combo = QComboBox()
         self.scope_combo.setObjectName("ScopeCombo")
@@ -2923,7 +2995,7 @@ class MainWindow(QMainWindow):
         self.scope_combo.addItem("Any Session", "any")
         self.scope_combo.setCurrentIndex(1)
         self.scope_combo.currentIndexChanged.connect(self._on_scope_changed)
-        self.scope_combo.setMinimumHeight(46)
+        self.scope_combo.setMinimumHeight(46 if theme.is_pixel() else 40)
         self.scope_combo.setMinimumWidth(140)
         self.scope_combo.setMaximumWidth(210)
         top_bar.addWidget(self.scope_combo, 0)
@@ -2931,7 +3003,7 @@ class MainWindow(QMainWindow):
         self.session_search_input = QLineEdit()
         self.session_search_input.setObjectName("SessionSearchInput")
         self.session_search_input.setPlaceholderText("Search sessions...")
-        self.session_search_input.setMinimumHeight(46)
+        self.session_search_input.setMinimumHeight(46 if theme.is_pixel() else 40)
         self.session_search_input.installEventFilter(self)
         top_bar.addWidget(self.session_search_input, 1)
 
@@ -2942,6 +3014,10 @@ class MainWindow(QMainWindow):
         self.session_search_button.setToolTip("Show all sessions")
         self.session_search_button.clicked.connect(self._show_all_sessions_window)
         self.session_search_button.setStyleSheet("QToolButton { background: transparent; color: #071C4B; border: none; min-width: 46px; min-height: 46px; max-width: 50px; max-height: 50px; }")
+        if not theme.is_pixel():
+            self.session_search_button.setStyleSheet(
+                corporate_button_qss("ghost", "QToolButton", 34, padding="0px"))
+            self.session_search_button.setFixedSize(34, 34)
         top_bar.addWidget(self.session_search_button, 0)
         self.show_all_sessions_button = self.session_search_button
 
@@ -3028,6 +3104,8 @@ class MainWindow(QMainWindow):
         self._answer_layout.setContentsMargins(38, 16, 38, 16)
         self._answer_layout.addStretch()
         self._answer_scroll_area.setWidget(self._answer_container)
+        if not theme.is_pixel():
+            self._answer_layout.setSpacing(24)
         # Same pinning as the transcript stream: follow the bottom while the
         # user is there, re-pinning once the new bubble has its real height.
         self._answer_autoscroll = True
@@ -3049,12 +3127,16 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout(input_bar)
         input_layout.setContentsMargins(16, 7, 12, 7)
         input_layout.setSpacing(8)
+        if not theme.is_pixel():
+            # A 60px pill: radius 30 in the theme QSS needs this exact height.
+            input_bar.setFixedHeight(60)
+            input_layout.setContentsMargins(22, 6, 12, 6)
 
         self.question_input = PixelChatInput()
         self.question_input.setObjectName("QuestionInput")
         self.question_input.setPlaceholderText("Ready to help...")
-        self.question_input.setMaximumHeight(50)
-        self.question_input.setMinimumHeight(50)
+        self.question_input.setMaximumHeight(50 if theme.is_pixel() else 44)
+        self.question_input.setMinimumHeight(50 if theme.is_pixel() else 44)
         self.question_input.submitted.connect(self._on_ask_clicked)
         input_layout.addWidget(self.question_input, 1)
 
@@ -3082,6 +3164,24 @@ class MainWindow(QMainWindow):
         self.ask_button.setVisible(False)
         input_layout.addWidget(self.ask_button, 0)
 
+        # Boring Corporate (BU157): a round send button closes the pill, as
+        # in a chat app. It asks exactly like Ctrl+Enter does.
+        self.send_button = None
+        if not theme.is_pixel():
+            self.send_button = QToolButton()
+            self.send_button.setObjectName("SendButton")
+            self.send_button.setIcon(self._make_icon("icon_send.svg"))
+            self.send_button.setIconSize(QSize(18, 18))
+            self.send_button.setFixedSize(36, 36)
+            self.send_button.setCursor(Qt.PointingHandCursor)
+            self.send_button.setToolTip("Send (Ctrl+Enter)")
+            self.send_button.setStyleSheet(
+                corporate_button_qss("primary", "QToolButton#SendButton", 36, padding="0px"))
+            self.send_button.clicked.connect(self._on_ask_clicked)
+            self.question_input.textChanged.connect(self._sync_send_button)
+            input_layout.addWidget(self.send_button, 0, Qt.AlignVCenter)
+            self._sync_send_button()
+
         self.detach_assistant_button = PixelButton("Detach")
         self.detach_assistant_button.clicked.connect(self._on_detach_assistant)
         self.detach_assistant_button.setVisible(False)
@@ -3101,7 +3201,11 @@ class MainWindow(QMainWindow):
         input_bar_container.addStretch(1)
         input_bar_container.addWidget(input_bar, 10)
         input_bar_container.addStretch(1)
+        if not theme.is_pixel():
+            self._build_empty_chat_state(layout)
         layout.addLayout(input_bar_container, 0)
+        if not theme.is_pixel():
+            layout.addWidget(self._empty_chat_bottom, 1)
 
         self.candidate_group = PixelPanel(inner=True)
         candidate_layout = QVBoxLayout(self.candidate_group)
@@ -3148,6 +3252,58 @@ class MainWindow(QMainWindow):
         self._app_logs_messages = []
 
         return panel
+
+    # ---- Boring Corporate empty chat (BU157) ---------------------------------
+
+    def _build_empty_chat_state(self, layout):
+        """"Where should we begin?" over the input pill, both centred in the
+        column while the chat is empty, as in a chat app's start page.
+
+        Two expanding spacers around the heading and the input bar push them
+        to the middle; they and the heading are shown only while the answers
+        list holds no message, and the answers area is hidden meanwhile.
+        """
+        self._empty_chat_top = QWidget()
+        self._empty_chat_top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self._empty_chat_heading = QLabel("Hello Boss, how can I help?")
+        self._empty_chat_heading.setAlignment(Qt.AlignCenter)
+        self._empty_chat_heading.setStyleSheet(theme.NATIVE_QSS + (
+            "QLabel { color: #ECECEC; background: transparent; border: none;"
+            f" font-family: '{theme.display_font_family()}'; font-size: 28px;"
+            " font-weight: 400; padding-bottom: 22px; }"))
+        self._empty_chat_bottom = QWidget()
+        self._empty_chat_bottom.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        layout.addWidget(self._empty_chat_top, 1)
+        layout.addWidget(self._empty_chat_heading, 0)
+        self._answer_container.installEventFilter(self)
+        self._empty_chat_shown = None
+        self._sync_empty_chat_state()
+
+    def _chat_is_empty(self) -> bool:
+        # Children, not layout items: rows are reparented into the container
+        # before the layout lists them, and a cleared row stays a child until
+        # its deleteLater runs - ChildAdded / ChildRemoved bracket both.
+        container = getattr(self, '_answer_container', None)
+        if container is None:
+            return False
+        return not any(isinstance(child, QWidget) and not child.isWindow()
+                       for child in container.children())
+
+    def _sync_empty_chat_state(self):
+        if getattr(self, '_empty_chat_heading', None) is None:
+            return
+        empty = self._chat_is_empty()
+        if empty == self._empty_chat_shown:
+            return
+        self._empty_chat_shown = empty
+        self._answer_scroll_area.setVisible(not empty)
+        self._empty_chat_top.setVisible(empty)
+        self._empty_chat_heading.setVisible(empty)
+        self._empty_chat_bottom.setVisible(empty)
+
+    def _sync_send_button(self):
+        if self.send_button is not None:
+            self.send_button.setEnabled(bool(self.question_input.toPlainText().strip()))
 
     @staticmethod
     def _make_inserted_caption(alignment) -> QLabel:
@@ -3273,6 +3429,7 @@ class MainWindow(QMainWindow):
     def _create_transcription_view(self) -> QWidget:
         """Create the right-panel pixel transcript stream."""
         wrapper = PixelPanel(inner=True)
+        wrapper.set_flat(not theme.is_pixel())  # BU157: flush on the canvas
         wrapper.setObjectName("TranscriptViewport")
         wrapper_layout = QVBoxLayout(wrapper)
         # Keep the scroll area inside PixelPanel's painted border (drawn at
@@ -3545,8 +3702,9 @@ class MainWindow(QMainWindow):
             self._thinking_message_widget = None
 
         align = "right" if role == 'user' else "left"
-        variant = "cream" if role == 'user' else "blue"
-        row = aligned_bubble(text, variant=variant, align=align, max_width=400)
+        variant = "cream" if role == 'user' else self._answer_variant()
+        row = aligned_bubble(text, variant=variant, align=align,
+                             max_width=self._chat_bubble_width(role))
         row.setProperty('role', role)
         row.setProperty('message_text', text)
 
@@ -3564,6 +3722,17 @@ class MainWindow(QMainWindow):
             self._add_message_to_detached_conversation(role, text)
 
         return row
+
+    @staticmethod
+    def _answer_variant() -> str:
+        """Answers are plain text on the canvas in Boring Corporate (BU157)."""
+        return "blue" if theme.is_pixel() else "plain"
+
+    @staticmethod
+    def _chat_bubble_width(role: str) -> int:
+        if theme.is_pixel():
+            return 400
+        return 460 if role == 'user' else 720
 
     def _scroll_answer_to_bottom(self):
         """Jump the chat to its last message and keep following it.
@@ -3610,7 +3779,8 @@ class MainWindow(QMainWindow):
                 self._answer_layout.takeAt(index)
                 self._thinking_message_widget.deleteLater()
 
-        row = aligned_bubble(new_text, variant="blue", align="left", max_width=400)
+        row = aligned_bubble(new_text, variant=self._answer_variant(), align="left",
+                             max_width=self._chat_bubble_width('assistant'))
         row.setProperty('role', 'assistant')
         row.setProperty('message_text', new_text)
         self._answer_layout.insertWidget(
@@ -4085,6 +4255,14 @@ class MainWindow(QMainWindow):
                 background: transparent;
             }
         """)
+        if not theme.is_pixel():
+            log_label.setStyleSheet(theme.NATIVE_QSS + """
+                QPushButton#AppLogMessage {
+                    color: #8F8F8F; background: transparent; border: none;
+                    text-align: left; padding: 0px 4px; font-size: 12px; font-weight: 400;
+                }
+                QPushButton#AppLogMessage:hover { color: #B4B4B4; }
+            """)
 
         # Make it clickable to hide
         log_label.clicked.connect(lambda: self._hide_app_log(log_label))
@@ -4589,6 +4767,12 @@ class MainWindow(QMainWindow):
             f"QScrollArea {{ background-color: {page_bg}; border: none; }}"
             f" QScrollBar {{ background-color: {page_bg}; }}"
         )
+        if not theme.is_pixel():
+            # A partial QScrollBar rule makes Qt fall back to its own
+            # (checkered) drawing; give the bar the theme's full look (BU158).
+            self._detached_scroll_area.setStyleSheet(
+                f"QScrollArea {{ background-color: {page_bg}; border: none; }}"
+                + theme.scrollbar_qss())
         # Same stick-to-bottom behaviour as the main transcript panel: follow
         # new content only while the user is at the bottom, and re-pin on every
         # real range change so a bubble that grows after insertion still lands
@@ -7472,6 +7656,13 @@ class MainWindow(QMainWindow):
         dialog.setObjectName("AllSessionsDialog")
         dialog.setWindowTitle("All Sessions")
         dialog.setStyleSheet(self._ALL_SESSIONS_DIALOG_QSS)
+        if not theme.is_pixel():
+            # BU158: uploads are the white primary pills, Close a dark one.
+            dialog.setStyleSheet(
+                self._ALL_SESSIONS_DIALOG_QSS
+                + corporate_button_qss("primary", "QPushButton#AllSessionsUpload", 32)
+                + corporate_button_qss("primary", "QPushButton#AllSessionsUploadTranscript", 32)
+                + corporate_button_qss("secondary", "QPushButton#AllSessionsClose", 32))
         dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         dialog.setSizeGripEnabled(True)
         dialog.setMinimumSize(700, 460)

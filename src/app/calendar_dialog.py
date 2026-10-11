@@ -26,7 +26,7 @@ from ..calendar_sync import events, google_auth
 from ..calendar_sync.events import CalendarError, EventDraft
 from ..calendar_sync.google_auth import GoogleAuthError, GoogleAuthExpired
 from . import theme
-from .pixel_widgets import NAVY, PANEL_BORDER_INNER, _label_qss
+from .pixel_widgets import NAVY, PANEL_BORDER_INNER, _label_qss, set_accent
 from .settings_dialog import (
     CREAM, GOLD, MUTED, PixelToggle, _centered_button, _label, _Scrim, _SettingCard,
 )
@@ -215,6 +215,8 @@ class CalendarEventDialog(QDialog):
         buttons.addStretch(1)
         self.discard_button = _centered_button("Discard", 120)
         self.primary_button = _centered_button("Create Event", 190)
+        if not theme.is_pixel():
+            set_accent(self.primary_button, "primary")  # BU159: white pill
         for button in (self.discard_button, self.primary_button):
             button.setAutoDefault(False)
             button.setDefault(False)
@@ -426,7 +428,7 @@ class CalendarEventDialog(QDialog):
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), NAVY)
-        p.setPen(QPen(PANEL_BORDER_INNER, 2))
+        p.setPen(QPen(PANEL_BORDER_INNER, theme.pen_width(2)))
         p.setBrush(Qt.NoBrush)
         p.drawRect(self.rect().adjusted(1, 1, -1, -1))
         p.end()

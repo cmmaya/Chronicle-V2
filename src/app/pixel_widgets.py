@@ -69,6 +69,8 @@ PANEL_GLOW = theme.role("panel_glow")  # "" = no halo around panels
 # invisible - CREAM bubbles use the dark-on-light BUBBLE_BLUE pair instead).
 FIND_TERM_ON_CREAM = (theme.hex("#294F9D"), theme.hex("#FFF0BF"))  # over CREAM / cream-variant bubbles
 FIND_TERM_ON_BLUE = (theme.hex("#FFEFC1"), theme.hex("#071846"))   # over BUBBLE_BLUE / blue-variant bubbles
+if not theme.is_pixel():
+    FIND_TERM_ON_CREAM = FIND_TERM_ON_BLUE = (theme.role("find_fill"), theme.role("find_text"))
 
 # Selected transcript bubble (BU113). Deliberately not cream: the find
 # highlight already owns CREAM_BORDER, and a selection has to stay legible
@@ -92,7 +94,11 @@ def pixel_round_rect_path(x: int, y: int, w: int, h: int, cut: int = 10) -> QPai
     """
     Rectángulo con esquinas pixeladas.
     No usa curvas; todo son segmentos rectos.
+
+    A non-pixel theme (BU153) gets a real rounded rectangle instead.
     """
+    if not theme.is_pixel():
+        return theme.rounded_rect_path(x, y, w, h, theme.corner_radius(cut))
     path = QPainterPath()
     path.moveTo(x + cut, y)
     path.lineTo(x + w - cut, y)
@@ -363,9 +369,19 @@ class PixelPanel(QWidget):
             self.clicked.emit()
         super().mousePressEvent(event)
 
+    def set_flat(self, value: bool):
+        """Boring Corporate (BU156): paint nothing, so the panel's content sits
+        straight on the canvas. Pixel themes ignore it."""
+        self._flat = bool(value)
+        self.update()
+
     def paintEvent(self, event):
+        if not theme.is_pixel():
+            self._paint_flush(event)
+            return
+
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
 
         rect = self.rect().adjusted(2, 2, -3, -3)
         if rect.width() <= 0 or rect.height() <= 0:
@@ -411,15 +427,42 @@ class PixelPanel(QWidget):
                 painter.drawPath(path)
             painter.restore()
 
-        painter.setPen(QPen(border, pen_width))
+        painter.setPen(QPen(border, theme.pen_width(pen_width)))
         painter.drawPath(path)
 
+        super().paintEvent(event)
+
+    def _paint_flush(self, event):
+        """Boring Corporate: a top-level panel is just the black canvas (the
+        window draws 1px dividers between columns); an inner panel is a
+        hairline-edged rounded box, or nothing at all when ``set_flat``."""
+        if getattr(self, "_flat", False):
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.inner:
+            rect = self.rect().adjusted(0, 0, -1, -1)
+            path = theme.rounded_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 12)
+            painter.setBrush(QBrush(NAVY_INNER))
+            painter.setPen(QPen(PANEL_BORDER_INNER, 1))
+            painter.drawPath(path)
+        else:
+            painter.fillRect(self.rect(), NAVY)
         super().paintEvent(event)
 
 
 # =========================
 # Titles
 # =========================
+
+
+def _sentence_case(text: str) -> str:
+    """"PAST CONVERSATIONS" -> "Past conversations" (BU156); text that is not
+    all capitals is left alone."""
+    if text and text.isupper():
+        return text[:1] + text[1:].lower()
+    return text
 
 class PixelSectionTitle(QLabel):
     def __init__(self, text: str, parent=None, center: bool = False, alt: bool = False):
@@ -435,6 +478,22 @@ class PixelSectionTitle(QLabel):
         self.setFont(font)
 
         color = theme.role("section_title_alt" if alt else "section_title")
+        if not theme.is_pixel():
+            # Small grey sentence-case label, like a chat app's "Chats".
+            super().setText(_sentence_case(text))
+            self.setStyleSheet(
+                theme.NATIVE_QSS + f"""
+                QLabel#PixelSectionTitle {{
+                    color: {color};
+                    background: transparent;
+                    border: none;
+                    font-size: 12px;
+                    font-weight: 400;
+                    padding: 2px 2px;
+                }}
+                """
+            )
+            return
         self.setStyleSheet(
             f"""
             QLabel#PixelSectionTitle {{
@@ -444,6 +503,9 @@ class PixelSectionTitle(QLabel):
             }}
             """
         )
+
+    def setText(self, text):  # noqa: N802 - Qt signature
+        super().setText(text if theme.is_pixel() else _sentence_case(text))
 
 
 # =========================
@@ -482,6 +544,132 @@ _ACCENT_TOOL_QSS = {
 }
 
 
+# Boring Corporate buttons (BU156). ``__R__`` is the corner radius, kept at
+# half the button's height (a pill, or a circle for a square icon button) by
+# _PillStyle: Qt draws a radius over half the height as a square corner.
+_CORPORATE_BUTTON_QSS = theme.NATIVE_QSS + """
+QPushButton#PixelButton {
+    color: #ECECEC;
+    background: #212121;
+    border: 1px solid #424242;
+    border-radius: __R__px;
+    padding: 6px 16px;
+    text-align: center;
+    font-size: 14px;
+    font-weight: 500;
+}
+QPushButton#PixelButton:hover { background: #2C2C2C; }
+QPushButton#PixelButton:pressed { background: #181818; }
+QPushButton#PixelButton:disabled {
+    color: #5C5C5C;
+    background: #141414;
+    border-color: #262626;
+}
+QPushButton#PixelButton[accent="primary"] {
+    color: #0D0D0D;
+    background: #F9F9F9;
+    border-color: #F9F9F9;
+    font-weight: 600;
+}
+QPushButton#PixelButton[accent="primary"]:hover { background: #E5E5E5; border-color: #E5E5E5; }
+QPushButton#PixelButton[accent="primary"]:pressed { background: #D4D4D4; }
+"""
+
+# Sidebar buttons are flat navigation rows that only show a grey rounded
+# background under the pointer.
+_CORPORATE_NAV_QSS = theme.NATIVE_QSS + """
+QPushButton#PixelButton {
+    color: #ECECEC;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 10px;
+    text-align: left;
+    font-size: 14px;
+    font-weight: 400;
+}
+QPushButton#PixelButton:hover { background: #1A1A1A; }
+QPushButton#PixelButton:pressed { background: #212121; }
+QPushButton#PixelButton[iconOnly="true"] { text-align: center; padding: 6px; }
+QPushButton#PixelButton:disabled { color: #5C5C5C; }
+"""
+
+# Icon buttons are ghost circles.
+_CORPORATE_TOOL_QSS = theme.NATIVE_QSS + """
+QToolButton#PixelToolButton {
+    color: #ECECEC;
+    background: transparent;
+    border: none;
+    border-radius: __R__px;
+    padding: 4px;
+    font-size: 14px;
+}
+QToolButton#PixelToolButton:hover { background: #212121; }
+QToolButton#PixelToolButton:pressed { background: #2A2A2A; }
+QToolButton#PixelToolButton:checked { background: #212121; }
+QToolButton#PixelToolButton:disabled { color: #5C5C5C; background: transparent; }
+QToolButton#PixelToolButton[quietDisabled="true"]:disabled { color: #ECECEC; }
+"""
+
+# Line icons read best at this size; the pixel icons were drawn for 28px.
+CORPORATE_ICON_MAX = 20
+
+
+class _PillStyle:
+    """Keep a ``__R__`` stylesheet's radius at half the widget's height.
+
+    Re-applies only while the widget still carries the stylesheet this set, so
+    a caller's own ``setStyleSheet`` afterwards is never overwritten.
+    """
+
+    def __init__(self, widget, template: str):
+        self.widget = widget
+        self.template = template
+        self.radius = None
+        self.applied = None
+        self.apply()
+
+    def apply(self):
+        w = self.widget
+        if self.applied is not None and w.styleSheet() != self.applied:
+            return  # someone restyled the widget; leave it alone
+        radius = max(4, min(w.height(), w.width()) // 2)
+        if radius == self.radius:
+            return
+        self.radius = radius
+        w.setStyleSheet(self.template.replace("__R__", str(radius)))
+        self.applied = w.styleSheet()
+
+
+def corporate_button_qss(kind: str, selector: str, height: int,
+                         padding: str = "0px 16px", font_px: int = 13) -> str:
+    """A Boring Corporate button stylesheet (BU156) for a fixed-height
+    button: ``kind`` is "primary" (white pill, black text), "secondary"
+    (dark pill, grey border) or "ghost" (no fill until hovered)."""
+    radius = max(4, height // 2)
+    looks = {
+        "primary": ("#0D0D0D", "#F9F9F9", "#F9F9F9", "#E5E5E5", "#D4D4D4", 600),
+        "secondary": ("#ECECEC", "#212121", "#424242", "#2C2C2C", "#181818", 500),
+        "ghost": ("#ECECEC", "transparent", "transparent", "#212121", "#2A2A2A", 400),
+    }
+    color, fill, border, hover, pressed, weight = looks[kind]
+    return theme.NATIVE_QSS + f"""
+    {selector} {{
+        color: {color};
+        background: {fill};
+        border: 1px solid {border};
+        border-radius: {radius}px;
+        padding: {padding};
+        font-size: {font_px}px;
+        font-weight: {weight};
+    }}
+    {selector}:hover {{ background: {hover}; border-color: {hover if kind != "secondary" else "#4D4D4D"}; }}
+    {selector}:pressed {{ background: {pressed}; }}
+    {selector}:disabled {{ color: #5C5C5C; background: {"#141414" if kind != "ghost" else "transparent"}; border-color: #262626; }}
+    {selector}::menu-indicator {{ image: none; width: 0px; }}
+    """
+
+
 def set_accent(widget: QWidget, accent: str):
     """Give a PixelButton / PixelToolButton one of the theme's accent looks."""
     widget.setProperty("accent", accent)
@@ -511,6 +699,16 @@ class PixelButton(QPushButton):
         font.setPointSize(12 if sidebar else 10)
         font.setBold(True)
         self.setFont(font)
+
+        self._pill = None
+        if not theme.is_pixel():
+            if sidebar:
+                self.setMinimumHeight(38)
+                self.setStyleSheet(_CORPORATE_NAV_QSS)
+            else:
+                self.setMinimumHeight(36)
+                self._pill = _PillStyle(self, _CORPORATE_BUTTON_QSS)
+            return
 
         self.setStyleSheet(
             """
@@ -551,6 +749,11 @@ class PixelButton(QPushButton):
             + _ACCENT_BUTTON_QSS.get(theme.active(), "")
         )
 
+    def resizeEvent(self, event):  # noqa: N802 - Qt signature
+        super().resizeEvent(event)
+        if self._pill is not None:
+            self._pill.apply()
+
 
 class PixelToolButton(QToolButton):
     """Square icon button in the app's navy/gold palette.
@@ -588,6 +791,12 @@ class PixelToolButton(QToolButton):
         font.setBold(True)
         self.setFont(font)
 
+        self._pill = None
+        if not theme.is_pixel():
+            self.setIconSize(icon_size)
+            self._pill = _PillStyle(self, _CORPORATE_TOOL_QSS)
+            return
+
         self.setStyleSheet(
             f"""
             QToolButton#PixelToolButton {{
@@ -624,6 +833,17 @@ class PixelToolButton(QToolButton):
             + _ACCENT_TOOL_QSS.get(theme.active(), "")
         )
 
+    def setIconSize(self, size):  # noqa: N802 - Qt signature
+        if not theme.is_pixel():
+            size = QSize(min(size.width(), CORPORATE_ICON_MAX),
+                         min(size.height(), CORPORATE_ICON_MAX))
+        super().setIconSize(size)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt signature
+        super().resizeEvent(event)
+        if self._pill is not None:
+            self._pill.apply()
+
 
 # =========================
 # Chat bubbles
@@ -640,6 +860,10 @@ class PixelBubble(QWidget):
     """
     Burbuja plana tipo mockup 2:
     sin bisel, sin sombra, con esquinas pixeladas y cola pixelada.
+
+    Boring Corporate (BU156) drops the tail and rounds the corners. Its
+    ``"plain"`` variant is no bubble at all - text straight on the canvas,
+    the way a chat app sets the assistant's answers.
     """
 
     def __init__(
@@ -664,10 +888,12 @@ class PixelBubble(QWidget):
                 comment below); they are not a nested layout.
         """
         super().__init__(parent)
+        if variant == "plain" and theme.is_pixel():
+            variant = "blue"  # pixel themes always draw the bubble
         self.variant = variant
         self.tail = tail
         self.cut = 7
-        self.tail_size = 13
+        self.tail_size = 13 if theme.is_pixel() else 0
         self._highlighted = False
         self._selected = False
         self._match_terms = []
@@ -765,7 +991,12 @@ class PixelBubble(QWidget):
         # label's actual assigned width, so the box grew or clipped text
         # depending on how far off the guess was.
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
+        if theme.is_pixel():
+            layout.setContentsMargins(14, 14, 14, 14)
+        elif variant == "plain":
+            layout.setContentsMargins(2, 4, 2, 4)
+        else:
+            layout.setContentsMargins(16, 10, 12, 10)
         layout.setSpacing(6)
         layout.addWidget(self.label)
         if self.footer_label:
@@ -1007,9 +1238,34 @@ class PixelBubble(QWidget):
 
         return path
 
+    def _paint_rounded(self, painter):
+        """Boring Corporate: a borderless rounded fill; an outline only for
+        the find match or the user's selection."""
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        radius = 18 if self.variant == "cream" else 14
+        path = theme.rounded_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), radius)
+        border = None
+        if self._selected:
+            border = QPen(QColor(theme.role("selection")), 1.5)
+        elif self._highlighted:
+            border = QPen(QColor(theme.role("text_muted")), 1)
+        if self.variant == "plain":
+            if border is None:
+                return
+            painter.setBrush(QColor("#0D0D0D"))
+        else:
+            painter.setBrush(QBrush(CREAM if self.variant == "cream" else BUBBLE_BLUE))
+        painter.setPen(border if border is not None else Qt.NoPen)
+        painter.drawPath(path)
+
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
+        if not theme.is_pixel():
+            self._paint_rounded(painter)
+            painter.end()
+            super().paintEvent(event)
+            return
 
         if self.variant == "cream":
             fill = CREAM
@@ -1032,7 +1288,7 @@ class PixelBubble(QWidget):
 
         path = self._bubble_path()
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(border, pen_width))
+        painter.setPen(QPen(border, theme.pen_width(pen_width)))
         painter.drawPath(path)
 
         super().paintEvent(event)
@@ -1057,7 +1313,7 @@ class PixelScopePrompt(QWidget):
     def __init__(self, text: str, max_width: int = 400, allow_choose_another: bool = True, parent=None):
         super().__init__(parent)
         self.cut = 7
-        self.tail_size = 13
+        self.tail_size = 13 if theme.is_pixel() else 0
         self._answered = False
 
         self.setAttribute(Qt.WA_StyledBackground, False)
@@ -1182,10 +1438,14 @@ class PixelScopePrompt(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
-        path = self._bubble_path()
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
+        if theme.is_pixel():
+            path = self._bubble_path()
+        else:
+            rect = self.rect().adjusted(0, 0, -1, -1)
+            path = theme.rounded_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 14)
         painter.setBrush(QBrush(BUBBLE_BLUE))
-        painter.setPen(QPen(BUBBLE_BLUE_BORDER, 2))
+        painter.setPen(QPen(BUBBLE_BLUE_BORDER, theme.pen_width(2)))
         painter.drawPath(path)
         super().paintEvent(event)
 
@@ -1377,13 +1637,13 @@ class PixelFindBar(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
         rect = self.rect().adjusted(1, 1, -2, -2)
         path = pixel_round_rect_path(
             rect.x(), rect.y(), rect.width(), rect.height(), 8
         )
         painter.setBrush(QBrush(NAVY))
-        painter.setPen(QPen(BORDER_BLUE_LIGHT, 2))
+        painter.setPen(QPen(BORDER_BLUE_LIGHT, theme.pen_width(2)))
         painter.drawPath(path)
         super().paintEvent(event)
 
@@ -1689,9 +1949,11 @@ class _SectionHeader(QWidget):
         self._hover = False
         self._expanded = True
 
-        self.chevron = QLabel("▼")
-        self.title = QLabel(title.upper())
-        self.count = QLabel(str(count))
+        # Parent each label up front: setVisible() on a parentless widget
+        # makes it a top-level window, which flashes as a white square.
+        self.chevron = QLabel("▼", self)
+        self.title = QLabel(title.upper() if theme.is_pixel() else title, self)
+        self.count = QLabel(str(count), self)
         self.count.setAlignment(Qt.AlignCenter)
         self.count.setVisible(count > 0)
 
@@ -1749,9 +2011,20 @@ class _SectionHeader(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
         rect = self.rect().adjusted(1, 1, -2, -2)
         if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        if not theme.is_pixel():
+            # A flat row with a hairline under it; grey under the pointer.
+            if self._hover:
+                path = theme.rounded_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 10)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(theme.role("nav_hover")))
+                painter.drawPath(path)
+            painter.end()
+            super().paintEvent(event)
             return
 
         if self._hover:
@@ -1766,7 +2039,7 @@ class _SectionHeader(QWidget):
             rect.x(), rect.y(), rect.width(), rect.height(), 8
         )
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(border, 2))
+        painter.setPen(QPen(border, theme.pen_width(2)))
         painter.drawPath(path)
         super().paintEvent(event)
 
@@ -1959,8 +2232,8 @@ class PixelDueDateCard(QWidget):
         self._busy_text = None
 
         title = escape_with_markdown_bold(entry.title or "Untitled")
-        self.title_label = _FittedLabel(theme.remap(f'<b style="color:#FFE9A8;">{title}</b>'))
-        self.button = QToolButton()
+        self.title_label = _FittedLabel(theme.remap(f'<b style="color:#FFE9A8;">{title}</b>'), self)
+        self.button = QToolButton(self)
         self.button.setCursor(Qt.PointingHandCursor)
         self.button.clicked.connect(self._on_clicked)
 
@@ -1971,7 +2244,7 @@ class PixelDueDateCard(QWidget):
                     f'<div style="margin:0 0 2px 0;"><span style="color:#8EA7D8;">{label}:</span> '
                     f'{escape_with_markdown_bold(value)}</div>'
                 )
-        self.detail_label = _FittedLabel(theme.remap("".join(rows)))
+        self.detail_label = _FittedLabel(theme.remap("".join(rows)), self)
         self.detail_label.setVisible(bool(rows))
 
         top = QHBoxLayout()
@@ -2246,12 +2519,14 @@ def pixel_group_header(text: str, count: int = 0) -> QWidget:
     layout.setContentsMargins(2, 8, 2, 0)
     layout.setSpacing(10)
 
-    title = QLabel(text.upper())
+    title = QLabel(text.upper() if theme.is_pixel() else text)
     spaced = QFont("Courier New")
     spaced.setBold(True)
     spaced.setLetterSpacing(QFont.AbsoluteSpacing, 1.5)
     title.setFont(spaced)
     title.setStyleSheet(_label_qss("#FFE9A8", 9, bold=True))
+    if not theme.is_pixel():
+        title.setStyleSheet(_label_qss(theme.role("text_secondary"), 9.5, bold=True))
     layout.addWidget(title, 0)
 
     if count:
@@ -2260,7 +2535,7 @@ def pixel_group_header(text: str, count: int = 0) -> QWidget:
         layout.addWidget(count_label, 0)
 
     rule = QWidget()
-    rule.setFixedHeight(2)
+    rule.setFixedHeight(2 if theme.is_pixel() else 1)
     rule.setAttribute(Qt.WA_StyledBackground, True)
     rule.setStyleSheet("background: #1E3F82;")
     layout.addWidget(rule, 1, Qt.AlignVCenter)
@@ -2413,6 +2688,8 @@ class PixelSessionCard(QWidget):
             QToolButton:pressed { background: #E8CF8E; }
             """
         )
+        if not theme.is_pixel():
+            self.open_button.setStyleSheet(corporate_button_qss("primary", "QToolButton", 32))
         self.open_button.clicked.connect(self.open_requested.emit)
 
         self.actions_button = QToolButton()
@@ -2438,6 +2715,10 @@ class PixelSessionCard(QWidget):
             QToolButton::menu-indicator { image: none; width: 0px; }
             """
         )
+        if not theme.is_pixel():
+            self.actions_button.setFixedSize(32, 32)
+            self.actions_button.setStyleSheet(
+                corporate_button_qss("ghost", "QToolButton", 32, padding="0px"))
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(22, 10, 14, 10)
@@ -2511,7 +2792,7 @@ class PixelSessionCard(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
         rect = self.rect().adjusted(1, 1, -2, -2)
         if rect.width() <= 0 or rect.height() <= 0:
             return
@@ -2540,13 +2821,16 @@ class PixelSessionCard(QWidget):
 
         path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 7)
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(border, 2))
+        painter.setPen(QPen(border, theme.pen_width(2)))
         painter.drawPath(path)
 
         # Left stripe: live colour for the ongoing session, a quiet blue otherwise.
         stripe = live_color if live_color is not None else (
             CREAM if self._selected else BORDER_BLUE_LIGHT
         )
+        if not theme.is_pixel() and live_color is None:
+            super().paintEvent(event)  # the stripe is for live sessions only
+            return
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(stripe))
         painter.drawRect(rect.x() + 8, rect.y() + 12, 4, max(0, rect.height() - 24))
@@ -2676,7 +2960,7 @@ class PixelSearchResultCard(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
         rect = self.rect().adjusted(1, 1, -2, -2)
         if rect.width() <= 0 or rect.height() <= 0:
             return
@@ -2688,7 +2972,7 @@ class PixelSearchResultCard(QWidget):
             fill, border, stripe = NAVY_INNER, BORDER_BLUE, BORDER_BLUE_LIGHT
         path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 7)
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(border, 2))
+        painter.setPen(QPen(border, theme.pen_width(2)))
         painter.drawPath(path)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(stripe))
@@ -3040,7 +3324,7 @@ class PixelDropOverlay(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
         rect = self.rect().adjusted(8, 8, -9, -9)
         if rect.width() <= 0 or rect.height() <= 0:
             return
@@ -3123,11 +3407,17 @@ QPushButton#PrimaryButton:disabled {
     border: 2px solid #284B94;
 }
 """
+if not theme.is_pixel():
+    PRIMARY_BUTTON_QSS = corporate_button_qss(
+        "primary", "QPushButton#PrimaryButton", 34, padding="9px 18px", font_px=14)
 
 
 def pixel_caption(text: str, color: str, pt: float, bold: bool = False,
                   spacing: float = 0) -> QLabel:
-    """A small label; ``spacing`` letter-spaces it (for ALL-CAPS captions)."""
+    """A small label; ``spacing`` letter-spaces it (for ALL-CAPS captions).
+    Boring Corporate sets those captions in sentence case instead."""
+    if spacing and not theme.is_pixel():
+        text = _sentence_case(text)
     label = QLabel(text)
     extra = f"letter-spacing: {spacing}px;" if spacing else ""
     label.setStyleSheet(_label_qss(color, pt, bold=bold, extra=extra))
@@ -3194,7 +3484,7 @@ class PixelDropZone(QWidget):
 
     def set_drag(self, state, text: str = ""):
         self._drag = state
-        self._drag_text = text
+        self._drag_text = text if theme.is_pixel() else _sentence_case(text)
         self.update()
 
     def enterEvent(self, event):
@@ -3217,7 +3507,7 @@ class PixelDropZone(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setRenderHint(QPainter.Antialiasing, theme.antialias())
         rect = self.rect().adjusted(1, 1, -2, -2)
         enabled = self.isEnabled()
         if not enabled:
@@ -3232,7 +3522,7 @@ class PixelDropZone(QWidget):
             border, fill = theme.qcolor("#3A67C7"), QColor(0, 0, 0, 0)
         path = pixel_round_rect_path(rect.x(), rect.y(), rect.width(), rect.height(), 6)
         p.fillPath(path, fill)
-        pen = QPen(border, 2)
+        pen = QPen(border, theme.pen_width(2))
         pen.setStyle(Qt.CustomDashLine)
         pen.setDashPattern([3, 2])
         p.setPen(pen)
@@ -3270,7 +3560,7 @@ def pixel_group_label(text: str) -> QLabel:
     The answers rail now carries two chip groups. Without a name on each, the
     five chips read as one five-way control.
     """
-    label = QLabel(text.upper())
+    label = QLabel(text.upper() if theme.is_pixel() else _sentence_case(text))
     font = QFont("Courier New")
     font.setBold(True)
     font.setPointSize(8)
@@ -3350,10 +3640,17 @@ class PixelConversationDelegate(QStyledItemDelegate):
     TITLE_COLOR = theme.qcolor("#FFF0BF")
     DATE_COLOR = theme.qcolor("#A9BCE6")
     SELECTED_DATE_COLOR = theme.role_color("date_selected")
+    if not theme.is_pixel():
+        # Boring Corporate (BU156): a one-line regular-weight title, the date
+        # small and grey beneath it, inside the flat hover row.
+        TITLE_LINES = 1
+        PAD_X = 10
+        PAD_Y = 8
+        DATE_GAP = 3
 
     def _fonts(self, option):
         title_font = QFont(option.font)
-        title_font.setBold(True)
+        title_font.setBold(theme.is_pixel())
         date_font = QFont(option.font)
         date_font.setBold(False)
         date_font.setPointSizeF(max(6.5, title_font.pointSizeF() - 2.5))
@@ -3450,12 +3747,12 @@ def transcript_gap_separator(label: str) -> QWidget:
 
     def _rule():
         rule = QWidget()
-        rule.setFixedHeight(2)
+        rule.setFixedHeight(2 if theme.is_pixel() else 1)
         rule.setAttribute(Qt.WA_StyledBackground, True)
         rule.setStyleSheet("background: #1E3F82;")
         return rule
 
-    text = QLabel(label.upper())
+    text = QLabel(label.upper() if theme.is_pixel() else label)
     spaced = QFont("Courier New")
     spaced.setBold(True)
     spaced.setPointSize(8)
@@ -3531,10 +3828,43 @@ class PixelWindowButton(QToolButton):
         box += [(0, r) for r in range(2, 6)] + [(6, r) for r in range(2, 6)]
         return box
 
+    def _paint_line_glyph(self, p, fg):
+        """Boring Corporate (BU156): thin Windows-style glyphs, 10px."""
+        from PySide6.QtCore import QPointF, QRectF
+
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(fg, 1.1))
+        p.setBrush(Qt.NoBrush)
+        cx, cy = self.width() / 2, self.height() / 2
+        h = 5
+        if self.kind == "min":
+            p.drawLine(QPointF(cx - h, cy + 0.5), QPointF(cx + h, cy + 0.5))
+        elif self.kind == "close":
+            p.drawLine(QPointF(cx - h, cy - h), QPointF(cx + h, cy + h))
+            p.drawLine(QPointF(cx - h, cy + h), QPointF(cx + h, cy - h))
+        elif self.maximized:
+            p.drawRoundedRect(QRectF(cx - h, cy - h + 2, 2 * h - 2, 2 * h - 2), 1.5, 1.5)
+            p.drawPolyline([QPointF(cx - h + 2, cy - h), QPointF(cx + h, cy - h),
+                            QPointF(cx + h, cy + h - 2)])
+        else:
+            p.drawRoundedRect(QRectF(cx - h, cy - h, 2 * h, 2 * h), 1.5, 1.5)
+
     def paintEvent(self, event):
         p = QPainter(self)
         hovered = self.underMouse()
         pressed = self.isDown()
+        if not theme.is_pixel():
+            fg = QColor(theme.role("text"))
+            if hovered or pressed:
+                bg = QColor("#C42B1C") if self.kind == "close" else QColor("#1F1F1F")
+                if pressed:
+                    bg = bg.darker(115)
+                p.fillRect(self.rect(), bg)
+                if self.kind == "close":
+                    fg = QColor("#FFFFFE")
+            self._paint_line_glyph(p, fg)
+            p.end()
+            return
         # No background at rest: just the glyph. Hover fills the whole hit
         # area, red for close.
         fg = theme.qcolor("#FFE9A8")
@@ -3567,6 +3897,11 @@ class PixelTitleBar(QWidget):
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet(_label_qss(theme.role("title_bar_text"), 11, bold=True))
         self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        if not theme.is_pixel():
+            self.title_label.setStyleSheet(theme.NATIVE_QSS + (
+                f"QLabel {{ color: {theme.role('text_secondary')}; background: transparent;"
+                " border: none; font-size: 13px; font-weight: 400; }"))
 
         self.min_button = PixelWindowButton("min")
         self.min_button.setToolTip("Minimize")
@@ -3905,4 +4240,10 @@ def install_pixel_window_chrome(app) -> PixelWindowChrome:
     """Install the frameless pixel chrome for every window the app opens."""
     chrome = PixelWindowChrome(app)
     app.installEventFilter(chrome)
+    if not theme.is_pixel():
+        # Tooltips, menus and parentless pop-ups never see a window's
+        # stylesheet; they take the app's (BU153).
+        app.setFont(theme.font(10))
+        app.setPalette(theme.app_palette())
+        app.setStyleSheet(theme.app_wide_qss())
     return chrome

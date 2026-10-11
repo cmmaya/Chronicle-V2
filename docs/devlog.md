@@ -4010,3 +4010,138 @@ Validation:
 Next:
 
 - none
+
+
+## BU153 - Theme engine: style tokens beyond colour
+
+Changes:
+
+- `BORING_CORPORATE` theme; `STYLE` tokens; `restyle()` with the `NATIVE_QSS` marker; `QFont` subclass installed by `activate()` for non-pixel themes; rounded `pixel_round_rect_path`, `theme.antialias()` / `theme.pen_width()` at every paint site; app font, palette and QSS from `install_pixel_window_chrome`. Segoe UI instead of a bundled Inter (the reference's own font, true Semibold).
+
+Validation:
+
+- `tests/test_bu153.py` (10 passed). Classic and Synthwave screenshots pixel-identical to HEAD.
+
+Next:
+
+- BU154
+
+
+## BU154 - Monochrome palette
+
+Changes:
+
+- `REMAP` / `ROLES` / `_EXTRA_QSS` for Boring Corporate.
+
+Validation:
+
+- `tests/test_bu154.py` (7 passed).
+
+Next:
+
+- BU155
+
+
+## BU155 - Line icon set
+
+Changes:
+
+- 34 Lucide-derived line icons under the pixel filenames, licence, `theme.icon_override`, `asset_path` lookup, 20px icon cap. No alias map needed.
+
+Validation:
+
+- `tests/test_bu155.py` (5 passed).
+
+Next:
+
+- BU156
+
+
+## BU156 - Core widgets
+
+Changes:
+
+- Flush panels, flat nav rows, pill/ghost buttons (`_PillStyle`, `corporate_button_qss`), tail-less rounded and plain bubbles, sentence-case titles and labels, line window buttons.
+
+Validation:
+
+- `tests/test_bu156.py` (4 passed; corporate and classic probes in subprocesses).
+
+Next:
+
+- BU157
+
+
+## BU157 - Main window layout
+
+Changes:
+
+- Column dividers, sidebar, search and input pills, send button, empty-chat heading, plain answers. "+" and mic pill buttons left out (no action behind them).
+
+Validation:
+
+- `tests/test_bu157.py` (3 passed). Screenshots: empty chat, conversation, collapsed sidebar.
+
+Next:
+
+- BU158
+
+
+## BU158 - Secondary windows
+
+Changes:
+
+- All Sessions buttons, detached scrollbar, sentence-case drop texts.
+
+Validation:
+
+- `tests/test_bu158.py` (3 passed).
+
+Next:
+
+- BU159
+
+
+## BU159 - Dialogs
+
+Changes:
+
+- Settings (toggle, slider, nav, Done, three theme cards, corporate preview, scrim), Calendar, Documents, Start Session popover, Setup wizard, message boxes, `app_palette`.
+
+Validation:
+
+- `tests/test_bu159.py` (2 passed).
+
+Next:
+
+- BU160
+
+
+## BU160 - Visual QA
+
+Changes:
+
+- Offscreen screenshots of every window; pixel diff of Classic/Synthwave against HEAD (0 pixels); contrast checks.
+
+Validation:
+
+- `tests/test_bu160.py` (11 passed). BU153-BU160: 45 passed. Existing UI tests (BU111-BU152 files that import the app modules): 417 passed, 6 failed - the same 6 `test_bu116.py` failures as on HEAD (stale thread double, "two sentences" rule). Real-app checks (hover states, live recording, drag-and-drop, maximised) not run.
+
+Next:
+
+- none
+
+
+## BU157 follow-up - First chat message missing
+
+Changes:
+
+- `MainWindow.eventFilter` defers `_sync_empty_chat_state` (`QTimer.singleShot(0)`): run on ChildAdded it showed the answers area mid-reparent and Qt left the first question's row hidden.
+
+Validation:
+
+- Reproduced offscreen (New Chat, then a question: only "Thinking..." showed); after the fix both rows are visible. `tests/test_bu157.py` passes.
+
+Next:
+
+- none

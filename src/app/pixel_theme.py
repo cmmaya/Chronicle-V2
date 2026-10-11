@@ -4,12 +4,18 @@ from . import theme
 
 def asset_path(filename: str) -> str:
     """Path to a pixel-art SVG shipped in ``assets/pixel/<filename>``,
-    recoloured for the active theme (BU129)."""
+    recoloured for the active theme (BU129).
+
+    A theme with its own icon set (BU155) has the same filenames under
+    ``assets/themes/<theme>/icons/``; those win, unrecoloured."""
+    own = theme.icon_override(filename)
+    if own:
+        return own
     return theme.themed_svg(paths.asset_path("pixel", filename))
 
 
 def app_qss() -> str:
-    return """
+    return ("""
     QMainWindow {
         background: #061946;
     }
@@ -282,6 +288,6 @@ def app_qss() -> str:
         text-align: center;
         border-radius: 7px;
     }
-    """.replace(
+    """ + theme.extra_qss()).replace(
         "__CHEVRON__", asset_path("icon_chevron_down_dark.svg").replace("\\", "/")
-    ) + theme.extra_qss()
+    )

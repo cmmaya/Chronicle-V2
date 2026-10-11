@@ -154,6 +154,8 @@ class _Card(QWidget):
     def _outline(self, dx: int = 0, dy: int = 0) -> QPainterPath:
         w = self.width() - SHADOW - 3
         h = self.height() - SHADOW - TAIL_H - 3
+        if not theme.is_pixel():
+            return theme.rounded_rect_path(2 + dx, 2 + dy, w, h, 16)
         body = pixel_round_rect_path(2 + dx, 2 + dy, w, h, 8)
         tx, by = self.tail_x + dx, 2 + dy + h
         # Drawn without antialiasing, so its edges step like the pixel corners.
@@ -167,7 +169,14 @@ class _Card(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setRenderHint(QPainter.Antialiasing, theme.antialias())
+        if not theme.is_pixel():
+            # A flat popover: menu grey with a hairline (BU159).
+            path = self._outline()
+            p.fillPath(path, QColor("#1F1F1F"))
+            p.setPen(QPen(QColor("#333333"), 1))
+            p.drawPath(path)
+            return
         p.fillPath(self._outline(SHADOW, SHADOW), QColor(1, 5, 18, 150))
         path = self._outline()
         p.fillPath(path, NAVY_INNER)
@@ -180,7 +189,7 @@ class _Card(QWidget):
                 p.setPen(QPen(glow, width))
                 p.drawPath(path)
             p.restore()
-        p.setPen(QPen(BORDER_BLUE_ACTIVE, 2))
+        p.setPen(QPen(BORDER_BLUE_ACTIVE, theme.pen_width(2)))
         p.drawPath(path)
 
 
@@ -372,7 +381,8 @@ class StartSessionPopover(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         t = max(0.0, min(1.0, self._progress))
-        p.fillRect(self.rect(), QColor(3, 10, 32, int(60 * t)))
+        tint = (3, 10, 32) if theme.is_pixel() else (0, 0, 0)
+        p.fillRect(self.rect(), QColor(*tint, int(60 * t)))
         if self._snapshot is None:
             return
         # Scale the card out of the tail's tip, so it pops from the button.
@@ -491,12 +501,15 @@ class StartSessionPopover(QWidget):
         pending = sum(1 for i in self._items.values() if i.state == "pending")
         ready = sum(1 for i in self._items.values() if i.state == "ready")
         if pending:
-            self.start_button.setText(f"READING {pending} FILE{'S' if pending > 1 else ''}…")
+            if theme.is_pixel():
+                self.start_button.setText(f"READING {pending} FILE{'S' if pending > 1 else ''}…")
+            else:
+                self.start_button.setText(f"Reading {pending} file{'s' if pending > 1 else ''}…")
             self.start_button.setEnabled(False)
             if not self._dot_timer.isActive():
                 self._dot_timer.start()
         else:
-            self.start_button.setText("▶  START SESSION")
+            self.start_button.setText("▶  START SESSION" if theme.is_pixel() else "Start session")
             self.start_button.setEnabled(True)
             self._dot_timer.stop()
         limit = SESSION_DOCUMENTS["max_per_session"]
