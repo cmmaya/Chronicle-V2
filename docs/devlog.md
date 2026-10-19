@@ -4145,3 +4145,190 @@ Validation:
 Next:
 
 - none
+
+
+## BU161 - Any Session Archive Search For Rare Words And Centred Excerpts
+
+Changes:
+
+- `rag_context_builder.py`: `rank_query_terms`, `find_archive_chunks`, `archive_session`, `_excerpt`; `build_routed_session_context` takes `archive` and `terms`.
+- `service._get_all_sessions_context` adds archive matches and their sessions as candidates; builds the routed context even when routing is empty.
+- `database.py`: `count_rag_fts_matches`; `search_rag_fts(terms=...)`.
+
+Validation:
+
+- `tests/test_bu161.py` (11 passed); `test_bu152.py`, `test_rag_router.py` pass (one BU152 test double updated for the new keyword arguments). `test_assistant_service.py`: the same 5 failures as before the change.
+- Copy of the real database (1079 chunks, 15 sessions): "Where was the location they mentioned I should go near Toronto" routed S44 and S76 only; the archive search adds S51, the only chunk with "Toronto", and the sentence is inside the excerpt. Generic questions ("what should we do next", "monte carlo") add nothing. Term counting plus search: about 3 ms. Searching all rare terms in one query ranked two "locations" chunks above the Toronto one, hence one search per term and the 0.5% threshold.
+- Not run: a real answer through OpenRouter; routing with embeddings (onnxruntime missing in .venv, so routing was lexical-only).
+
+Next:
+
+- none
+
+
+## BU162 - Diarization Runtime And Models
+
+Changes:
+
+- `requirements.txt`: `sherpa-onnx==1.13.8` (the version of the 2026-10-11 test; pulls `sherpa-onnx-core`).
+- `model_manager.py`: optional `DIARIZATION_MODELS` (pyannote segmentation-3.0 `model.onnx`, TitaNet-small), pinned Hugging Face mirrors of the k2-fsa files (SHA-256 identical to the GitHub downloads); `download_diarization()`, `diarization_installed()`; `local_path()` covers them. `download()` lifts `HF_HUB_OFFLINE` while it runs.
+- `chronicle.spec`: `sherpa_onnx` hidden import + dynamic libs; `copy_metadata("onnx-asr")`.
+
+Validation:
+
+- Gate: Parakeet + sherpa diarizer in one process, both import orders, transcribe / diarize / transcribe again on a real chunk: identical text. Loaded modules: only `sherpa_onnx/lib/onnxruntime.dll`; the pip onnxruntime 1.20.1 runs from its `.pyd` and never loads `capi/onnxruntime.dll`, so no conflict.
+- Real on-demand download into the dev cache with offline mode on: both models installed, progress to 100%, offline restored afterwards.
+- `build.ps1 -SkipInstaller` from a clean venv: 319 MB (was 283), both `onnxruntime.dll` copies in their own folders. Found while checking: the bundle had no `onnx_asr` dist-info and `onnx_asr/__init__.py` calls `importlib.metadata.version("onnx-asr")`, so `import onnx_asr` failed frozen - fixed in the spec, rebuilt, dist-info present.
+- A small PyInstaller exe built from the same build venv (onnx_asr + sherpa_onnx, same lib collection) transcribed a real chunk, diarized it and transcribed again: works frozen.
+- Not run: the packaged Chronicle.exe itself transcribing - a source instance was running and the single-instance check handed off to it.
+- `tests/test_bu162.py` (9 passed); `test_bu123.py`, `test_bu124.py` pass.
+
+Next:
+
+- BU163
+
+
+## BU163 - Diarization Engine
+
+Changes:
+
+- `src/diarization/engine.py` (+ `__init__.py`): `diarize_session`, `Turn`, `ChunkSpan`, `OffsetMap`, `cluster` (numpy average linkage, nearest-neighbour chain), `assign_speakers`, `merge_turns`, `DiarizationCancelled`.
+- Audio is processed in ~10-minute windows per source, so memory stays near 0.7 GB for a 142-minute session instead of holding the whole source.
+
+Validation:
+
+- `cluster()` vs scipy `fcluster(linkage(..., "average", "cosine"), t, "distance")` on 200 random sets: same partition in all 200; 3000 x 192 embeddings in 0.3 s.
+- Real sessions (4 threads, while other work ran):
+  - DR session 2 (S84, 61.9 min mic): 2 speakers, 56% / 44% (test of 2026-10-11: 55% / 42%), 236 turns, 487 s (0.13x real time).
+  - Research Methods - Article Critique (S77, 142.4 min system + 8 mic chunks): 5 system speakers, 51 / 14 / 6 / 14 / 14%, 372 turns, 1025 s (0.12x). sherpa found no speech in the mic chunks ("No speakers found"), so no mic turns.
+- `tests/test_bu163.py` (10 passed).
+
+Next:
+
+- BU164
+
+
+## BU164 - Speaker Transcript Storage
+
+Changes:
+
+- `database.py`: schema v6 (`diarized_transcripts`, `sessions.diarization_status` / `diarization_enabled`); `get_transcripts` switch, `get_original_transcripts`, `replace_diarized_transcripts`, `set_diarization`; `list_sessions_with_flags` gains `speaker_count`; deletes, purge, orphan cleanup and reset include the new table; `delete_transcripts` resets the status.
+- Outside Allowed Files: `tests/test_bu146.py` asserted `SCHEMA_VERSION == 5`; now only that the migration reaches `SCHEMA_VERSION`.
+
+Validation:
+
+- Copy of the real chronicle.db (16 sessions, 9355 transcript rows): v5 -> v6, backup `.bak-v5-*` written first, every table's row count and the transcripts / sessions content identical, all sessions 'none' / disabled / 0 speakers.
+- `tests/test_bu164.py` (8 passed); `test_bu106.py`, `test_bu134.py`, `test_bu146.py`, `test_database_perf.py`, `test_bu161.py` pass.
+
+Next:
+
+- BU165
+
+
+## BU165 - Diarization Job
+
+Changes:
+
+- `src/diarization/job.py` (new): `run_diarization` (download -> speakers -> per-turn transcription in <= 30 s pieces cut at a quiet frame -> store, enable, re-index) and `DiarizationRunner` (own daemon thread, queue, cancel restoring the prior status, 'failed' + in-memory error on failure, deduplicated progress).
+- `session_manager.py`: diarization callbacks, `start_diarization` / `cancel_diarization` / `enable_diarization` / `disable_diarization` / `is_diarizing` / `diarization_error` / `diarization_refusal`; startup repair 'running' -> 'failed'; `close()` cancels and waits; resume sets a diarized session back to 'none'.
+
+Validation:
+
+- `tests/test_bu165.py` (8 passed): success (rows, enabled, re-indexed, progress monotonic to 100, "Transcribing speakers 2/2"), failure and cancel keep the original transcript and the right status, disable + enable runs nothing again, refusals (live, inserted, untranscribed), a job submitted to the shared thread runs during a diarization, startup repair, resume.
+
+Next:
+
+- BU166
+
+
+## BU166 - Enable / Disable Diarization In The Session Menu
+
+Changes:
+
+- `window.py`: `_add_diarization_action`, `_enable_diarization`, `_disable_diarization`, `_cancel_diarization`, `_after_diarization_switch`, `_diarization_popup` / `_ask_diarization` with `_DIARIZATION_POPUP_QSS`.
+
+Validation:
+
+- `tests/test_bu166.py` (12 passed): label per state, position after Transcribe / Summarize, retry tooltip, disabled live / untranscribed, absent for text sessions, the Disable pop-up's primary button switches to the original transcript (Cancel does not), enabling a 'ready' session shows no pop-up and starts no job, first run asks (mentions the 46 MB download) then queues.
+- Offscreen renders of the menu and both pop-ups in Classic, Synthwave and Boring Corporate (with `QT_QPA_FONTDIR=C:/Windows/Fonts`).
+
+Next:
+
+- BU167
+
+
+## BU167 - Diarization Progress Bar On The Session Card
+
+Changes:
+
+- `pixel_widgets.py`: `PixelCardProgress` + `_ProgressTrack`, `PixelSpeakersChip`, card `progress` / `speakers_chip` / `set_speakers`; the card meta line elides.
+- `theme.py`: `PROGRESS` tokens and `progress_color()`.
+- `window.py`: progress kept in `_diarization_progress`, `_apply_diarization_card_state`, `_apply_diarization_progress`, `_apply_diarization_finished`, `_on_diarization_strip_done`, dialog `_card_for`.
+- Icons: `assets/pixel/icon_speakers.svg` and `assets/themes/boring_corporate/icons/icon_speakers.svg` (Lucide "users"). The BU named `assets/icon_speakers.svg`; pixel icons live under `assets/pixel/`, so it went there.
+
+Validation:
+
+- `tests/test_bu167.py` (8 passed): hidden idle / shown running / holds then hides after 100, easing, survives reload and reopening, queued state, finished card fills then reloads, Speakers chip count / visibility / error tooltip, corporate (subprocess) sentence case + 4 px track vs Classic 6 px.
+- Offscreen renders of running / finished / failed cards in all three appearances at 880 px and 640 px. Minimum card width with screenshots + documents + speakers chips: 627 px Classic, 604 px Corporate (783 / 699 before the meta line elided), inside the ~644 px the list has at the window's 700 px minimum.
+
+Next:
+
+- BU168
+
+
+## BU168 - Speaker-Labelled Transcript View
+
+Changes:
+
+- `window.py`: `speaker_layout()`, `TranscriptRecord.speaker`, `bubble_look()`, speaker rows in `add_transcription_to_view` / `_add_transcription_to_detached` / `_load_transcripts_for_session`, filter options shared by both menus (`_transcript_filter_options`, `_add_filter_actions`, `_sync_transcript_filter_options`), speaker filters not saved.
+- `pixel_widgets.py`: `PixelBubble(tag=...)`, passed through `aligned_bubble` / `aligned_bubble_with_time`.
+- `theme.py`: `SPEAKER_COLORS`, `speaker_color()`.
+
+Validation:
+
+- `tests/test_bu168.py` (10 passed): "Speaker N" vs Mic / System, most-talk speaker right in blue, tag colours, merging only for consecutive turns, speaker filter, filter menu lists speakers and resets on switch, corporate tokens (subprocess), contrast >= 4.0:1 of every tag colour on its bubble fill in all three appearances (measured 4.4-15.2).
+- Offscreen renders of a 3-speaker transcript in all three appearances.
+
+Next:
+
+- BU169
+
+
+## BU169 - Speakers In Assistant Context
+
+Changes:
+
+- `rag/indexer.py`: `_chunk_transcripts` splits on speaker and labels windows; `SPEAKER_NOTE`, `is_diarized()`.
+- `assistant/context.py`: full-transcript rows labelled; `speakers` summary entry for a diarized session.
+- `assistant/rag_context_builder.py`: `[speakers]:` note under a diarized session's header (routed and archive sections).
+
+Validation:
+
+- `tests/test_bu169.py` (7 passed): labelled chunks, FTS finds "Speaker 2" after indexing a diarized session, evidence lines and note, Specific Session and Any Session context identical without diarization.
+- `test_rag_indexer.py`, `test_rag_context_builder.py`, `test_context_retriever.py`, `test_bu141.py`, `test_bu144.py`, `test_bu161.py`, `test_bu163.py`, `test_bu164.py` pass (113).
+
+Next:
+
+- BU170
+
+
+## BU170 - Diarization Visual And Real-Session QA (in progress)
+
+Changes:
+
+- `tests/test_bu170.py`: smoke test, menu "Enable diarization" -> pop-up -> job -> stored rows -> speaker bubbles (engine and ASR stubbed).
+- Crash fix (reported: the app closed right after "Enable diarization"): a native access violation in sherpa-onnx's `OfflineSpeakerDiarization.process(..., callback=)` progress callback, which sherpa calls from native code; the standalone runs passed because no other Python thread was busy, in the app the Qt thread is. Reproduced by driving the real `MainWindow` on a copy of the data (faulthandler trace in `engine.on_segment_progress`). The engine no longer passes a callback: progress and cancel are reported between windows, and `WINDOW_SECONDS` went from 600 to 300 so neither waits more than ~20 s. `tests/test_bu163.py`'s fake diarizer no longer accepts a callback, so passing one fails the tests.
+- After the fix, the real `MainWindow` (offscreen, copy of the data) ran Enable diarization on DR session 2 to the end: no crash, progress 5 -> 100 on the card, finished ok, the open transcript reloaded with 282 speaker rows; Speaker 1 35.4 min / Speaker 2 25.2 min (58 / 42%, 238 turns with 300 s windows).
+- Fixes found during QA: the card meta line elides, so a card with all three chips fits the window's minimum width (pixel_widgets, BU167); `bubble_look()` is a module function, since `tests/detached_harness.py` and the BU139 host fixture build the window without `__init__` / with mocked methods.
+
+Validation so far:
+
+- DR session 2 (S84, 61.9 min mic), copy of chronicle.db, real models, full job: 2 speakers, 56% / 44% talk time (BU163: 56 / 44), 236 turns -> 273 rows (135 original rows), 919 s in all (speaker finding 507 s, transcription 402 s, saving 10 s; 0.25x real time). Disable then enable afterwards: instant (0 ms), no second run.
+- Offscreen renders (menu, both pop-ups, running / finished / failed card at 880 and 640 px, 3-speaker transcript) in Classic, Synthwave and Boring Corporate.
+- `test_bu111/112/113/119/137/138/139/148/166/168/170` pass (189).
+
+Still to do:
+
+- Research Methods - Article Critique full run (expect > 3 speakers; ~0.25x of 142 min, about 35 min).
+- In the running app: cancel half-way, close and reopen All Sessions mid-run, quit mid-run (startup repair), a transcription and a summary on other sessions mid-run, hover / pressed states. Covered by unit tests, not yet by hand.
+- Packaged build: first-run model download, then a full run.

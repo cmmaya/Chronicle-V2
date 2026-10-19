@@ -20,6 +20,7 @@ from ..transcription.parakeet import get_shared_engine
 from ..transcription.worker import TranscriptionWorker
 from ..summarization import SummaryGenerator
 from ..rag.indexer import index_session_content
+from ..diarization.job import DiarizationRunner
 
 from .session import Session
 from .timeline import Timeline
@@ -127,7 +128,9 @@ class SessionManager:
                  db_path: Optional[str] = None,
                  status_callback: Optional[callable] = None,
                  live_transcription_ui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-                 session_finalized_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None):
+                 session_finalized_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+                 diarization_progress_callback: Optional[Callable[[int, int, str], None]] = None,
+                 diarization_finished_callback: Optional[Callable[[int, bool, Optional[str]], None]] = None):
         """Initialize SessionManager.
 
         Args:
@@ -137,6 +140,10 @@ class SessionManager:
             live_transcription_ui_callback: Optional callback for live transcription results
             session_finalized_callback: Optional ``(session_id, outcome)`` callback
                 fired when a stopped session's post-processing has finished
+            diarization_progress_callback: Optional ``(session_id, percent, text)``
+                callback while a session is being diarized (BU165)
+            diarization_finished_callback: Optional ``(session_id, ok, error)``
+                callback when a diarization ends; ``error`` is None on cancel
         """
         self.base_path = Path(base_path) if base_path is not None else paths.sessions_dir()
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -177,6 +184,12 @@ class SessionManager:
             on_idle=self._unload_idle_models,
         )
         self._worker.start()
+        # Diarization (BU165) is long: its own thread, so it never holds up _jobs.
+        self._diarization = DiarizationRunner(
+            self.db, self._get_session_path,
+            on_progress=diarization_progress_callback,
+            on_finished=diarization_finished_callback,
+        )
 
     def _recover_after_restart(self) -> None:
         """Close out sessions the last run didn't stop and drop leftovers of
@@ -185,6 +198,10 @@ class SessionManager:
             repaired = self.db.repair_interrupted_sessions()
             if repaired:
                 logger.info(f'Closed sessions left open by the last run: {repaired}')
+            for row in self.db.list_sessions_with_flags():
+                if row.get('diarization_status') == 'running':
+                    self.db.set_diarization(row['id'], status='failed')
+                    logger.info(f"Diarization of session {row['id']} was interrupted; marked failed")
             removed = self.db.purge_orphans()
             if any(removed.values()):
                 logger.info(f'Removed rows left behind by deleted sessions: {removed}')
@@ -655,6 +672,10 @@ class SessionManager:
         session = self.load_session(session_id)
         session.status = Session.STATUS_ACTIVE
         self.db.update_session(session_id, status=Session.STATUS_ACTIVE)
+        if db_session.get('diarization_status', 'none') != 'none':
+            # New audio: the speaker copy no longer covers the whole session.
+            self._diarization.cancel(session_id)
+            self.db.set_diarization(session_id, status='none')
         self.current_session = session
 
         self._worker.preload()
@@ -848,6 +869,72 @@ class SessionManager:
         except Exception as e:  # noqa: BLE001
             self._update_status(f'RAG indexing failed for session {session_id}: {str(e)}', is_error=True)
         return summary
+
+    # -- diarization (BU165) ---------------------------------------------------
+
+    def diarization_refusal(self, session_id: int) -> Optional[str]:
+        """Why the session can't be diarized now, or None when it can."""
+        db_session = self.db.get_session(session_id)
+        if not db_session:
+            return 'Session not found'
+        live = self.current_session
+        if db_session['status'] in (Session.STATUS_ACTIVE, Session.STATUS_PAUSED) or (
+                live is not None and live.id == session_id
+                and live.status in (Session.STATUS_ACTIVE, Session.STATUS_PAUSED)):
+            return 'Stop recording first'
+        if self.db.is_inserted_transcript(session_id):
+            return 'An inserted transcript has no audio'
+        audio = self._get_session_path(session_id) / 'audio'
+        if not any(audio.glob('*/*.wav')):
+            return 'This session has no audio'
+        if db_session.get('transcription_status') != 'transcribed' or not self.db.has_transcripts(session_id):
+            return 'Transcribe the session first'
+        return None
+
+    def start_diarization(self, session_id: int) -> bool:
+        """Queue a full diarization run (also when one already succeeded).
+
+        Returns False when the session is already queued or running.
+
+        Raises:
+            ValueError: the session can't be diarized (message for the user).
+        """
+        refusal = self.diarization_refusal(session_id)
+        if refusal:
+            raise ValueError(refusal)
+        return self._diarization.submit(session_id)
+
+    def cancel_diarization(self, session_id: int) -> bool:
+        """Stop a queued or running diarization; the session is left as it was."""
+        return self._diarization.cancel(session_id)
+
+    def is_diarizing(self, session_id: int) -> bool:
+        return self._diarization.is_active(session_id)
+
+    def diarization_error(self, session_id: int) -> Optional[str]:
+        """The last failed run's error, while this app runs."""
+        return self._diarization.last_error(session_id)
+
+    def enable_diarization(self, session_id: int) -> bool:
+        """Show the speaker transcript. True when it switched at once (status
+        'ready'); False when a run had to be queued (see start_diarization)."""
+        db_session = self.db.get_session(session_id)
+        if db_session and db_session.get('diarization_status') == 'ready':
+            self.db.set_diarization(session_id, enabled=True)
+            self._reindex_in_background(session_id)
+            return True
+        self.start_diarization(session_id)
+        return False
+
+    def disable_diarization(self, session_id: int) -> None:
+        """Back to the original transcript. The speaker rows are kept, so
+        enabling again is instant."""
+        self.db.set_diarization(session_id, enabled=False)
+        self._reindex_in_background(session_id)
+
+    def _reindex_in_background(self, session_id: int) -> None:
+        self._jobs.submit(f're-index session {session_id}',
+                          lambda: index_session_content(self.db, session_id))
 
     def _auto_generate_summary(self, session: Session) -> None:
         """Automatically generate a summary for a session if conditions are met.
@@ -1079,6 +1166,10 @@ class SessionManager:
 
         # Let the last queued chunks finish; leftovers are handled next start.
         self._worker.stop(drain_timeout=CLOSE_DRAIN_SECONDS)
+        # A diarization stops between segments; one that doesn't in time is
+        # left 'running' and marked failed on the next start.
+        self._diarization.cancel_all()
+        diarization_done = self._diarization.wait(timeout=CLOSE_DRAIN_SECONDS)
 
         # A background job (Stop's background finalize, or a Transcribe /
         # Summarize / Upload Audio submitted from the UI) may still be
@@ -1089,7 +1180,7 @@ class SessionManager:
         # open, which is safe (its daemon thread and connection are reclaimed
         # by the OS at process exit) and rare (the drain above already lets
         # queued transcription finish first).
-        if not self._jobs.wait(timeout=CLOSE_DRAIN_SECONDS):
+        if not self._jobs.wait(timeout=CLOSE_DRAIN_SECONDS) or not diarization_done:
             logger.warning(
                 'A background job is still running at close() - leaving the database connected'
             )

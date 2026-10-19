@@ -271,6 +271,34 @@ def activate_saved_theme() -> str:
     return theme.activate(theme.read_preference(prefs))
 
 
+APP_USER_MODEL_ID = f"{paths.APP_NAME}.Desktop"
+
+
+def set_app_user_model_id() -> None:
+    """Give the process its own taskbar identity.
+
+    Without it a source run is grouped under python.exe and the taskbar shows
+    Python's icon instead of the window icon. Must run before any window exists.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception as exc:  # noqa: BLE001 - cosmetic only
+        logger.warning("Could not set the AppUserModelID: %s", exc)
+
+
+def apply_app_icon(app) -> None:
+    """Title bar, taskbar and Alt+Tab icon for every window."""
+    from PySide6.QtGui import QIcon
+
+    icon = QIcon(str(paths.asset_path("chronicle.ico")))
+    icon.addFile(str(paths.asset_path("chronicle.png")))
+    app.setWindowIcon(icon)
+
+
 def relaunch() -> bool:
     """Start a new Chronicle process with the same arguments (BU129)."""
     from PySide6.QtCore import QProcess
@@ -294,7 +322,9 @@ def main(argv=None) -> int:
     from src.app.pixel_widgets import install_pixel_window_chrome
     from src.app import setup_wizard
 
+    set_app_user_model_id()
     app = QApplication.instance() or QApplication([])
+    apply_app_icon(app)
     # One instance per user (BU125): a second launch fronts the first and exits.
     server_name = instance_server_name()
     if notify_running_instance(server_name):

@@ -63,13 +63,31 @@ def _chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE,
     return chunks
 
 
+# Diarized sessions (BU169): speaker turns are labelled in chunk text, so a
+# search for "Speaker 2" finds that speaker, and the model is told the labels
+# are automatic.
+SPEAKER_NOTE = ("Speakers in this transcript are numbered automatically (Speaker 1, "
+                "Speaker 2, ...); the split between them may be imperfect.")
+
+
+def is_diarized(session: Optional[Dict[str, Any]]) -> bool:
+    """Whether readers get the session's speaker-labelled transcript."""
+    session = session or {}
+    return bool(session.get('diarization_enabled')) and session.get('diarization_status') == 'ready'
+
+
+def _labelled(text: str, speaker: Optional[int]) -> str:
+    return f'Speaker {speaker}: {text}' if speaker else text
+
+
 def _chunk_transcripts(transcripts: List[Dict[str, Any]],
                        window_seconds: int = TRANSCRIPT_WINDOW_SECONDS,
                        max_chars: int = TRANSCRIPT_WINDOW_CHARS) -> List[Dict[str, Any]]:
     """Group transcript rows into time-windowed chunks.
 
-    A window is closed when any of these happens: the audio source changes,
-    the elapsed time since the window started reaches ``window_seconds``, or
+    A window is closed when any of these happens: the audio source (or, in a
+    diarized transcript, the speaker - each window then opens with
+    "Speaker N:") changes, the elapsed time since the window started reaches ``window_seconds``, or
     adding the next row would push the window past ``max_chars``. A single row
     longer than ``max_chars`` is split on the size bound, and every piece keeps
     the row's timestamp and source.
@@ -89,13 +107,14 @@ def _chunk_transcripts(transcripts: List[Dict[str, Any]],
     start_ts = 0
     end_ts = 0
     source: Optional[str] = None
+    speaker: Optional[int] = None
 
     def flush() -> None:
         nonlocal texts
         if not texts:
             return
         chunks.append({
-            'content': ' '.join(texts).strip(),
+            'content': _labelled(' '.join(texts).strip(), speaker),
             'chunk_index': len(chunks),
             'start_timestamp': start_ts,
             'end_timestamp': end_ts,
@@ -110,8 +129,9 @@ def _chunk_transcripts(transcripts: List[Dict[str, Any]],
 
         row_ts = int(row.get('timestamp') or 0)
         row_source = row.get('source')
+        row_speaker = row.get('speaker')
 
-        if texts and (row_source != source
+        if texts and (row_source != source or row_speaker != speaker
                       or row_ts - start_ts >= window_seconds
                       or sum(len(t) for t in texts) + 1 + len(text) > max_chars):
             flush()
@@ -119,13 +139,14 @@ def _chunk_transcripts(transcripts: List[Dict[str, Any]],
         if not texts:
             start_ts = row_ts
             source = row_source
+            speaker = row_speaker
 
         # A row that cannot fit in any window is split on the size bound.
         if len(text) > max_chars:
             flush()
             for piece in _chunk_text(text, chunk_size=max_chars, overlap=0):
                 chunks.append({
-                    'content': piece['content'],
+                    'content': _labelled(piece['content'], row_speaker),
                     'chunk_index': len(chunks),
                     'start_timestamp': row_ts,
                     'end_timestamp': row_ts,

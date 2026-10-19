@@ -14,7 +14,7 @@ from .context_models import (
 )
 from .rag_models import RetrievedChunk, SourceType
 from ..config import SESSION
-from ..rag.indexer import _chunk_transcripts
+from ..rag.indexer import SPEAKER_NOTE, _chunk_transcripts, is_diarized
 from .live_qa import collapse_overlap, strip_transcript_evidence
 from ..screenshots.search import search_session_screenshots
 from ..storage.database import fts_terms
@@ -119,6 +119,11 @@ class AssistantContextRetriever:
 
         # Get summaries
         summaries = self._get_summaries(session_id, session_name)
+        if is_diarized(session):
+            # BU169: the speaker labels are automatic; the model is told so.
+            summaries.insert(0, SummaryExcerpt(
+                session_id=session_id, session_name=session_name,
+                summary_type="speakers", content=SPEAKER_NOTE))
 
         # Get conversation history
         conversation_history = self._get_conversation_history(conversation_id)
@@ -190,6 +195,8 @@ class AssistantContextRetriever:
             previous[source] = text
             if not collapsed:
                 continue
+            if row.get("speaker"):
+                collapsed = f"Speaker {row['speaker']}: {collapsed}"
             total += len(collapsed)
             if total > limit:
                 return None

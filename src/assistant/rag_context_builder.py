@@ -3,16 +3,35 @@
 Provides compact context builders for global search results grouped by session.
 """
 
+import re
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from ..rag.indexer import _chunk_transcripts
+from ..rag.indexer import SPEAKER_NOTE, _chunk_transcripts, is_diarized
+from ..storage.database import fts_terms
 
 # Per-excerpt and total budgets shared by every Any Session context builder.
 MAX_EXCERPT_CHARS = 500
 MAX_CONTEXT_CHARS = 12000
 MAX_CHUNKS_PER_SESSION = 4
+
+# Archive-wide search (BU161): routing reads only session profiles (summaries),
+# so a passing remark the summary left out is never routed. Chunks anywhere in
+# the archive that hold one of the question's rare words are added as well.
+# A word is rare when at most this share of all chunks match it (with a floor
+# for a small archive); a question with no rare word adds nothing, so common
+# words never pull in unrelated meetings.
+RARE_TERM_MAX_SHARE = 0.005
+RARE_TERM_MIN_CHUNKS = 5
+# Shorter terms are prefix searches ("go*") that match far more than they say.
+RARE_TERM_MIN_LENGTH = 3
+MAX_ARCHIVE_CHUNKS = 4
+# Budget for archive matches in sessions routing did not pick, on top of
+# MAX_CONTEXT_CHARS.
+MAX_ARCHIVE_CHARS = 3000
+# Assistant answers are indexed too; an old answer is not evidence.
+ARCHIVE_SOURCE_TYPES = ["transcript", "summary", "screenshot"]
 
 
 def _format_session_date(value: Any) -> str:
@@ -88,6 +107,8 @@ def build_any_session_context(
         if session_id is not None:
             sessions[session_id].append(result)
 
+    terms = fts_terms(query)
+
     # Build context string with character limit tracking
     parts = []
     current_length = 0
@@ -116,7 +137,7 @@ def build_any_session_context(
         # Add each result from this session
         for result in session_results:
             # Format the result line
-            result_text = _format_result(result)
+            result_text = _format_result(result, terms)
             result_length = len(result_text)
 
             # Check if adding this result would exceed limit
@@ -136,11 +157,58 @@ def build_any_session_context(
     return "\n".join(parts)
 
 
+def rank_query_terms(db: Any, query: str) -> Dict[str, List[str]]:
+    """The question's search terms, rarest first, and the rare ones (BU161).
+
+    ``{"ranked": [...], "rare": [...]}``. Terms no chunk matches are kept last
+    in ``ranked`` and are never rare. Without counts (an error) the terms keep
+    their question order and none is rare.
+    """
+    terms = fts_terms(query)
+    try:
+        counts = db.count_rag_fts_matches(terms, source_types=ARCHIVE_SOURCE_TYPES)
+        total = int(counts["total"])
+        by_term = {t: int(n) for t, n in counts["terms"].items()}
+    except Exception:
+        return {"ranked": terms, "rare": []}
+    limit = max(RARE_TERM_MIN_CHUNKS, total * RARE_TERM_MAX_SHARE)
+    found = sorted((t for t in terms if by_term.get(t)), key=lambda t: by_term[t])
+    rare = [t for t in found if by_term[t] <= limit and len(t) >= RARE_TERM_MIN_LENGTH]
+    return {"ranked": found + [t for t in terms if t not in found], "rare": rare}
+
+
+def find_archive_chunks(db: Any, rare_terms: List[str]) -> List[Dict[str, Any]]:
+    """Chunks anywhere in the archive holding a rare question term (BU161).
+
+    Each term is searched alone, rarest first: searched together, a word
+    repeated in one chunk outranks the single chunk with the rarest word.
+    """
+    found: List[Dict[str, Any]] = []
+    seen = set()
+    for term in rare_terms:
+        if len(found) >= MAX_ARCHIVE_CHUNKS:
+            break
+        try:
+            hits = db.search_rag_fts(
+                term, limit=MAX_ARCHIVE_CHUNKS,
+                source_types=ARCHIVE_SOURCE_TYPES, terms=[term],
+            ) or []
+        except Exception:
+            continue
+        for hit in hits:
+            if len(found) < MAX_ARCHIVE_CHUNKS and hit.get("chunk_id") not in seen:
+                seen.add(hit.get("chunk_id"))
+                found.append(hit)
+    return found
+
+
 def build_routed_session_context(
     db: Any,
     query: str,
     routed: List[Any],
     max_chars: int = MAX_CONTEXT_CHARS,
+    archive: Optional[List[Dict[str, Any]]] = None,
+    terms: Optional[List[str]] = None,
 ) -> str:
     """Build Any Session context from router-selected sessions (BU089).
 
@@ -150,17 +218,31 @@ def build_routed_session_context(
     the per-excerpt and total character budgets. The router's match reason is
     internal and is not rendered here (it stays on ``RoutedSession.reason``).
 
+    ``archive`` chunks (BU161, from :func:`find_archive_chunks`) lead their
+    session's chunks when it was routed; the rest follow in sessions of their
+    own, within ``MAX_ARCHIVE_CHARS`` beyond ``max_chars``. Each excerpt is cut
+    around the first of ``terms`` (rarest first) it contains.
+
     Args:
-        db: Database with ``get_summaries`` and ``search_rag_fts``.
+        db: Database with ``get_summaries``, ``get_session`` and ``search_rag_fts``.
         query: The user's question.
         routed: List of ``RoutedSession`` (session_id, name, start_time, score, reason).
         max_chars: Total character budget.
+        archive: Archive-wide matches for the question's rare words.
+        terms: Search terms in excerpt priority order; the query's by default.
 
     Returns:
         Formatted context string, or the no-context message when nothing fits.
     """
-    if not routed:
+    archive = list(archive or [])
+    if not routed and not archive:
         return "(No relevant context found in any session)"
+    if terms is None:
+        terms = fts_terms(query)
+
+    archive_by_session: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for chunk in archive:
+        archive_by_session[chunk.get("session_id")].append(chunk)
 
     parts: List[str] = []
     length = 0
@@ -173,6 +255,7 @@ def build_routed_session_context(
         length += len(text)
         return True
 
+    full = False
     for candidate in routed:
         session_id = getattr(candidate, "session_id", None)
         if session_id is None:
@@ -182,6 +265,8 @@ def build_routed_session_context(
         header = _session_header(session_id, name, session_date)
         if not add(header):
             break
+        if _session_is_diarized(db, session_id):
+            add(f"[speakers]: {SPEAKER_NOTE}\n")
 
         # Session summary
         try:
@@ -205,13 +290,59 @@ def build_routed_session_context(
         # the model what the session is about (BU152).
         if not chunks and not summary_text:
             chunks = _opening_chunks(db, session_id)
+        # Archive matches lead; the same chunk is never sent twice.
+        leading = archive_by_session.pop(session_id, [])
+        lead_ids = {c.get("chunk_id") for c in leading} - {None}
+        chunks = leading + [c for c in chunks if c.get("chunk_id") not in lead_ids]
         for chunk in chunks:
-            if not add(_format_result(chunk)):
-                return "\n".join(parts)
+            if not add(_format_result(chunk, terms)):
+                full = True
+                break
+        if full:
+            break
+
+    # Archive matches in sessions routing did not pick (BU161).
+    max_chars += MAX_ARCHIVE_CHARS
+    for session_id, chunks in archive_by_session.items():
+        if session_id is None:
+            continue
+        session = archive_session(db, session_id)
+        header = _session_header(
+            session_id, session["session_name"], _format_session_date(session["start_time"]))
+        if not add(header):
+            break
+        if _session_is_diarized(db, session_id):
+            add(f"[speakers]: {SPEAKER_NOTE}\n")
+        for chunk in chunks:
+            if not add(_format_result(chunk, terms)):
+                break
 
     if not any(p.strip() and not p.startswith("\n## ") for p in parts):
         return "(No relevant context found in any session)"
     return "\n".join(parts)
+
+
+def archive_session(db: Any, session_id: int) -> Dict[str, Any]:
+    """Name and start time (unix seconds) of a session an archive match is in."""
+    try:
+        session = db.get_session(session_id) or {}
+    except Exception:
+        session = {}
+    start = session.get("start_time")
+    if isinstance(start, datetime):
+        start = int(start.timestamp())
+    return {
+        "session_id": session_id,
+        "session_name": session.get("name") or f"Session {session_id}",
+        "start_time": start,
+    }
+
+
+def _session_is_diarized(db: Any, session_id: Any) -> bool:
+    try:
+        return is_diarized(db.get_session(session_id))
+    except Exception:
+        return False
 
 
 def _opening_chunks(db: Any, session_id: int) -> List[Dict[str, Any]]:
@@ -238,7 +369,7 @@ def _truncate(text: str, limit: int = MAX_EXCERPT_CHARS) -> str:
     return text
 
 
-def _format_result(result: Dict[str, Any]) -> str:
+def _format_result(result: Dict[str, Any], terms: Optional[List[str]] = None) -> str:
     """Format a single RAG result as ``[<source> @ <YYYY-MM-DD HH:MM:SS>]: <content>``.
 
     The chunk timestamp carries the full date, not just the time of day, so
@@ -258,8 +389,31 @@ def _format_result(result: Dict[str, Any]) -> str:
         except (ValueError, OSError):
             timestamp_str = ""
 
-    content = result.get("content", "")
-    if len(content) > MAX_EXCERPT_CHARS:
-        content = content[:MAX_EXCERPT_CHARS].rstrip() + "..."
-
+    content = _excerpt(result.get("content", ""), terms)
     return f"[{source_type}{timestamp_str}]: {content}\n"
+
+
+def _excerpt(text: str, terms: Optional[List[str]] = None, limit: int = MAX_EXCERPT_CHARS) -> str:
+    """At most ``limit`` characters of ``text``, centred on the first of
+    ``terms`` (in priority order) it contains (BU161); the opening when none
+    matches. Cut ends are marked with ``...``."""
+    if len(text) <= limit:
+        return text
+    pos = None
+    for term in terms or []:
+        match = re.search(r"\b" + re.escape(term), text, re.IGNORECASE)
+        if match:
+            pos = match.start()
+            break
+    if pos is None:
+        return text[:limit].rstrip() + "..."
+    start = min(max(0, pos - limit // 2), len(text) - limit)
+    if start > 0:
+        # Start on a whole word, never past the matched term.
+        space = text.find(" ", start, pos)
+        if space != -1:
+            start = space + 1
+    end = start + limit
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end].strip() + suffix

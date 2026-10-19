@@ -12,7 +12,7 @@ from ..config import SESSION_DOCUMENTS
 logger = logging.getLogger(__name__)
 
 # Bump when a step is added to Database._migrate().
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # sessions.origin (BU134): where a session's transcript came from. Uploaded
 # audio counts as recorded; 'text' marks a transcript inserted from a file.
@@ -39,6 +39,28 @@ _SESSION_DOCUMENTS_INDEX = (
     'CREATE INDEX IF NOT EXISTS idx_session_documents_session '
     'ON session_documents(session_id, added_at)'
 )
+# Speaker diarization (BU164): a speaker-labelled copy of a session's
+# transcript, written next to the original rows, which are never modified.
+_DIARIZED_TRANSCRIPTS_TABLE = '''
+    CREATE TABLE IF NOT EXISTS diarized_transcripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        timestamp INTEGER NOT NULL,
+        end_timestamp INTEGER,
+        text TEXT NOT NULL,
+        source TEXT NOT NULL,
+        speaker INTEGER NOT NULL,
+        audio_file TEXT,
+        FOREIGN KEY(session_id) REFERENCES sessions(id)
+    )
+'''
+_DIARIZED_TRANSCRIPTS_INDEX = (
+    'CREATE INDEX IF NOT EXISTS idx_diarized_transcripts_session '
+    'ON diarized_transcripts(session_id, timestamp)'
+)
+# sessions.diarization_status
+DIARIZATION_STATUSES = ('none', 'running', 'ready', 'failed')
+
 _SESSION_DOCUMENT_LIST_COLUMNS = (
     'id, session_id, name, file_type, file_bytes, char_count, added_at'
 )
@@ -103,9 +125,12 @@ def sanitize_fts_query(query: str) -> str:
 
     Returns an empty string when no usable term remains.
     """
-    terms = fts_terms(query)
-    if not terms:
-        return ''
+    return _fts_or_query(fts_terms(query))
+
+
+def _fts_or_query(terms: List[str]) -> str:
+    """Prefix-match ``terms`` joined with OR; ``''`` for no terms."""
+    terms = [t for t in (terms or []) if t and '"' not in t]
     return ' OR '.join('"{}"*'.format(t) for t in terms)
 
 
@@ -269,7 +294,9 @@ class Database:
                     transcription_status TEXT DEFAULT 'none',
                     summary_status TEXT DEFAULT 'none',
                     needs_finalize INTEGER NOT NULL DEFAULT 0,
-                    origin TEXT NOT NULL DEFAULT 'recorded'
+                    origin TEXT NOT NULL DEFAULT 'recorded',
+                    diarization_status TEXT DEFAULT 'none',
+                    diarization_enabled INTEGER NOT NULL DEFAULT 0
                 )
             ''')
             # end_timestamp / audio_file: the chunk a line came from, so a batch
@@ -426,6 +453,7 @@ class Database:
                 )
             ''')
             cursor.execute(_SESSION_DOCUMENTS_TABLE)
+            cursor.execute(_DIARIZED_TRANSCRIPTS_TABLE)
             conn.commit()
 
             if version < SCHEMA_VERSION:
@@ -448,6 +476,7 @@ class Database:
                 'CREATE INDEX IF NOT EXISTS idx_conversations_updated ON assistant_conversations(updated_at)',
                 'CREATE INDEX IF NOT EXISTS idx_messages_conversation ON assistant_messages(conversation_id, timestamp)',
                 _SESSION_DOCUMENTS_INDEX,
+                _DIARIZED_TRANSCRIPTS_INDEX,
             ):
                 cursor.execute(statement)
             conn.commit()
@@ -543,6 +572,13 @@ class Database:
             cursor.execute(_SESSION_DOCUMENTS_INDEX)
             conn.commit()
 
+        if from_version < 6:
+            # BU164: speaker-labelled transcripts, switched on per session.
+            cursor.execute(_DIARIZED_TRANSCRIPTS_TABLE)
+            self._add_column(cursor, 'sessions', "diarization_status TEXT DEFAULT 'none'")
+            self._add_column(cursor, 'sessions', 'diarization_enabled INTEGER NOT NULL DEFAULT 0')
+            conn.commit()
+
     def create_session(self, name: str, start_time: datetime, status: str = 'active', 
                        transcription_status: str = 'none', summary_status: str = 'none',
                        origin: str = SESSION_ORIGIN_RECORDED) -> int:
@@ -582,8 +618,9 @@ class Database:
 
     def list_sessions_with_flags(self) -> List[Dict[str, Any]]:
         """All sessions, newest first, each with ``has_transcripts`` and
-        ``has_summary`` booleans and a ``screenshot_count``, computed in the
-        same query."""
+        ``has_summary`` booleans, a ``screenshot_count`` and the diarization
+        fields (``diarization_enabled`` as a boolean, ``diarization_status``,
+        ``speaker_count``), computed in the same query."""
         try:
             cursor = self.connection.cursor()
             cursor.execute('''
@@ -591,7 +628,9 @@ class Database:
                        EXISTS (SELECT 1 FROM transcripts t WHERE t.session_id = s.id) AS has_transcripts,
                        EXISTS (SELECT 1 FROM summaries su WHERE su.session_id = s.id) AS has_summary,
                        (SELECT COUNT(*) FROM screenshots sc WHERE sc.session_id = s.id) AS screenshot_count,
-                       (SELECT COUNT(*) FROM session_documents d WHERE d.session_id = s.id) AS document_count
+                       (SELECT COUNT(*) FROM session_documents d WHERE d.session_id = s.id) AS document_count,
+                       (SELECT COUNT(DISTINCT dt.speaker) FROM diarized_transcripts dt
+                        WHERE dt.session_id = s.id) AS speaker_count
                 FROM sessions s
                 ORDER BY s.start_time DESC
             ''')
@@ -600,6 +639,7 @@ class Database:
                 item = dict(row)
                 item['has_transcripts'] = bool(item['has_transcripts'])
                 item['has_summary'] = bool(item['has_summary'])
+                item['diarization_enabled'] = bool(item['diarization_enabled'])
                 rows.append(item)
             return rows
         except sqlite3.Error as e:
@@ -667,6 +707,7 @@ class Database:
             cursor = self.connection.cursor()
             cursor.execute('DELETE FROM calendar_events WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM session_documents WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM diarized_transcripts WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
             self.connection.commit()
         except sqlite3.Error as e:
@@ -732,6 +773,7 @@ class Database:
             # Core session content.
             cursor.execute('DELETE FROM summaries WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM transcripts WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM diarized_transcripts WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM screenshots WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM calendar_events WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM session_documents WHERE session_id = ?', (session_id,))
@@ -777,6 +819,8 @@ class Database:
                                        OR conversation_id NOT IN (SELECT id FROM assistant_conversations)'''),
             ('assistant_conversations', f'DELETE FROM assistant_conversations WHERE id IN {orphan_convs}'),
             ('transcripts', 'DELETE FROM transcripts WHERE session_id NOT IN (SELECT id FROM sessions)'),
+            ('diarized_transcripts',
+             'DELETE FROM diarized_transcripts WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('screenshots', 'DELETE FROM screenshots WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('summaries', 'DELETE FROM summaries WHERE session_id NOT IN (SELECT id FROM sessions)'),
             ('calendar_events', 'DELETE FROM calendar_events WHERE session_id NOT IN (SELECT id FROM sessions)'),
@@ -1206,7 +1250,9 @@ class Database:
             raise DatabaseError(f'Transcript lookup failed: {str(e)}')
 
     def get_transcripts(self, session_id: int) -> List[Dict[str, Any]]:
-        """Get all transcripts for a session.
+        """The transcript every reader shows: the speaker-labelled rows (each
+        with a ``speaker`` key) when the session has diarization enabled and
+        ready, otherwise the original rows (no ``speaker`` key).
 
         Args:
             session_id: ID of the session
@@ -1218,15 +1264,74 @@ class Database:
             DatabaseError: If retrieval fails
         """
         try:
+            row = self.connection.execute(
+                'SELECT diarization_enabled, diarization_status FROM sessions WHERE id = ?',
+                (session_id,)).fetchone()
+        except sqlite3.Error as e:
+            raise DatabaseError(f'Transcript retrieval failed: {str(e)}')
+        if row and row[0] and row[1] == 'ready':
+            return self._transcript_rows('diarized_transcripts', session_id)
+        return self.get_original_transcripts(session_id)
+
+    def get_original_transcripts(self, session_id: int) -> List[Dict[str, Any]]:
+        """The session's original transcript rows, whatever the diarization state."""
+        return self._transcript_rows('transcripts', session_id)
+
+    def _transcript_rows(self, table: str, session_id: int) -> List[Dict[str, Any]]:
+        try:
             cursor = self.connection.cursor()
-            cursor.execute('''
-                SELECT * FROM transcripts
+            cursor.execute(f'''
+                SELECT * FROM {table}
                 WHERE session_id = ?
                 ORDER BY timestamp ASC, id ASC
             ''', (session_id,))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f'Transcript retrieval failed: {str(e)}')
+
+    def replace_diarized_transcripts(self, session_id: int, rows: Iterable[Dict[str, Any]]) -> None:
+        """Replace the session's speaker-labelled rows, in one transaction.
+
+        Each row has ``timestamp``, ``text``, ``source``, ``speaker`` and
+        optionally ``end_timestamp`` and ``audio_file``; times are datetimes
+        or epoch seconds.
+        """
+        def seconds(value):
+            if value is None:
+                return None
+            return int(value.timestamp() if isinstance(value, datetime) else value)
+
+        values = [
+            (session_id, seconds(r['timestamp']), seconds(r.get('end_timestamp')),
+             r['text'], r['source'], int(r['speaker']), r.get('audio_file'))
+            for r in rows
+        ]
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute('DELETE FROM diarized_transcripts WHERE session_id = ?', (session_id,))
+            cursor.executemany('''
+                INSERT INTO diarized_transcripts
+                    (session_id, timestamp, end_timestamp, text, source, speaker, audio_file)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', values)
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
+            raise DatabaseError(f'Diarized transcript replacement failed: {str(e)}')
+
+    def set_diarization(self, session_id: int, enabled: Optional[bool] = None,
+                        status: Optional[str] = None) -> None:
+        """Set ``diarization_enabled`` and/or ``diarization_status`` (one of
+        DIARIZATION_STATUSES); a field left as None is unchanged."""
+        fields: Dict[str, Any] = {}
+        if enabled is not None:
+            fields['diarization_enabled'] = int(bool(enabled))
+        if status is not None:
+            if status not in DIARIZATION_STATUSES:
+                raise ValueError(f'Unknown diarization status: {status!r}')
+            fields['diarization_status'] = status
+        if fields:
+            self.update_session(session_id, **fields)
 
     def get_transcript(self, transcript_id: int) -> Dict[str, Any]:
         """Get a specific transcript by ID.
@@ -1268,16 +1373,21 @@ class Database:
 
     def delete_transcripts(self, session_id: int) -> None:
         """Delete all transcripts for a session.
-        
+
+        The speaker-labelled copy goes too and the diarization status returns
+        to 'none': it would not match a new transcript.
+
         Args:
             session_id: ID of the session
-            
+
         Raises:
             DatabaseError: If deletion fails
         """
         try:
             cursor = self.connection.cursor()
             cursor.execute('DELETE FROM transcripts WHERE session_id = ?', (session_id,))
+            cursor.execute('DELETE FROM diarized_transcripts WHERE session_id = ?', (session_id,))
+            cursor.execute("UPDATE sessions SET diarization_status = 'none' WHERE id = ?", (session_id,))
             self.connection.commit()
         except sqlite3.Error as e:
             raise DatabaseError(f'Transcript deletion failed: {str(e)}')
@@ -1731,6 +1841,7 @@ class Database:
             cursor.execute('DELETE FROM assistant_messages')
             cursor.execute('DELETE FROM assistant_conversations')
             cursor.execute('DELETE FROM transcripts')
+            cursor.execute('DELETE FROM diarized_transcripts')
             cursor.execute('DELETE FROM screenshots')
             cursor.execute('DELETE FROM summaries')
             cursor.execute('DELETE FROM sessions')
@@ -2157,7 +2268,8 @@ class Database:
             raise DatabaseError(f'FTS rebuild failed: {str(e)}')
 
     def search_rag_fts(self, query: str, limit: int = 20, session_id: Optional[int] = None,
-                       source_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                       source_types: Optional[List[str]] = None,
+                       terms: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Search the RAG FTS index and return source-aware results.
 
         Args:
@@ -2165,6 +2277,8 @@ class Database:
             limit: Maximum number of results (default 20, capped at 50)
             session_id: Optional session ID to filter results to a specific session
             source_types: Optional list of source types to filter results
+            terms: Search terms already reduced by ``fts_terms``; searched
+                as given instead of re-deriving them from ``query``.
 
         Returns:
             List of result dictionaries with keys:
@@ -2200,7 +2314,7 @@ class Database:
             cursor = self.connection.cursor()
 
             # Build the FTS5 search query with bm25 ranking
-            fts_query = sanitize_fts_query(query)
+            fts_query = _fts_or_query(terms) if terms else sanitize_fts_query(query)
             if not fts_query:
                 # Nothing searchable survived sanitisation; never fall back to
                 # an unfiltered scan.
@@ -2346,6 +2460,30 @@ class Database:
             return (row[0], row[1]) if row else (0, 0)
         except sqlite3.Error as e:
             raise DatabaseError(f'Session profile signature failed: {str(e)}')
+
+    def count_rag_fts_matches(self, terms: List[str],
+                              source_types: Optional[List[str]] = None) -> Dict[str, Any]:
+        """How many indexed chunks match each prefix term, and how many there
+        are in all (BU161): ``{"total": n, "terms": {term: count}}``."""
+        try:
+            cursor = self.connection.cursor()
+            type_sql, type_params = '', []
+            if source_types:
+                type_sql = ' AND source_type IN ({})'.format(','.join('?' * len(source_types)))
+                type_params = list(source_types)
+            cursor.execute('SELECT COUNT(*) FROM rag_fts WHERE 1=1' + type_sql, type_params)
+            total = cursor.fetchone()[0]
+            counts = {}
+            for term in terms:
+                fts_query = _fts_or_query([term])
+                if not fts_query:
+                    continue
+                cursor.execute('SELECT COUNT(*) FROM rag_fts WHERE content MATCH ?' + type_sql,
+                               [fts_query] + type_params)
+                counts[term] = cursor.fetchone()[0]
+            return {'total': total, 'terms': counts}
+        except sqlite3.Error as e:
+            raise DatabaseError(f'FTS count failed: {str(e)}')
 
     def search_session_profiles_fts(
         self, query: str, limit: int = 20

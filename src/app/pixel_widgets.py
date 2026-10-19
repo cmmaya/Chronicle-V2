@@ -32,7 +32,9 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QCursor,
+    QLinearGradient,
 )
+from typing import Optional
 
 
 # =========================
@@ -874,9 +876,12 @@ class PixelBubble(QWidget):
         max_width: int = 520,
         parent=None,
         segmented: bool = False,
+        tag=None,
     ):
         """
         Args:
+            tag: ``(text, colour)`` of a name tag opening the bubble's first
+                line, e.g. a speaker (BU168).
             segmented: keep each appended chunk as its own label inside the
                 bubble instead of merging it into one body (BU113 follow-up).
                 A grouped bubble can hold a minute of speech, and the chunk -
@@ -902,6 +907,7 @@ class PixelBubble(QWidget):
         self._segment_texts = []
         self._max_width = max_width
         self._fill_width = False  # set_max_width() turns this on
+        self._tag = tag
 
         self.setAttribute(Qt.WA_StyledBackground, False)
         self.setAutoFillBackground(False)
@@ -914,7 +920,8 @@ class PixelBubble(QWidget):
 
         text_color = "#071846" if variant == "cream" else theme.role("bubble_blue_text")
 
-        self.label = QLabel(simple_markdown_to_html(body_text))
+        self.label = QLabel()
+        self._render_label(self.label, body_text)
         self.label.setWordWrap(True)
         self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.label.setMaximumWidth(max_width)
@@ -1029,6 +1036,8 @@ class PixelBubble(QWidget):
             pairs = list(zip(self._segments, self._segment_texts))
         else:
             pairs = [(self.label, self._body_text)]
+        if self._tag:
+            pairs[0] = (pairs[0][0], f"{self._tag[0]}: {pairs[0][1]}")
         if self.footer_label:
             pairs.append((self.footer_label, self.footer_label.text()))
         return pairs
@@ -1128,9 +1137,13 @@ class PixelBubble(QWidget):
         label.setTextFormat(Qt.RichText)
         if self._match_terms:
             bg, fg = FIND_TERM_ON_CREAM if self.variant == "cream" else FIND_TERM_ON_BLUE
-            label.setText(highlight_terms_html(text, self._match_terms, bg, fg))
+            html = highlight_terms_html(text, self._match_terms, bg, fg)
         else:
-            label.setText(simple_markdown_to_html(text))
+            html = simple_markdown_to_html(text)
+        if self._tag and label is self.label:
+            name, color = self._tag
+            html = f'<span style="color:{color}; font-weight:700;">{html_escape.escape(name)}:</span> {html}'
+        label.setText(html)
 
     def _style_segment(self, label: QLabel, selected: bool):
         text_color = "#071846" if self.variant == "cream" else theme.role("bubble_blue_text")
@@ -1451,7 +1464,7 @@ class PixelScopePrompt(QWidget):
 
 
 def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_width: int = 520,
-                   segmented: bool = False) -> QWidget:
+                   segmented: bool = False, tag=None) -> QWidget:
     """
     Retorna una fila con burbuja alineada.
     MainWindow ya usa esta función para chat y transcripts.
@@ -1466,7 +1479,7 @@ def aligned_bubble(text: str, variant: str = "blue", align: str = "left", max_wi
 
     tail = "right" if align == "right" else "left"
     bubble = PixelBubble(text=text, variant=variant, tail=tail, max_width=max_width,
-                         segmented=segmented)
+                         segmented=segmented, tag=tag)
 
     if align == "right":
         layout.addStretch(1)
@@ -1485,6 +1498,7 @@ def aligned_bubble_with_time(
     max_width: int = 520,
     time_text: str = "",
     segmented: bool = False,
+    tag=None,
 ) -> QWidget:
     """Like ``aligned_bubble``, but with a small muted timestamp placed
     *above* the bubble (BU104) instead of buried at the end of its text -
@@ -1522,7 +1536,7 @@ def aligned_bubble_with_time(
         outer.addLayout(time_row)
 
     outer.addWidget(aligned_bubble(text, variant=variant, align=align, max_width=max_width,
-                                   segmented=segmented))
+                                   segmented=segmented, tag=tag))
     return container
 
 
@@ -2609,6 +2623,168 @@ class PixelDocsChip(PixelShotsChip):
     NOUN = "document"
 
 
+class PixelSpeakersChip(PixelShotsChip):
+    """How many speakers a diarized session has (BU167); after a failed run,
+    an error mark with the reason in its tooltip. Not clickable."""
+
+    ICON_FILE = "icon_speakers.svg"
+    NOUN = "speaker"
+
+    def __init__(self, count: int = 0, parent=None):
+        self._error = None
+        super().__init__(count, parent)
+        self.setCursor(Qt.ArrowCursor)
+
+    def set_count(self, count: int, error: Optional[str] = None):
+        count = max(0, int(count or 0))
+        self._error = error
+        if error is not None:
+            self.count_label.setText("!")
+            self.setToolTip(f"Diarization failed: {error}" if error else "Diarization failed")
+            border = LIVE_RED.name()
+        else:
+            self.count_label.setText(str(count))
+            self.setToolTip(f"{count} speaker{'s' if count != 1 else ''} - diarization on")
+            border = "#3A67C7"
+        self.setStyleSheet(
+            f"QWidget#PixelShotsChip {{ background: #1E3F82; border: 1px solid {border};"
+            " border-radius: 4px; }")
+        if count <= 0 and error is None:
+            self.hide()
+        elif self.parentWidget() is not None:
+            self.show()
+
+    def has_error(self) -> bool:
+        return self._error is not None
+
+    def mousePressEvent(self, event):
+        QWidget.mousePressEvent(self, event)
+
+
+class _ProgressTrack(QWidget):
+    """The bar of a PixelCardProgress: track plus a chunk up to ``fraction``."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.fraction = 0.0
+        self.setFixedHeight(6 if theme.is_pixel() else 4)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, theme.antialias())
+        painter.setPen(Qt.NoPen)
+        w, h = self.width(), self.height()
+        width = int(round(w * min(max(self.fraction, 0.0), 1.0)))
+        track, chunk = QColor(theme.progress_color("track")), QColor(theme.progress_color("chunk"))
+        if not theme.is_pixel():
+            painter.setBrush(track)
+            painter.drawRoundedRect(0, 0, w, h, h / 2, h / 2)
+            if width:
+                painter.setBrush(chunk)
+                painter.drawRoundedRect(0, 0, max(width, h), h, h / 2, h / 2)
+            return
+        painter.setBrush(track)
+        painter.drawPath(pixel_round_rect_path(0, 0, w, h, 2))
+        if width < 2:
+            return
+        painter.setBrush(chunk)
+        painter.drawPath(pixel_round_rect_path(0, 0, width, h, 2))
+        glow = theme.progress_color("glow")
+        if glow:
+            # A soft light on the leading edge, fading back into the chunk.
+            edge = QLinearGradient(width - 14, 0, width, 0)
+            transparent, bright = QColor(glow), QColor(glow)
+            transparent.setAlpha(0)
+            bright.setAlpha(220)
+            edge.setColorAt(0.0, transparent)
+            edge.setColorAt(1.0, bright)
+            painter.setBrush(QBrush(edge))
+            painter.drawRect(max(0, width - 14), 0, min(14, width), h)
+
+
+class PixelCardProgress(QWidget):
+    """Stage text, percent and a determinate bar under a session card's meta
+    line while the session is being diarized (BU167).
+
+    Hidden when idle. The bar eases toward each new value; at 100% it holds
+    for :data:`HOLD_MS`, then the strip hides and ``done`` is emitted.
+    """
+
+    HOLD_MS = 350
+    done = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = 0.0
+        self._target = 0.0
+        self._holding = False
+        self.text_label = QLabel()
+        self.percent_label = QLabel()
+        pt = 8.5
+        for label, key in ((self.text_label, "text"), (self.percent_label, "muted")):
+            label.setStyleSheet(_label_qss(theme.progress_color(key), pt, bold=theme.is_pixel()))
+        self.text_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.track = _ProgressTrack()
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(self.text_label, 1)
+        row.addWidget(self.percent_label, 0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(4)
+        layout.addLayout(row)
+        layout.addWidget(self.track)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._step)
+        self.setVisible(False)
+
+    def value(self) -> float:
+        return self._value
+
+    def is_active(self) -> bool:
+        return not self.isHidden()
+
+    def set_progress(self, percent: float, text: str, animate: bool = True):
+        """Show the strip at ``percent`` (0-100) with stage ``text``."""
+        if not theme.is_pixel():
+            text = _sentence_case(text)
+        self.text_label.setText(text)
+        self._target = float(min(max(percent, 0), 100))
+        if self._target < self._value or not animate:
+            self._value = self._target
+        self._holding = False
+        if self.isHidden() and self.parentWidget() is not None:
+            self.show()
+        self._paint()
+        if self._value < self._target or self._target >= 100:
+            self._timer.start()
+
+    def _step(self):
+        self._value = min(self._target, self._value + max((self._target - self._value) * 0.18, 0.5))
+        self._paint()
+        if self._value < self._target:
+            return
+        self._timer.stop()
+        if self._target >= 100 and not self._holding:
+            self._holding = True
+            QTimer.singleShot(self.HOLD_MS, self._finish)
+
+    def _finish(self):
+        if self._holding:
+            self._holding = False
+            self.hide()
+            self.done.emit()
+
+    def _paint(self):
+        self.percent_label.setText(f"{int(self._value)}%")
+        self.track.fraction = self._value / 100
+        self.track.update()
+
+
 class PixelSessionCard(QWidget):
     """One session in the All Sessions browser: name, time, processing chips,
     an Open button and a "•••" actions button (its menu is set by the owner).
@@ -2637,7 +2813,9 @@ class PixelSessionCard(QWidget):
         self.name_label = PixelElidedLabel(name)
         self.name_label.setToolTip(name)
         self.name_label.setStyleSheet(_label_qss("#FFF0BF", 11, bold=True))
-        self.meta_label = QLabel(meta)
+        # Elides too, so a card with every chip still fits the window's minimum width.
+        self.meta_label = PixelElidedLabel(meta)
+        self.meta_label.setToolTip(meta)
         self.meta_label.setStyleSheet(_label_qss("#8EA7D8", 9))
 
         name_row = QHBoxLayout()
@@ -2649,6 +2827,8 @@ class PixelSessionCard(QWidget):
         text_col.setSpacing(4)
         text_col.addLayout(name_row)
         text_col.addWidget(self.meta_label)
+        self.progress = PixelCardProgress()  # diarization (BU167)
+        text_col.addWidget(self.progress)
 
         self.transcript_chip = PixelStatusChip("Transcript")
         self.summary_chip = PixelStatusChip("Summary")
@@ -2665,6 +2845,8 @@ class PixelSessionCard(QWidget):
         self.docs_chip = PixelDocsChip(doc_count)
         self.docs_chip.setFixedHeight(self.transcript_chip.sizeHint().height())
         self.docs_chip.clicked.connect(self.documents_requested.emit)
+        self.speakers_chip = PixelSpeakersChip(0)
+        self.speakers_chip.setFixedHeight(self.transcript_chip.sizeHint().height())
 
         self.open_button = QToolButton()
         self.open_button.setText("Open")
@@ -2724,6 +2906,7 @@ class PixelSessionCard(QWidget):
         layout.setContentsMargins(22, 10, 14, 10)
         layout.setSpacing(8)
         layout.addLayout(text_col, 1)
+        layout.addWidget(self.speakers_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.docs_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.shots_chip, 0, Qt.AlignVCenter)
         layout.addWidget(self.transcript_chip, 0, Qt.AlignVCenter)
@@ -2749,9 +2932,15 @@ class PixelSessionCard(QWidget):
     def set_doc_count(self, count: int):
         self.docs_chip.set_count(count)
 
+    def set_speakers(self, count: int, error: Optional[str] = None):
+        """Speakers chip: ``count`` while diarization is on, or the error of
+        a failed run (an empty string when the reason is not known)."""
+        self.speakers_chip.set_count(count, error)
+
     def set_meta(self, text: str):
-        if self.meta_label.text() != text:
-            self.meta_label.setText(text)
+        if self.meta_label.full_text() != text:
+            self.meta_label.set_full_text(text)
+            self.meta_label.setToolTip(text)
 
     def set_live_state(self, state):
         """"recording", "paused" or None."""

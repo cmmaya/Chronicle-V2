@@ -286,6 +286,38 @@ ROLES = {
     },
 }
 
+# Diarization progress strip on a session card (BU167).
+PROGRESS = {
+    CLASSIC: {"track": "#030C24", "chunk": "#E37C25", "glow": "", "text": "#FFE9A8", "muted": "#8EA7D8"},
+    SYNTHWAVE: {"track": "#05030F", "chunk": "#FF2BB0", "glow": "#FF7AD8", "text": "#FFE36E",
+                "muted": "#B9A6E8"},
+    BORING_CORPORATE: {"track": "#3A3A3A", "chunk": "#F9F9F9", "glow": "", "text": "#B4B4B4",
+                       "muted": "#8F8F8F"},
+}
+
+# Speaker name tags (BU168), cycled after six: (on the cream bubble, on the
+# blue bubble), each at least 3:1 against its fill. Boring Corporate's two
+# fills are both dark greys, so one colour serves both.
+SPEAKER_COLORS = {
+    CLASSIC: [("#9A4A0C", "#FFB36B"), ("#1E3F8A", "#BFD3FF"), ("#2E6B2E", "#A8E6A0"),
+              ("#A3263A", "#FFB0BC"), ("#5B3A9A", "#D6C2FF"), ("#1F6B73", "#9EE8EE")],
+    SYNTHWAVE: [("#A3007A", "#FF5CC8"), ("#1D2FA8", "#7AF5FF"), ("#6A1FA0", "#C79BFF"),
+                ("#B0310F", "#FF9E6B"), ("#00646E", "#6BFFB8"), ("#7A1F4A", "#FFE36E")],
+    BORING_CORPORATE: [("#ECECEC",) * 2, ("#7AA2F7",) * 2, ("#B4B4B4",) * 2,
+                       ("#D4D4D4",) * 2, ("#9A9A9A",) * 2, ("#C8C8C8",) * 2],
+}
+
+
+def progress_color(key: str) -> str:
+    return PROGRESS[_active][key]
+
+
+def speaker_color(speaker: int, on_blue: bool) -> str:
+    """Name-tag colour of speaker 1, 2, ... on the blue or the cream bubble."""
+    colors = SPEAKER_COLORS[_active]
+    return colors[(max(int(speaker), 1) - 1) % len(colors)][1 if on_blue else 0]
+
+
 # Icons whose colour in a theme is not just REMAP of the classic one.
 _SVG_OVERRIDES = {
     SYNTHWAVE: {

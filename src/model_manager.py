@@ -7,6 +7,11 @@ Both models live in the Hugging Face cache (``HF_HOME``, set to
   configured ``TRANSCRIPTION['quantization']``;
 - ``intfloat/multilingual-e5-small`` for RAG routing.
 
+Speaker diarization (BU162) adds an optional group that is not part of the
+required set - setup never downloads it and offline mode does not wait for
+it: pyannote segmentation-3.0 and NeMo TitaNet-small, both as sherpa-onnx
+ONNX exports. :func:`download_diarization` fetches it on first use.
+
 :func:`status` reads the disk only. :func:`download` fetches what is missing
 with progress, resume and cancel. Once everything is installed the app turns on
 ``HF_HUB_OFFLINE`` (:func:`enable_offline_if_installed`), and the loaders use
@@ -31,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 PARAKEET = "parakeet"
 EMBEDDINGS = "embeddings"
+SEGMENTATION = "segmentation"
+SPEAKER_EMBEDDING = "speaker_embedding"
 
 # onnx_asr.resolver.model_repos["nemo-parakeet-tdt-0.6b-v3"]
 PARAKEET_REPO_ID = "istupakov/parakeet-tdt-0.6b-v3-onnx"
@@ -64,6 +71,13 @@ _E5_FILES = {
     "onnx/model.onnx": 470_268_510,
     "onnx/tokenizer.json": 17_082_730,
 }
+
+# Hugging Face mirrors of the k2-fsa GitHub release files (same SHA-256),
+# so they use the same pinned, resumable download path as the models above.
+SEGMENTATION_REPO_ID = "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0"
+SEGMENTATION_REVISION = "9403a6902bb58e3d5ae8c7e77c3422de279db2e0"
+SPEAKER_EMBEDDING_REPO_ID = "csukuangfj/speaker-embedding-models"
+SPEAKER_EMBEDDING_REVISION = "0743f301363dec56491a490f6d6cbc9d67f9a3bf"
 
 # Headroom on top of the download itself (partial files, filesystem slack).
 DISK_MARGIN_BYTES = 200 * 1024 * 1024
@@ -144,6 +158,21 @@ def required_models(quantization=_FROM_CONFIG) -> List[RequiredModel]:
 
 REQUIRED_MODELS = required_models()
 
+# Optional: fetched on first use by download_diarization(), never by setup.
+DIARIZATION_MODELS = [
+    RequiredModel(SEGMENTATION, SEGMENTATION_REPO_ID, SEGMENTATION_REVISION,
+                  {"model.onnx": 5_992_913}),
+    RequiredModel(SPEAKER_EMBEDDING, SPEAKER_EMBEDDING_REPO_ID, SPEAKER_EMBEDDING_REVISION,
+                  {"nemo_en_titanet_small.onnx": 40_257_283}),
+]
+
+_LABELS = {
+    PARAKEET: "speech-to-text model (Parakeet)",
+    EMBEDDINGS: "embedding model (e5)",
+    SEGMENTATION: "speaker segmentation model (pyannote)",
+    SPEAKER_EMBEDDING: "speaker embedding model (TitaNet)",
+}
+
 
 # -- where things are on disk ----------------------------------------------------
 
@@ -165,7 +194,7 @@ def snapshot_dir(model: RequiredModel, cache_dir: Optional[Path] = None) -> Path
 
 
 def _get(name: str, models: Optional[List[RequiredModel]] = None) -> RequiredModel:
-    for model in models or required_models():
+    for model in models or required_models() + DIARIZATION_MODELS:
         if model.name == name:
             return model
     raise KeyError(name)
@@ -221,12 +250,16 @@ def local_path(name: str, filename: Optional[str] = None,
     model = _get(name)
     [st] = status(cache_dir, [model])
     if not st.installed:
-        label = "speech-to-text model (Parakeet)" if name == PARAKEET else "embedding model (e5)"
+        hint = "Enable diarization again to download it." if model in DIARIZATION_MODELS else SETUP_HINT
         raise ModelNotInstalledError(
-            f"The {label} is not installed ({len(st.missing_files)} file(s) missing). {SETUP_HINT}"
+            f"The {_LABELS[name]} is not installed ({len(st.missing_files)} file(s) missing). {hint}"
         )
     root = snapshot_dir(model, cache_dir)
     return root / filename if filename else root
+
+
+def diarization_installed(cache_dir: Optional[Path] = None) -> bool:
+    return is_installed(cache_dir, DIARIZATION_MODELS)
 
 
 def enable_offline_if_installed(cache_dir: Optional[Path] = None) -> bool:
@@ -370,10 +403,23 @@ def download(progress_cb: Optional[ProgressCallback] = None,
     # .incomplete file with a Range request. Read per call by huggingface_hub.
     xet_was_disabled = hf_constants.HF_HUB_DISABLE_XET
     hf_constants.HF_HUB_DISABLE_XET = True
+    # An explicit download is a request to go online, also once
+    # enable_offline_if_installed() has turned offline mode on (the optional
+    # diarization models are fetched while the app runs offline).
+    was_offline = hf_constants.HF_HUB_OFFLINE
+    hf_constants.HF_HUB_OFFLINE = False
     try:
         _download(models, cache, progress_cb, cancel_event)
     finally:
         hf_constants.HF_HUB_DISABLE_XET = xet_was_disabled
+        hf_constants.HF_HUB_OFFLINE = was_offline
+
+
+def download_diarization(progress_cb: Optional[ProgressCallback] = None,
+                         cancel_event: Optional[threading.Event] = None,
+                         cache_dir: Optional[Path] = None) -> None:
+    """Fetch the optional diarization models; same errors as :func:`download`."""
+    download(progress_cb, cancel_event, cache_dir, DIARIZATION_MODELS)
 
 
 def _download(models: List[RequiredModel], cache: Path,

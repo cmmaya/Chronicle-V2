@@ -254,3 +254,23 @@ Boring Corporate Appearance — user-requested: a third appearance, "Boring Corp
 | BU158 | Secondary Windows                       | Completed | BU156               | BU159 |
 | BU159 | Dialogs                                 | Completed | BU156               | BU160 |
 | BU160 | Visual QA                               | Completed | BU157, BU158, BU159 | none  |
+
+Any Session Passing Remarks — user-requested: a question about something said in passing ("the location near Toronto") was missed when that session's summary did not mention it, and a chunk's matching sentence could be cut off by the 500-char excerpt
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU161 | Any Session Archive Search For Rare Words And Centred Excerpts | Completed | BU089, BU152 | none  |
+
+Speaker Diarization — user-requested: an optional "Enable diarization" in a session's All Sessions "•••" menu finds who spoke when (sherpa-onnx with pyannote segmentation-3.0 + TitaNet, validated 2026-10-11 on DR session 2 and Research Methods - Article Critique), shows a loading bar on the session's card while it runs, then shows the transcript by speaker; "Disable diarization" goes back to the original transcript, which is never modified. Styled for Classic, Synthwave and Boring Corporate
+
+| BU    | Name                                    | Status    | Depends On          | Next  |
+| ---   | ---                                     | ---       | ---                 | ---   |
+| BU162 | Diarization Runtime And Models          | Completed | none                | BU163 |
+| BU163 | Diarization Engine                      | Completed | BU162               | BU164 |
+| BU164 | Speaker Transcript Storage              | Completed | none                | BU165 |
+| BU165 | Diarization Job                         | Completed | BU163, BU164        | BU166 |
+| BU166 | Enable / Disable Diarization In The Session Menu | Completed | BU165       | BU167 |
+| BU167 | Diarization Progress Bar On The Session Card | Completed | BU165           | BU168 |
+| BU168 | Speaker-Labelled Transcript View        | Completed | BU164               | BU169 |
+| BU169 | Speakers In Assistant Context           | Completed | BU165, BU168        | BU170 |
+| BU170 | Diarization Visual And Real-Session QA  | In Progress | BU166, BU167, BU168, BU169 | none |

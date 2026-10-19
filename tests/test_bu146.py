@@ -114,7 +114,7 @@ def test_migration_adds_the_table_to_a_v4_database(tmp_path):
     database = Database(path)
     database.connect()
     try:
-        assert database.connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
+        assert database.connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
         _add(database, session)
         assert database.count_session_documents(session) == 1
     finally:

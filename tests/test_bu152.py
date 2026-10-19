@@ -152,7 +152,7 @@ def test_service_routes_a_short_follow_up_with_the_previous_question(monkeypatch
         seen['route'] = query
         return [_routed(1)]
 
-    def fake_build(_db, query, routed):
+    def fake_build(_db, query, routed, **_kwargs):
         seen['build'] = query
         return CONTEXT
 

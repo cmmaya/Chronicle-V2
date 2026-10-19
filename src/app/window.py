@@ -26,7 +26,7 @@ from .documents_dialog import SessionDocumentsDialog
 from .start_session_popover import StartSessionPopover, default_session_name
 from .pixel_theme import app_qss, asset_path
 from . import theme
-from .. import paths
+from .. import model_manager, paths
 from .pixel_widgets import (
     PixelPanel, PixelSectionTitle, PixelButton, PixelToolButton, PixelScopePrompt,
     PixelFindBar, PixelCollapsibleSection, aligned_bubble, aligned_bubble_with_time,
@@ -143,6 +143,7 @@ class TranscriptRecord:
     end_dt: Optional[datetime]
     transcript_id: Optional[int]
     display_text: str
+    speaker: Optional[int] = None  # diarized sessions (BU168)
 
 
 def should_extend_group(group: Optional[dict], start_dt, end_dt) -> bool:
@@ -163,6 +164,37 @@ def should_extend_group(group: Optional[dict], start_dt, end_dt) -> bool:
     gap = (start_dt - last_end).total_seconds()
     duration = (end_dt - group_start).total_seconds()
     return gap <= TRANSCRIPT_PAUSE_GAP_SECONDS and duration <= TRANSCRIPT_MAX_GROUP_SECONDS
+
+
+def speaker_layout(rows) -> Optional[dict]:
+    """``{'primary': n, 'speakers': [1, 2, ...]}`` for diarized transcript
+    rows (BU168), the primary being the speaker with the most talk time;
+    None for rows without speakers."""
+    talk = {}
+    for row in rows or ():
+        speaker = row.get('speaker')
+        if not speaker:
+            continue
+        start, end = row.get('timestamp') or 0, row.get('end_timestamp') or 0
+        talk[speaker] = talk.get(speaker, 0) + (end - start if end > start else len(row.get('text') or '') / 15)
+    if not talk:
+        return None
+    return {'primary': max(sorted(talk), key=talk.get), 'speakers': sorted(talk)}
+
+
+def bubble_look(source: str, speaker: Optional[int] = None, layout: Optional[dict] = None):
+    """(label, align, variant, tag) of a transcript bubble. In a diarized
+    session (``layout`` from :func:`speaker_layout`) the most-talk speaker sits
+    on the right in blue, everyone else on the left in cream, each name tag in
+    its own colour (BU168)."""
+    if not speaker:
+        mic = source == 'mic'
+        return ("Mic" if mic else "System", "right" if mic else "left",
+                "blue" if mic else "cream", None)
+    primary = (layout or {}).get('primary') == speaker
+    label = f"Speaker {speaker}"
+    return (label, "right" if primary else "left", "blue" if primary else "cream",
+            (label, theme.speaker_color(speaker, on_blue=primary)))
 
 
 # BU112: a silence longer than this between two bubbles gets its own separator
@@ -753,6 +785,10 @@ class MainWindow(QMainWindow):
 
     _status_ready = Signal(str, bool)
     _session_finalized_ready = Signal(int, object)  # (session_id, outcome dict)
+    # Diarization (BU165) reports from its own thread, through the same hop.
+    _diarization_progress_ready = Signal(int, int, str)  # (session_id, percent, text)
+    _diarization_finished_ready = Signal(int, bool, object)  # (session_id, ok, error)
+    _speaker_layout = None  # see __init__
 
     # Generic version of the same hop, for a SessionManager.submit_job()
     # completion callback (Transcribe / Summarize / Upload Audio): carries a
@@ -873,6 +909,15 @@ class MainWindow(QMainWindow):
         self._session_finalized_ready.connect(
             self._apply_session_finalized, Qt.QueuedConnection
         )
+        self._diarization_progress_ready.connect(
+            self._apply_diarization_progress, Qt.QueuedConnection)
+        self._diarization_finished_ready.connect(
+            self._apply_diarization_finished, Qt.QueuedConnection)
+        # session_id -> (percent, stage text) while a diarization runs (BU167);
+        # on the window, not the All Sessions dialog, so reopening it keeps the bar.
+        self._diarization_progress = {}
+        # The displayed session's speakers (BU168): {'primary': n, 'speakers': [...]}.
+        self._speaker_layout = None
         self.documents_changed.connect(self._update_documents_chip)
         self._ui_callback_ready.connect(self._run_ui_callback, Qt.QueuedConnection)
 
@@ -1112,6 +1157,8 @@ class MainWindow(QMainWindow):
                 status_callback=self._on_status_update,
                 live_transcription_ui_callback=self._on_live_transcription,
                 session_finalized_callback=self._on_session_finalized,
+                diarization_progress_callback=self._diarization_progress_ready.emit,
+                diarization_finished_callback=self._diarization_finished_ready.emit,
             )
 
             # Initialize Assistant Answer Service
@@ -2207,7 +2254,8 @@ class MainWindow(QMainWindow):
         self._transcription_filter = stored if stored in TRANSCRIPT_FILTERS else 'all'
 
     def _save_transcription_filter(self):
-        self._update_preferences({'transcription_filter': self._transcription_filter})
+        if self._transcription_filter in TRANSCRIPT_FILTERS:  # not a session's speaker
+            self._update_preferences({'transcription_filter': self._transcription_filter})
 
     def _save_session_scope(self):
         """Remember the scope and the session in it (BU119).
@@ -3387,38 +3435,47 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        # Get current filter to check the active option
-        current_filter = self._transcription_filter
-        
-        # Add filter options
-        all_action = menu.addAction("All")
-        all_action.setCheckable(True)
-        all_action.setChecked(current_filter == 'all')
-        
-        mic_action = menu.addAction("Mic")
-        mic_action.setCheckable(True)
-        mic_action.setChecked(current_filter == 'mic')
-        
-        system_action = menu.addAction("System")
-        system_action.setCheckable(True)
-        system_action.setChecked(current_filter == 'system')
-        
-        # Connect actions to filter change
-        def set_filter(filter_value):
-            # Find and set the combo index
-            for i in range(self._transcription_filter_combo.count()):
-                if self._transcription_filter_combo.itemData(i) == filter_value:
-                    self._transcription_filter_combo.setCurrentIndex(i)
-                    break
-        
-        all_action.triggered.connect(lambda: set_filter('all'))
-        mic_action.triggered.connect(lambda: set_filter('mic'))
-        system_action.triggered.connect(lambda: set_filter('system'))
-        
+        self._add_filter_actions(menu, self._transcription_filter_combo, self._transcription_filter)
+
         # Show menu below the button
         menu.exec(self.transcript_filter_button.mapToGlobal(
             QPoint(0, self.transcript_filter_button.height())))
     
+    def _transcript_filter_options(self) -> list:
+        """(value, label) of the filters for the transcript on screen: All plus
+        each speaker while it is diarized (BU168), else All / Mic / System."""
+        if self._speaker_layout:
+            return [('all', 'All')] + [(f'speaker:{n}', f'Speaker {n}')
+                                       for n in self._speaker_layout['speakers']]
+        return [('all', 'All'), ('mic', 'Mic'), ('system', 'System')]
+
+    def _add_filter_actions(self, menu: QMenu, combo: QComboBox, current: str):
+        """One checkable action per filter option; choosing one selects it in ``combo``."""
+        for value, label in self._transcript_filter_options():
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(current == value)
+            action.triggered.connect(
+                lambda _checked=False, v=value: combo.setCurrentIndex(max(combo.findData(v), 0)))
+
+    def _sync_transcript_filter_options(self):
+        """Refill both filter combos for the transcript on screen; a filter
+        that no longer applies (diarization switched) goes back to All."""
+        options = self._transcript_filter_options()
+        if self._transcription_filter not in [value for value, _label in options]:
+            self._transcription_filter = 'all'
+        main = getattr(self, '_transcription_filter_combo', None)
+        for combo in (main, getattr(self, '_detached_filter_combo', None)):
+            if combo is None:
+                continue
+            current = self._transcription_filter if combo is main else combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for value, label in options:
+                combo.addItem(label, value)
+            combo.setCurrentIndex(max(combo.findData(current), 0))
+            combo.blockSignals(False)
+
     def _create_status_bar(self):
         """Create the status bar."""
         self.status_bar = QStatusBar()
@@ -3472,7 +3529,8 @@ class MainWindow(QMainWindow):
         return wrapper
 
     def add_transcription_to_view(self, text: str, source: str, timestamp: str = '',
-                                   start_dt=None, end_dt=None, animate: bool = True):
+                                   start_dt=None, end_dt=None, animate: bool = True,
+                                   speaker: Optional[int] = None):
         """Add a transcription chunk to the pixel transcript window.
 
         Grouped per source (BU103): consecutive chunks with no real pause
@@ -3488,8 +3546,11 @@ class MainWindow(QMainWindow):
                 this method (see _load_transcripts_for_session) and passes
                 False, so opening a long session doesn't fire one
                 QPropertyAnimation per historical line.
+            speaker: Diarized row (BU168): "Speaker N" replaces Mic / System,
+                and only consecutive turns of one speaker share a bubble.
         """
-        group = self._transcript_groups.get(source)
+        key = f'speaker:{speaker}' if speaker else source
+        group = self._transcript_groups.get(key)
         now = datetime.now()
 
         if should_extend_group(group, start_dt, end_dt):
@@ -3506,27 +3567,24 @@ class MainWindow(QMainWindow):
             group['last_end'] = end_dt
             return
 
-        display_source = "Mic" if source == 'mic' else "System"
         if start_dt is not None:
             bubble_time = start_dt.strftime('%H:%M')
         elif timestamp:
             bubble_time = timestamp[:5]
         else:
             bubble_time = ''
-        display_text = f"{display_source}: {text}"
-        align = "right" if source == 'mic' else "left"
-        variant = "blue" if source == 'mic' else "cream"
+        display_source, align, variant, tag = bubble_look(source, speaker, self._speaker_layout)
+        display_text = text if tag else f"{display_source}: {text}"
 
         row = aligned_bubble_with_time(
-            display_text, variant=variant, align=align, max_width=250, time_text=bubble_time
+            display_text, variant=variant, align=align, max_width=250, time_text=bubble_time,
+            tag=tag,
         )
-        row.setProperty('source', source)
+        row.setProperty('source', key)
         row.setProperty('find_text', f"{display_source}: {text}")
         row.setToolTip(timestamp or '')
 
-        if self._transcription_filter == 'mic' and source != 'mic':
-            row.hide()
-        elif self._transcription_filter == 'system' and source != 'system':
+        if self._transcription_filter not in ('all', key):
             row.hide()
 
         # Sticking to the bottom (or not) is handled by _on_transcription_range_changed,
@@ -3537,7 +3595,9 @@ class MainWindow(QMainWindow):
             row
         )
 
-        self._transcript_groups[source] = {
+        if speaker:
+            self._transcript_groups.clear()  # the next speaker closes this bubble
+        self._transcript_groups[key] = {
             'row': row,
             'bubble': bubble_of_row(row),
             'start_dt': start_dt or now,
@@ -3670,6 +3730,9 @@ class MainWindow(QMainWindow):
         self._transcription_autoscroll = True
         self._detached_autoscroll = True
         self._transcript_groups = {}
+        if getattr(self, '_speaker_layout', None) is not None:
+            self._speaker_layout = None
+            self._sync_transcript_filter_options()
         self._detached_transcript_groups = {}
         self._detached_last_end = None
         self._detached_selected_chunks = []
@@ -3896,18 +3959,7 @@ class MainWindow(QMainWindow):
                 source = bubble_frame.property('source')
                 
                 # Show or hide based on filter
-                if self._transcription_filter == 'all':
-                    bubble_frame.show()
-                elif self._transcription_filter == 'mic':
-                    if source == 'mic':
-                        bubble_frame.show()
-                    else:
-                        bubble_frame.hide()
-                elif self._transcription_filter == 'system':
-                    if source == 'system':
-                        bubble_frame.show()
-                    else:
-                        bubble_frame.hide()
+                bubble_frame.setVisible(self._transcription_filter in ('all', source))
 
     def _on_detached_scope_changed(self, index: int):
         """Propagate a detached-window scope change to the main combo."""
@@ -4000,7 +4052,9 @@ class MainWindow(QMainWindow):
 
             # Get transcripts from database
             transcripts = self.session_manager.db.get_transcripts(session_id)
-            
+            self._speaker_layout = speaker_layout(transcripts)
+            self._sync_transcript_filter_options()
+
             if not transcripts:
                 # Don't show message for active/current session - no transcripts expected yet
                 if not allow_live:
@@ -4052,13 +4106,16 @@ class MainWindow(QMainWindow):
                         time_str = str(timestamp)
 
                 # Format display text
-                source_label = 'Mic' if source == 'mic' else 'System'
+                speaker = transcript.get('speaker')
+                source_label = bubble_look(source, speaker, self._speaker_layout)[0]
                 display_text = f"[{time_str}] {source_label}: {text}" if time_str else f"{source_label}: {text}"
 
                 end_dt = (
                     start_dt + timedelta(seconds=ChunkedAudioRecorder.CHUNK_DURATION)
                     if start_dt else None
                 )
+                if speaker and start_dt and transcript.get('end_timestamp'):
+                    end_dt = datetime.fromtimestamp(transcript['end_timestamp'])
                 record = TranscriptRecord(
                     text=text,
                     source=source,
@@ -4066,6 +4123,7 @@ class MainWindow(QMainWindow):
                     end_dt=end_dt,
                     transcript_id=transcript.get('id'),
                     display_text=display_text,
+                    speaker=speaker,
                 )
                 self._transcript_records.append(record)
 
@@ -4075,7 +4133,8 @@ class MainWindow(QMainWindow):
                 # chunk arriving live - a fade-in per bubble here meant
                 # opening a long session fired dozens of animations at once.
                 self.add_transcription_to_view(
-                    text, source, time_str, start_dt=start_dt, end_dt=end_dt, animate=False
+                    text, source, time_str, start_dt=start_dt, end_dt=end_dt, animate=False,
+                    speaker=speaker,
                 )
 
                 # Also add to detached window if it exists
@@ -4741,9 +4800,8 @@ class MainWindow(QMainWindow):
 
         # Hidden filter combo for state management
         self._detached_filter_combo = QComboBox()
-        self._detached_filter_combo.addItem("All", "all")
-        self._detached_filter_combo.addItem("Mic", "mic")
-        self._detached_filter_combo.addItem("System", "system")
+        for value, label in self._transcript_filter_options():
+            self._detached_filter_combo.addItem(label, value)
         self._detached_filter_combo.currentIndexChanged.connect(self._on_detached_filter_changed)
         self._detached_filter_combo.setVisible(False)
         outer.addWidget(self._detached_filter_combo)
@@ -5876,30 +5934,9 @@ class MainWindow(QMainWindow):
         menu = QMenu(self._detached_filter_button)
         menu.setStyleSheet(DETACHED_MENU_QSS)
         
-        current_filter = self._transcription_filter
-        
-        all_action = menu.addAction("All")
-        all_action.setCheckable(True)
-        all_action.setChecked(current_filter == 'all')
-        
-        mic_action = menu.addAction("Mic")
-        mic_action.setCheckable(True)
-        mic_action.setChecked(current_filter == 'mic')
-        
-        system_action = menu.addAction("System")
-        system_action.setCheckable(True)
-        system_action.setChecked(current_filter == 'system')
-        
-        def set_filter(filter_value):
-            for i in range(self._detached_filter_combo.count()):
-                if self._detached_filter_combo.itemData(i) == filter_value:
-                    self._detached_filter_combo.setCurrentIndex(i)
-                    break
-        
-        all_action.triggered.connect(lambda: set_filter('all'))
-        mic_action.triggered.connect(lambda: set_filter('mic'))
-        system_action.triggered.connect(lambda: set_filter('system'))
-        
+        self._add_filter_actions(menu, self._detached_filter_combo,
+                                 self._detached_filter_combo.currentData())
+
         menu.exec(self._detached_filter_button.mapToGlobal(
             QPoint(0, self._detached_filter_button.height())))
     
@@ -5970,8 +6007,10 @@ class MainWindow(QMainWindow):
             return
 
         source = record.source if record.source in ('mic', 'system') else 'mic'
-        display_source = "Mic" if source == 'mic' else "System"
-        group = self._detached_transcript_groups.get(source)
+        key = f'speaker:{record.speaker}' if record.speaker else source
+        display_source, align, variant, tag = bubble_look(source, record.speaker,
+                                                        self._speaker_layout)
+        group = self._detached_transcript_groups.get(key)
 
         # Sticking to the bottom (or not) is handled by _on_detached_range_changed
         # once the content has actually resized, as in the main panel.
@@ -6002,11 +6041,10 @@ class MainWindow(QMainWindow):
                 self._detached_transcript_groups.clear()
 
             bubble_time = record.start_dt.strftime('%H:%M') if record.start_dt else ''
-            align = "right" if source == 'mic' else "left"
-            variant = "blue" if source == 'mic' else "cream"
 
             row = aligned_bubble_with_time(
-                f"{display_source}: {record.text}",
+                record.text if tag else f"{display_source}: {record.text}",
+                tag=tag,
                 variant=variant,
                 align=align,
                 max_width=getattr(self, '_detached_bubble_width', DETACHED_BUBBLE_MAX_WIDTH),
@@ -6015,7 +6053,7 @@ class MainWindow(QMainWindow):
                 # minute-long group can still be selected one chunk at a time.
                 segmented=True,
             )
-            row.setProperty('source', source)
+            row.setProperty('source', key)
             row.setProperty('find_text', f"{display_source}: {record.text}")
             row.setProperty('record_indices', [index])
 
@@ -6024,7 +6062,7 @@ class MainWindow(QMainWindow):
                 self._detached_filter_combo.currentData()
                 if getattr(self, '_detached_filter_combo', None) else 'all'
             )
-            if filter_value in ('mic', 'system') and source != filter_value:
+            if filter_value not in ('all', key):
                 row.hide()
 
             bubble_of_row(row).set_max_width(
@@ -6033,7 +6071,9 @@ class MainWindow(QMainWindow):
             self._install_bubble_selection(row)
             self._detached_layout.insertWidget(self._detached_layout.count() - 1, row)
 
-            self._detached_transcript_groups[source] = {
+            if record.speaker:
+                self._detached_transcript_groups.clear()  # the next speaker closes this bubble
+            self._detached_transcript_groups[key] = {
                 'row': row,
                 'bubble': bubble_of_row(row),
                 'start_dt': record.start_dt or datetime.now(),
@@ -7864,6 +7904,9 @@ class MainWindow(QMainWindow):
                     busy = state['busy'].get(session_id)
                     if busy is not None:
                         getattr(card, busy[0]).set_state('busy', busy[1])
+                    self._apply_diarization_card_state(card, session)
+                    card.progress.done.connect(
+                        lambda sid=session_id: self._on_diarization_strip_done(sid))
                     card.clicked.connect(lambda sid=session_id: select(sid))
                     card.open_requested.connect(lambda sid=session_id: open_session(sid))
                     list_layout.addWidget(card)
@@ -7998,6 +8041,7 @@ class MainWindow(QMainWindow):
         dialog._busy_end = busy_end
         dialog._mark_busy = mark_busy
         dialog._clear_busy = clear_busy
+        dialog._card_for = lambda session_id: state['cards'].get(session_id)
 
         def on_finished(_result):
             live_timer.stop()
@@ -8048,6 +8092,8 @@ class MainWindow(QMainWindow):
                 lambda: run_step(card.summary_chip, "Summarizing", self._run_summarization),
             )
             action.setEnabled(not is_live)
+        if session.get('origin') != 'text':  # an inserted transcript has no audio
+            self._add_diarization_action(menu, session, dialog, is_live, trans_ready)
         if sum_ready:
             menu.addAction("View summary",
                            lambda: self._show_summary_by_session_id(session_id, session_name))
@@ -8083,6 +8129,168 @@ class MainWindow(QMainWindow):
         )
         delete_action.setEnabled(not is_live)
         return menu
+
+    # -- diarization (BU166, BU167) ------------------------------------------
+
+    _DIARIZATION_POPUP_QSS = """
+        QMessageBox { background: #0E2A6B; }
+        QMessageBox QLabel {
+            color: #FFF0BF; font-family: "Courier New"; font-size: 10pt;
+        }
+        QMessageBox QPushButton {
+            color: #FFF0BF; background: transparent; border: 2px solid #3A67C7;
+            border-radius: 5px; padding: 0px 16px; min-height: 28px;
+            font-family: "Courier New"; font-size: 9.5pt; font-weight: 700;
+        }
+        QMessageBox QPushButton:hover { background: #274F9B; }
+        QMessageBox QPushButton#DiarizationPrimary {
+            color: #071846; background: #E37C25; border: 2px solid #F4A25C;
+        }
+        QMessageBox QPushButton#DiarizationPrimary:hover { background: #EE8C38; }
+    """
+
+    def _diarization_popup(self, parent, title: str, text: str, primary: str):
+        """A small confirm pop-up: ``primary`` (default) and Cancel.
+        Returns (box, primary button)."""
+        box = QMessageBox(parent or self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setIcon(QMessageBox.NoIcon)
+        button = box.addButton(primary, QMessageBox.AcceptRole)
+        button.setObjectName("DiarizationPrimary")
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(button)
+        if theme.is_pixel():  # Boring Corporate styles message boxes app-wide
+            box.setStyleSheet(self._DIARIZATION_POPUP_QSS)
+        return box, button
+
+    def _ask_diarization(self, parent, title: str, text: str, primary: str) -> bool:
+        box, button = self._diarization_popup(parent, title, text, primary)
+        box.exec()
+        return box.clickedButton() is button
+
+    def _add_diarization_action(self, menu: QMenu, session: dict, dialog, is_live: bool,
+                                trans_ready: bool):
+        """Enable / Cancel / Disable diarization, following the session's state."""
+        session_id = session['id']
+        status = session.get('diarization_status') or 'none'
+        if self.session_manager.is_diarizing(session_id):
+            menu.addAction("Cancel diarization", lambda: self._cancel_diarization(session_id))
+            return
+        if session.get('diarization_enabled') and status == 'ready':
+            menu.addAction("Disable diarization",
+                           lambda: self._disable_diarization(session_id, dialog))
+            return
+        label = "Enable diarization"
+        if is_live:
+            label += " (after recording stops)"
+        elif not trans_ready:
+            label += " (transcribe first)"
+        elif status == 'failed':
+            label += " (retry)"
+        action = menu.addAction(label, lambda: self._enable_diarization(session, dialog))
+        action.setEnabled(not is_live and trans_ready)
+        if status == 'failed':
+            action.setToolTip(self.session_manager.diarization_error(session_id)
+                              or "The last diarization did not finish")
+            menu.setToolTipsVisible(True)
+
+    def _enable_diarization(self, session: dict, dialog):
+        session_id = session['id']
+        if session.get('diarization_status') == 'ready':
+            self.session_manager.enable_diarization(session_id)  # instant
+            self._after_diarization_switch(session_id, dialog)
+            return
+        text = (f"Find who spoke when in '{session['name']}' and label its transcript by speaker?"
+                "\n\nIt runs in the background and takes about 10-15 min per hour of audio.")
+        if not model_manager.diarization_installed():
+            text += "\n\nThe first run also downloads the speaker models (about 46 MB)."
+        if not self._ask_diarization(dialog, "Enable Diarization", text, "Enable diarization"):
+            return
+        try:
+            self.session_manager.start_diarization(session_id)
+        except ValueError as e:
+            QMessageBox.warning(dialog, "Diarization", str(e))
+            return
+        self._diarization_progress.setdefault(session_id, (0, "Queued…"))
+        self._on_status_update(f"Diarizing '{session['name']}' in the background…")
+        self._refresh_all_sessions_window(dialog)
+
+    def _disable_diarization(self, session_id: int, dialog):
+        if not self._ask_diarization(dialog, "Disable Diarization",
+                                     "Use the original transcript, without speakers?",
+                                     "Use original transcript"):
+            return
+        self.session_manager.disable_diarization(session_id)
+        self._after_diarization_switch(session_id, dialog)
+
+    def _cancel_diarization(self, session_id: int):
+        if self.session_manager.cancel_diarization(session_id):
+            percent = self._diarization_progress.get(session_id, (0, ''))[0]
+            self._apply_diarization_progress(session_id, percent, "Cancelling…")
+
+    def _after_diarization_switch(self, session_id: int, dialog=None):
+        """The session now shows the other transcript: refresh what shows it."""
+        if dialog is not None:
+            self._refresh_all_sessions_window(dialog)
+        if self._current_display_session_id() == session_id and self._live_session_state() is None:
+            self._clear_transcription_view()
+            self._load_transcripts_for_session(session_id)
+
+    def _apply_diarization_card_state(self, card, session: dict):
+        """Speakers chip and progress strip of one card, from the session row
+        and the progress kept on this window."""
+        session_id = session['id']
+        running = self.session_manager.is_diarizing(session_id)
+        error = None
+        if session.get('diarization_status') == 'failed' and not running:
+            error = self.session_manager.diarization_error(session_id) or ''
+        on = session.get('diarization_enabled') and session.get('diarization_status') == 'ready'
+        card.set_speakers(session.get('speaker_count', 0) if on else 0, error)
+        progress = self._diarization_progress.get(session_id)
+        if progress is None and running:
+            progress = (0, "Queued…")
+        if progress is not None:
+            card.progress.set_progress(*progress, animate=False)
+
+    def _diarization_card(self, session_id: int):
+        dialog = self._all_sessions_dialog
+        card_for = getattr(dialog, '_card_for', None) if dialog is not None else None
+        return card_for(session_id) if card_for else None
+
+    @Slot(int, int, str)
+    def _apply_diarization_progress(self, session_id: int, percent: int, text: str):
+        self._diarization_progress[session_id] = (percent, text)
+        card = self._diarization_card(session_id)
+        if card is not None:
+            card.progress.set_progress(percent, text)
+
+    @Slot(int, bool, object)
+    def _apply_diarization_finished(self, session_id: int, ok: bool, error):
+        """A run ended. On success the card's bar fills, holds, then the list
+        reloads (see _on_diarization_strip_done); otherwise it reloads now."""
+        card = self._diarization_card(session_id)
+        if ok and card is not None:
+            self._diarization_progress[session_id] = (100, "Done")
+            card.progress.set_progress(100, "Done")
+        else:
+            self._diarization_progress.pop(session_id, None)
+            if self._all_sessions_dialog is not None:
+                self._refresh_all_sessions_window(self._all_sessions_dialog)
+        if ok:
+            self._on_status_update(f"Session {session_id}: speakers found")
+            self._after_diarization_switch(session_id)
+        elif error:
+            self._on_status_update(f"Diarization of session {session_id} failed: {error}", is_error=True)
+        else:
+            self._on_status_update(f"Diarization of session {session_id} cancelled")
+
+    def _on_diarization_strip_done(self, session_id: int):
+        if self._diarization_progress.get(session_id, (0,))[0] >= 100:
+            self._diarization_progress.pop(session_id, None)
+            dialog = self._all_sessions_dialog
+            if dialog is not None:
+                QTimer.singleShot(0, lambda: self._refresh_all_sessions_window(dialog))
 
     def _run_document_job(self, fn, on_done):
         """Run ``fn`` on the job thread; ``on_done(result, error)`` on the UI thread."""

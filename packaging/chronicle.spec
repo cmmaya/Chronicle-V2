@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
-    collect_data_files, collect_dynamic_libs, collect_submodules,
+    collect_data_files, collect_dynamic_libs, collect_submodules, copy_metadata,
 )
 
 ROOT = Path(SPECPATH).parent
@@ -37,13 +37,18 @@ if (ROOT / "google_oauth_client.json").is_file():
 # onnx_asr ships its preprocessor ONNX graphs as package data.
 datas += collect_data_files("soundcard")
 datas += collect_data_files("onnx_asr")
+# onnx_asr/__init__.py reads its own version with importlib.metadata, so
+# without the dist-info `import onnx_asr` fails in the bundle (BU162).
+datas += copy_metadata("onnx-asr")
 # python-docx reads its default .docx template and XML schemas as package data.
 datas += collect_data_files("docx")
 
 # PortAudio and libsndfile ship in the _sounddevice_data / _soundfile_data
-# packages; FFmpeg in av's own folder.
+# packages; FFmpeg in av's own folder. sherpa_onnx keeps its own
+# onnxruntime.dll next to its extension in sherpa_onnx/lib (BU162).
 binaries = []
-for package in ("onnxruntime", "_sounddevice_data", "_soundfile_data", "av", "tokenizers"):
+for package in ("onnxruntime", "_sounddevice_data", "_soundfile_data", "av", "tokenizers",
+                "sherpa_onnx"):
     binaries += collect_dynamic_libs(package)
 
 hiddenimports = (
@@ -55,6 +60,8 @@ hiddenimports = (
     # Session Documents (BU147): read .pdf and .docx.
     + collect_submodules("pypdf")
     + ["docx", "lxml._elementpath"]
+    # Speaker diarization (BU162).
+    + ["sherpa_onnx"]
 )
 
 excludes = [

@@ -10,7 +10,13 @@ from .context_models import (
     ConversationTurn, ScreenshotReference, TranscriptExcerpt, render_screenshot_section,
 )
 from .openrouter_client import OpenRouterClient
-from .rag_context_builder import build_any_session_context, build_routed_session_context
+from .rag_context_builder import (
+    archive_session,
+    build_any_session_context,
+    build_routed_session_context,
+    find_archive_chunks,
+    rank_query_terms,
+)
 from .response_contract import RESPONSE_CONTRACT, parse_answer
 from .scope_offer import ScopeOffer, build_scope_offer
 from .live_qa import strip_transcript_evidence
@@ -642,6 +648,9 @@ class AssistantAnswerService:
         about; Tier-2 chunk search runs only inside them. Falls back to the
         legacy unified/keyword search when routing yields nothing. A short
         follow-up is routed and searched with the previous question (BU152).
+        Chunks anywhere in the archive holding the question's rare words are
+        added, and their sessions become candidates after the routed ones
+        (BU161).
         """
         query = search_query(question, self._previous_turns(conversation_id))
         routed = []
@@ -661,13 +670,23 @@ class AssistantAnswerService:
             for r in routed
         ]
 
-        if routed:
-            try:
-                context = build_routed_session_context(self._db, query, routed)
-                if context and not context.startswith("(No relevant context"):
-                    return context
-            except Exception:
-                pass
+        terms = rank_query_terms(self._db, query)
+        archive = find_archive_chunks(self._db, terms["rare"])
+        routed_ids = {r.session_id for r in routed}
+        for sid in dict.fromkeys(c.get("session_id") for c in archive):
+            if sid is not None and sid not in routed_ids:
+                self._last_routed_sessions.append(
+                    dict(archive_session(self._db, sid), score=0.0, reason="archive match"))
+        logger.info(
+            "Any Session archive search: rare=%s chunks=%d", terms["rare"], len(archive))
+
+        try:
+            context = build_routed_session_context(
+                self._db, query, routed, archive=archive, terms=terms["ranked"])
+            if context and not context.startswith("(No relevant context"):
+                return context
+        except Exception:
+            pass
 
         # Fall back: unified RAG search, then legacy keyword search.
         try:

@@ -28,6 +28,12 @@ webrtcvad-wheels==2.0.14
 onnxruntime==1.20.1
 onnx-asr[cpu,hub]==0.11.0
 
+# Speaker diarization (BU162): pyannote segmentation + TitaNet embeddings.
+# sherpa-onnx loads its own onnxruntime.dll (sherpa_onnx/lib); the pip
+# onnxruntime above keeps its runtime inside onnxruntime_pybind11_state.pyd,
+# so the two load side by side in one process (verified both import orders).
+sherpa-onnx==1.13.8
+
 # Model downloads (Parakeet and the e5 embedder) - imported directly by
 # src/rag/embeddings.py, so pinned directly rather than relying on onnx-asr[hub].
 huggingface_hub==1.17.0
