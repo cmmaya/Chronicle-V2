@@ -1,8 +1,8 @@
 ﻿# Current State
 
 ## Execution Status
-- Current BU: none
-- Next BU: none
+- Current BU: BU023
+- Next BU: BU024
 
 ## Target Architecture
 
@@ -36,135 +36,7 @@ BU017 - Trigger Summarization from UI
 BU018 - Display Summary in UI
 BU019 - Screenshot Button in UI
 BU020 - Display Screenshots in UI
-BU021 - Session Playback
-BU022 - Session Deletion
-BU023 - Overlapping Audio Chunking
-BU024 - Transcription Deduplication and Context
-BU025 - Mono Recording
-BU026 - VAD Integration
-BU027 - Live Transcription Callback
-BU028 - Real-time Transcription in SessionManager
-BU029 - Display Live Transcriptions in UI
-BU030 - UI Layout for Live Transcriptions
-BU031 - Live Transcription Checkbox
-BU032 - Live Transcription Display
-BU033 - Filtering Transcriptions
-BU034 - Assistant Conversation Storage
-BU035 - Assistant Agent Options Config
-BU036 - Assistant OpenRouter Client
-BU037 - Assistant Context Models
-BU038 - Single Session Assistant Retrieval
-BU039 - Assistant Database Search Methods
-BU040 - Assistant Session Resolver
-BU041 - Whitelisted Assistant Retrieval Tools
-BU042 - Assistant Answer Service
-BU043 - Assistant UI Panel Skeleton
-BU044 - Wire Assistant Ask Action
-BU045 - Assistant Clarification Flow UI
-BU047 - Past Assistant Conversations UI
-BU048 - Session-Scoped Conversation Persistence
-BU049 - Assistant Context Loader
-BU050 - Assistant Conversation Writeback
-BU050-1 - New Chat Button
-BU051 - Automatic Summary Setting
-BU052 - Auto Summary Toggle Button
-BU053 - Auto Summary On Stop
-BU054 - Assistant Model Setting
-BU055 - Model Selector UI
-BU056 - 
-BU057 - Screenshot AI Context Field
-BU058 - Screenshot Context Generator
-BU059 - Screenshot Context UI Button (Fixed - Selection Support)
-BU060 - Pause Resume Session Lifecycle
-BU061 - Pause Button UI
-BU062 - Home Layout Shell
-BU063 - Session Search Combobox
-BU065 - Selected Session Scope Label
-BU066 - Session Action Icon Row
-BU071 - RAG Metadata Schema
-BU072 - RAG Source Upsert Helpers
-BU073 - Add RAG FTS Rebuild
-BU074 - Add Unified FTS Search
-BU075 - Expose Unified Search Tool
-BU076 - Create RAG Result Models
-BU077 - Add Current Session FTS Retrieval
-BU078 - Replace Current Session Context Path
-BU079 - Add Any Session Context Builder
-BU080 - Wire Any Session Service Retrieval
-BU082 - Tighten Chronicle Assistant Prompt
-BU083 - Add Retrieval Tests
-BU084 - Add Local Embedding Schema Placeholder
-BU085 - Implement RAG Content Indexing
-BU086 - Fix RAG FTS MATCH Clause
-BU087 - Timestamp-Preserving Transcript Chunking
-BU089 - Session Router For Any Session
-BU090 - Assistant Answer Contract And Handoff
-BU091 - Embedding Backfill And Incremental Reindex
-BU092 - Scope Switch Offer Decision And Payload
-BU093 - In-Chat Scope Switch Prompt
-BU095 - System Audio Capture Supervisor And Watchdog
-BU096 - Delete Past Conversation From Sidebar (Right-Click)
-BU097 - Keyword Search For Transcripts And Conversations
-BU101 - Transcript Download Button
-BU102 - Resume Stopped Session From All Sessions
-BU103 - Grouped Live Transcript Bubbles
-BU104 - Upload Audio File As Session
-BU105 - Performance, Memory, and Threading Rework
-BU106 - Screenshot Preliminary Description And Metadata Optimization
-BU107 - Two-Tier Screenshot Search Engine
-BU108 - Screenshot-Aware Specific Session Answers
-BU109 - Screenshot Viewer Window
-BU110 - Screenshot Extras: Visible-Text Search, Live-Session Viewing, Capture Hotkey
-BU120 - Dependency Audit And Clean Requirements
-BU121 - App Paths: Separate Install Folder From User Data
-BU122 - API Key In The Windows Credential Store
-BU123 - Model Manager: Check, Download And Verify Models
-BU124 - First-Run Setup Wizard Before The Main Window
-BU125 - Windowed-App Hardening: Log File, Crash Dialog, Single Instance
-BU128 - Settings Pop-Up Window
-BU126 - PyInstaller Build Of A Standalone App Folder
-BU127 - Windows Installer With A Choosable Install Folder
-BU129 - Machine-Readable Calendar Date In Due Dates Entries
-BU130 - Google Account Sign-In (OAuth Desktop Flow)
-BU131 - Calendar Page In The Settings Pop-Up
-BU132 - Calendar Event Service And Sent-Event Tracking
-BU133 - "Send To Calendar" Button And Event Dialog
-BU134 - Session Origin Flag For Inserted Transcripts
-BU135 - Text Transcript File Parser
-BU136 - Import A Text Transcript As A Session
-BU137 - "Upload Transcript" Button In All Sessions
-BU138 - Inserted Transcript View In The Main Transcripts Panel
-BU139 - Inserted Transcript Mode In The Detached Window
-BU140 - "Text" Label For Inserted Transcripts In Assistant Context
-BU141 - Live-Aware Transcript Retrieval
-BU142 - Chronological, Timestamped Session Evidence
-BU143 - Search Terms: Stop Words, Stems, Follow-Ups
-BU144 - Whole Transcript For Specific Session Questions
-BU145 - No-Document Prompt Baseline
-BU146 - Session Documents Table
-BU147 - Document Text Extraction (.txt, .md, .pdf, .docx)
-BU148 - Session Documents Pop-Up From The All Sessions Menu
-BU149 - Session Documents In Specific Session Prompts
-BU150 - Document Badge On Chat Answers And A Documents Indicator
-BU151 - Detached Window On Session Documents (Replaces The BU117 Attachment)
-BU152 - Any Session Context For Unsummarized (Uploaded Audio) Sessions
-BU153 - Theme Engine: Style Tokens Beyond Colour
-BU154 - Monochrome Palette
-BU155 - Line Icon Set
-BU156 - Core Widgets
-BU157 - Main Window Layout
-BU158 - Secondary Windows
-BU159 - Dialogs
-BU160 - Visual QA
-BU161 - Any Session Archive Search For Rare Words And Centred Excerpts
-BU162 - Diarization Runtime And Models
-BU163 - Diarization Engine
-BU164 - Speaker Transcript Storage
-BU165 - Diarization Job
-BU166 - Enable / Disable Diarization In The Session Menu
-BU167 - Diarization Progress Bar On The Session Card
-BU168 - Speaker-Labelled Transcript View
-BU169 - Speakers In Assistant Context
+BU023 - Implement Overlapping Audio Chunking
 
 ## In Progress BUs
 BU170 - Diarization Visual And Real-Session QA (Article Critique run, live-app checks and packaged build still to do)
