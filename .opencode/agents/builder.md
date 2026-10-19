@@ -4,7 +4,7 @@ description: Stateless implementation specialist for isolated Builder Units (BU)
 model: openrouter/minimax/minimax-m2.1
 mode: primary
 temperature: 0.1
-maxSteps: 15
+maxSteps: 30
 tools:
   read: true
   write: true
@@ -21,6 +21,8 @@ You operate statelessly.
 Never rely on chat history.
 
 Repository documentation is your ONLY source of truth.
+
+Iterate until you are done or need human validation
 
 ==================================================
 CONTEXT RECOVERY

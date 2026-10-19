@@ -147,6 +147,26 @@ class Session:
         # Return the main audio directory
         return str(self.session_path / 'audio')
     
+    def set_source_muted(self, source: str, muted: bool) -> bool:
+        """Mute or unmute one capture source for this session (BU118).
+
+        Returns True if the state was applied. False means there is no
+        recorder to apply it to yet - the caller decides whether that is worth
+        reporting; nothing is raised for a session that isn't capturing.
+        """
+        if not self.dual_recorder:
+            logger.warning(f'No recorder on session {self.id}; cannot mute {source}')
+            return False
+
+        self.dual_recorder.set_source_muted(source, muted)
+        return True
+
+    def is_source_muted(self, source: str) -> bool:
+        """True if that source is muted. A session with no recorder is not."""
+        if not self.dual_recorder:
+            return False
+        return self.dual_recorder.is_source_muted(source)
+
     def stop_recording(self, label: str = 'recording') -> Optional[str]:
         """Stop audio recording.
         

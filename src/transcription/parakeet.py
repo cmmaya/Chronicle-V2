@@ -1,309 +1,384 @@
-"""Parakeet V3 transcription engine integration."""
+"""Parakeet ASR engine integration using ONNX Runtime via onnx-asr.
+
+This module intentionally avoids importing torch, openai-whisper, faster-whisper,
+or ROCm/CUDA libraries. It is designed for CPU-first transcription on Windows
+machines where PyTorch GPU stacks may be unavailable or unstable.
+"""
+
+from __future__ import annotations
+
 import logging
-import wave
+import os
+import threading
+import time
+from typing import Any, Dict, Optional
+
 import numpy as np
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-import struct
+import soundfile as sf
+
+try:
+    from ..config import TRANSCRIPTION as _TRANSCRIPTION
+except Exception:  # pragma: no cover - config should always import
+    _TRANSCRIPTION = {}
 
 logger = logging.getLogger(__name__)
+
+# onnx-asr accepts these input rates directly (it resamples internally).
+_SUPPORTED_SAMPLE_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
 
 
 class ParakeetError(Exception):
     """Base exception for Parakeet transcription errors."""
-    pass
 
 
 class ModelLoadError(ParakeetError):
     """Failed to load Parakeet model."""
-    pass
 
 
 class TranscriptionError(ParakeetError):
     """Failed to transcribe audio."""
-    pass
 
 
-class ParakeetV3:
-    """Wrapper for Parakeet V3 speech-to-text model.
-    
-    Supports offline transcription of audio files using the Parakeet V3 model.
-    Handles audio preprocessing and model inference.
+class ParakeetEngine:
+    """Wrapper for NVIDIA Parakeet TDT v3 through the onnx-asr package.
+
+    The default model name follows onnx-asr's public quickstart:
+    ``nemo-parakeet-tdt-0.6b-v3``. It loads only from the files installed by
+    ``src/model_manager.py`` for the configured quantization - never a download
+    at runtime (BU123).
+
+    Parakeet does not support Whisper-style ``initial_prompt``. The method
+    accepts that parameter only to remain compatible with the existing
+    TranscriptionProcessor interface; deduplication/context remains handled by
+    the processor.
+
+    ``load()`` and inference are thread-safe: concurrent first calls load the
+    model once, and inferences run one at a time (in parallel they would only
+    fight over the same CPU cores). Use :func:`get_shared_engine` so the whole
+    app holds a single copy of the model.
     """
-    
-    def __init__(self, model_path: Optional[str] = None, scorer_path: Optional[str] = None):
-        """Initialize Parakeet V3 model.
-        
+
+    DEFAULT_MODEL = "nemo-parakeet-tdt-0.6b-v3"
+    DEFAULT_LANGUAGE = "auto"
+    _UNSET = object()
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        scorer_path: Optional[str] = None,
+        language: str = DEFAULT_LANGUAGE,
+        intra_threads: Optional[int] = None,
+        inter_threads: int = 1,
+        quantization: Any = _UNSET,
+    ):
+        """Initialize Parakeet engine.
+
         Args:
-            model_path: Path to Parakeet model file (.tflite). 
-                        If None, attempts to use default model.
-            scorer_path: Path to language model scorer (optional).
+            model_path: onnx-asr model name or local model directory. Defaults
+                to ``config.TRANSCRIPTION['model']``.
+            scorer_path: Kept for API compatibility; unused.
+            language: Kept for API compatibility. Parakeet v3 can auto-detect
+                supported languages.
+            intra_threads: ONNX Runtime intra-op thread count. Defaults to
+                ``config.TRANSCRIPTION['intra_threads']``, else up to 4.
+            inter_threads: ONNX Runtime inter-op thread count.
+            quantization: onnx-asr weight quantization (``"int8"``) or None for
+                full precision. Defaults to ``config.TRANSCRIPTION['quantization']``.
         """
-        self.model_path = model_path
+        self.model_path = model_path or _TRANSCRIPTION.get("model") or self.DEFAULT_MODEL
         self.scorer_path = scorer_path
-        self._model = None
-        self._scorer = None
+        self.language = language or self.DEFAULT_LANGUAGE
+        self.intra_threads = (
+            intra_threads
+            or _TRANSCRIPTION.get("intra_threads")
+            or max(1, min(os.cpu_count() or 1, 4))
+        )
+        self.inter_threads = max(1, inter_threads)
+        self.quantization = (
+            _TRANSCRIPTION.get("quantization") if quantization is self._UNSET else quantization
+        )
+
+        self._model: Any = None
         self._loaded = False
-        self._model_type: Optional[str] = None
+        self._model_type = "parakeet-onnx"
         self._model_name: Optional[str] = None
-    
+        self._loaded_quantization: Optional[str] = None
+        self._load_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
+        self._last_used = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        """Seconds since the model was last loaded or used."""
+        return time.monotonic() - self._last_used
+
     def load(self) -> None:
-        """Load the Parakeet model and scorer.
-        
+        """Load Parakeet model through onnx-asr.
+
         Raises:
-            ModelLoadError: If model loading fails
+            ModelLoadError: If onnx-asr is missing or the model cannot be loaded.
         """
         if self._loaded:
             return
-            
-        # Primary: try Whisper first as preferred backend
-        try:
-            import whisper
-            model_name = self.model_path if self.model_path else "small"
-            self._model = whisper.load_model(model_name)
-            self._model_type = 'whisper'
-            self._model_name = model_name
-            logger.info(f"Loaded Whisper model: {model_name}")
-            self._loaded = True
-            return
-        except ImportError:
-            pass
-        except Exception as e:
-            # Whisper present but failed to load
-            raise ModelLoadError(f"Failed to load Whisper model: {str(e)}")
-
-        # Secondary: try parakeet-ctc
-        try:
-            from parakeet import load_model
-            self._model = load_model("parakeet_v3")
-            self._model_type = 'parakeet'
-            self._model_name = 'parakeet_v3'
-            logger.info("Loaded Parakeet V3 model via parakeet-ctc")
-            self._loaded = True
-            return
-        except ImportError:
-            pass
-        except Exception as e:
-            raise ModelLoadError(f"Failed to load Parakeet model: {str(e)}")
-
-        # Tertiary: try coqui-stt
-        try:
-            import coqui_stt
-            if self.model_path:
-                self._model = coqui_stt.Model(self.model_path)
-                if self.scorer_path:
-                    self._model.enableExternalScorer(self.scorer_path)
-                self._model_type = 'coqui'
-                self._model_name = self.model_path
-                logger.info(f"Loaded Coqui STT model from {self.model_path}")
-                self._loaded = True
+        with self._load_lock:
+            if self._loaded:
                 return
-        except ImportError:
-            pass
-        except Exception as e:
-            raise ModelLoadError(f"Failed to load Coqui-STT model: {str(e)}")
+            self._load()
 
-        # If we reach here, no supported backend loaded
-        raise ModelLoadError(
-            "Failed to load any speech-to-text model. "
-            "Please install a supported STT package (openai-whisper, parakeet-ctc, or coqui-stt) "
-            "and any required model files or dependencies (e.g. PyTorch)."
+    def _load(self) -> None:
+        try:
+            # Import lazily so the app can start even if the dependency is missing.
+            import onnx_asr
+        except ImportError as exc:
+            raise ModelLoadError(
+                "Failed to import onnx-asr. Install it with: "
+                "pip install \"onnx-asr[cpu,hub]\""
+            ) from exc
+
+        try:
+            start = time.perf_counter()
+            self._model = self._load_onnx_asr_model(onnx_asr)
+            self._model_name = self.model_path
+            self._loaded = True
+            self._last_used = time.monotonic()
+            logger.info(
+                "Loaded Parakeet model '%s' (%s) using onnx-asr in %.2fs "
+                "(intra_threads=%s, inter_threads=%s)",
+                self.model_path,
+                self._loaded_quantization or "full precision",
+                time.perf_counter() - start,
+                self.intra_threads,
+                self.inter_threads,
+            )
+        except Exception as exc:
+            raise ModelLoadError(
+                f"Failed to load Parakeet model '{self.model_path}': {exc}"
+            ) from exc
+
+    def _session_options(self) -> Any:
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = self.intra_threads
+        options.inter_op_num_threads = self.inter_threads
+        # The arena keeps every allocation's high-water mark for the life of
+        # the model (and over-allocates in powers of two); without it, memory
+        # between inferences goes back to the OS.
+        options.enable_cpu_mem_arena = False
+        return options
+
+    def _model_dir(self) -> str:
+        """Local folder holding exactly the files for ``self.quantization``.
+
+        ``model_path`` may itself be a model directory; otherwise it must be
+        the model the model manager installs.
+        """
+        if os.path.isdir(self.model_path):
+            return self.model_path
+        from .. import model_manager
+
+        if self.model_path != self.DEFAULT_MODEL:
+            raise ModelLoadError(
+                f"'{self.model_path}' is not a model directory, and only "
+                f"'{self.DEFAULT_MODEL}' is installed by setup."
+            )
+        parakeet = next(
+            m for m in model_manager.required_models(self.quantization)
+            if m.name == model_manager.PARAKEET
         )
-    
+        if not model_manager.is_installed(models=[parakeet]):
+            raise ModelLoadError(
+                f"The speech-to-text model (Parakeet, "
+                f"{self.quantization or 'full precision'}) is not installed. "
+                f"{model_manager.SETUP_HINT}"
+            )
+        return str(model_manager.snapshot_dir(parakeet))
+
+    def _load_onnx_asr_model(self, onnx_asr: Any) -> Any:
+        """Load the configured quantization, with our thread counts, from disk.
+
+        There is no fallback to another variant: that would mean a multi-GB
+        download in the middle of a session.
+        """
+        model_dir = self._model_dir()
+        try:
+            options = self._session_options()
+        except Exception as exc:  # noqa: BLE001 - thread tuning is optional
+            logger.warning("Could not build ONNX Runtime session options: %s", exc)
+            options = None
+
+        kwargs: Dict[str, Any] = {"quantization": self.quantization}
+        if options is not None:
+            kwargs["sess_options"] = options
+        # An existing local directory makes onnx-asr resolve files offline.
+        model = onnx_asr.load_model(self.DEFAULT_MODEL, model_dir, **kwargs)
+        self._loaded_quantization = self.quantization
+        return model
+
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
         return self._loaded
-    
-    def _load_audio_file(self, audio_path: str) -> np.ndarray:
-        """Load and preprocess audio file to numpy array.
-        
+
+    def transcribe(self, audio_path: str, initial_prompt: Optional[str] = None) -> str:
+        """Transcribe an audio file to text.
+
         Args:
-            audio_path: Path to WAV audio file
-            
+            audio_path: Path to a WAV (or other soundfile-readable) file.
+            initial_prompt: Ignored. Kept for compatibility with previous
+                Whisper-based processor calls.
+
         Returns:
-            Audio data as float32 numpy array normalized to [-1, 1]
-            
+            Transcribed text string.
+
         Raises:
-            TranscriptionError: If audio file cannot be loaded
+            TranscriptionError: If transcription fails.
+            ModelLoadError: If model cannot be loaded.
         """
+        audio_path = str(audio_path)
         try:
-            with wave.open(str(audio_path), 'rb') as wf:
-                # Verify audio format
-                if wf.getnchannels() != 1 and wf.getnchannels() != 2:
-                    raise TranscriptionError(f"Unsupported channel count: {wf.getnchannels()}")
-                
-                frames = wf.readframes(wf.getnframes())
-                sample_width = wf.getsampwidth()
-                sample_rate = wf.getframerate()
-                
-                # Convert to float32 array
-                if sample_width == 2:
-                    audio = np.frombuffer(frames, dtype=np.int16)
-                    audio = audio.astype(np.float32) / 32768.0
-                elif sample_width == 4:
-                    audio = np.frombuffer(frames, dtype=np.int32)
-                    audio = audio.astype(np.float32) / 2147483648.0
-                else:
-                    raise TranscriptionError(f"Unsupported sample width: {sample_width}")
-                
-                # Convert stereo to mono if needed
-                if wf.getnchannels() == 2:
-                    audio = audio.reshape(-1, 2).mean(axis=1)
-                
-                # Resample to 16000 Hz if needed (Parakeet expects 16kHz)
-                if sample_rate != 16000:
-                    audio = self._resample(audio, sample_rate, 16000)
-                
-                # Ensure float32 dtype for downstream models (Whisper expects float32)
-                return audio.astype(np.float32)
-                
-        except wave.Error as e:
-            raise TranscriptionError(f"Failed to read audio file: {str(e)}")
-        except Exception as e:
-            raise TranscriptionError(f"Audio preprocessing failed: {str(e)}")
-    
-    def _resample(self, audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
-        """Simple audio resampling using linear interpolation.
-        
-        Args:
-            audio: Input audio array
-            orig_rate: Original sample rate
-            target_rate: Target sample rate
-            
-        Returns:
-            Resampled audio array
-        """
-        if orig_rate == target_rate:
-            return audio.astype(np.float32)
-            
-        # Calculate new length
-        new_length = int(len(audio) * target_rate / orig_rate)
-        
-        # Linear interpolation
-        x_orig = np.linspace(0, 1, len(audio))
-        x_new = np.linspace(0, 1, new_length)
-        
-        # np.interp returns float64 by default; cast to float32 for model compatibility
-        return np.interp(x_new, x_orig, audio).astype(np.float32)
-    
-    def transcribe(self, audio_path: str) -> str:
-        """Transcribe audio file to text.
-        
-        Args:
-            audio_path: Path to WAV audio file
-            
-        Returns:
-            Transcribed text string
-            
-        Raises:
-            TranscriptionError: If transcription fails
-            ModelLoadError: If model is not loaded
-        """
-        if not self._loaded:
-            self.load()
-        
-        # If we reach here, model must be loaded (load() would have raised otherwise)
-        if self._model is None:
-            raise ModelLoadError("Model failed to load")
-        
-        try:
-            # Load and preprocess audio
-            # If using Whisper, let it handle audio file directly
-            if getattr(self, '_model_type', None) == 'whisper':
-                # Load audio into numpy array at 16kHz and pass directly to Whisper to avoid ffmpeg dependency
-                audio = self._load_audio_file(audio_path)
-                result = self._model.transcribe(audio)
-                return result.get('text', '')
+            samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+        except Exception as exc:
+            raise TranscriptionError(f"Could not read audio file {audio_path}: {exc}") from exc
+        return self.transcribe_array(samples, sample_rate, label=audio_path)
 
-            # Otherwise, load and preprocess audio for parakeet/coqui
-            audio = self._load_audio_file(audio_path)
+    def transcribe_array(
+        self, samples: np.ndarray, sample_rate: int, label: str = "<array>"
+    ) -> str:
+        """Transcribe in-memory audio (mono or multichannel, any supported rate)."""
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        if sample_rate not in _SUPPORTED_SAMPLE_RATES:
+            raise TranscriptionError(f"Unsupported sample rate {sample_rate} Hz for {label}")
 
-            # Run inference
+        # Lock order everywhere: _infer_lock, then _load_lock (see unload()).
+        with self._infer_lock:
+            if self._model is None:
+                self.load()  # raises ModelLoadError
+            model = self._model
             try:
-                # Try parakeet-ctc API
-                text = self._model(audio)
-                return text
-            except (TypeError, AttributeError):
-                # Fallback to coqui-stt API
-                text = self._model.SpeechToText(audio.tobytes())
-                return text
-                
-        except TranscriptionError:
-            raise
-        except Exception as e:
-            raise TranscriptionError(f"Transcription failed: {str(e)}")
-    
-    def transcribe_stream(self, audio_chunk: np.ndarray) -> str:
-        """Transcribe an audio chunk (for future real-time support).
-        
-        Note: Real-time transcription is out of scope for BU005,
-        but this method is provided for API consistency.
-        
-        Args:
-            audio_chunk: Audio data as float32 numpy array
-            
-        Returns:
-            Transcribed text string
-        """
-        if not self._loaded:
-            self.load()
-        
-        # Model must be loaded at this point
-        if self._model is None:
-            raise ModelLoadError("Model failed to load")
-        
-        # Whisper: accept numpy audio directly to avoid ffmpeg dependency
-        if getattr(self, '_model_type', None) == 'whisper':
-            try:
-                # Ensure mono
-                if len(audio_chunk.shape) > 1:
-                    audio_chunk = audio_chunk.mean(axis=1)
-
-                # Ensure float32
-                audio_chunk = audio_chunk.astype(np.float32)
-
-                result = self._model.transcribe(audio_chunk)
-                return result.get('text', '')
-            except Exception as e:
-                raise TranscriptionError(f"Stream transcription (Whisper) failed: {str(e)}")
-
-        # Ensure correct format
-        if len(audio_chunk.shape) > 1:
-            audio_chunk = audio_chunk.mean(axis=1)
-        
+                start = time.perf_counter()
+                result = model.recognize(samples, sample_rate=sample_rate)
+                self._last_used = time.monotonic()
+            except Exception as exc:
+                raise TranscriptionError(f"Parakeet transcription failed: {exc}") from exc
         try:
-            text = self._model(audio_chunk)
+            text = self._extract_text(result)
+            logger.info(
+                "Parakeet transcription for %s took %.2fs model='%s'",
+                label,
+                time.perf_counter() - start,
+                self.model_path,
+            )
             return text
-        except Exception as e:
-            logger.warning(f"Stream transcription failed: {str(e)}")
+        except Exception as exc:
+            raise TranscriptionError(f"Parakeet transcription failed: {exc}") from exc
+
+    def transcribe_stream(self, audio_chunk: Any, initial_prompt: Optional[str] = None) -> str:
+        """Transcribe an in-memory 16 kHz mono chunk (kept for older call sites)."""
+        return self.transcribe_array(audio_chunk, 16000, label="<stream>")
+
+    @staticmethod
+    def _extract_text(result: Any) -> str:
+        """Extract text from possible onnx-asr result shapes."""
+        if result is None:
             return ""
-    
+
+        if isinstance(result, str):
+            return result.strip()
+
+        # Common typed result objects may expose .text or .transcript.
+        for attr in ("text", "transcript", "sentence"):
+            value = getattr(result, attr, None)
+            if isinstance(value, str):
+                return value.strip()
+
+        if isinstance(result, dict):
+            for key in ("text", "transcript", "sentence"):
+                value = result.get(key)
+                if isinstance(value, str):
+                    return value.strip()
+            # Some APIs return segments/tokens; join recognizable text fields.
+            for key in ("segments", "tokens", "results"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    parts = []
+                    for item in value:
+                        if isinstance(item, str):
+                            parts.append(item)
+                        elif isinstance(item, dict):
+                            item_text = item.get("text") or item.get("token")
+                            if isinstance(item_text, str):
+                                parts.append(item_text)
+                        else:
+                            item_text = getattr(item, "text", None)
+                            if isinstance(item_text, str):
+                                parts.append(item_text)
+                    if parts:
+                        return " ".join(parts).strip()
+
+        if isinstance(result, (list, tuple)):
+            parts = []
+            for item in result:
+                text = ParakeetEngine._extract_text(item)
+                if text:
+                    parts.append(text)
+            if parts:
+                return " ".join(parts).strip()
+
+        return str(result).strip()
+
     def get_model_info(self) -> Dict[str, Any]:
-        """Get information about the loaded model.
-        
-        Returns:
-            Dictionary with model metadata
-        """
-        info = {
+        """Get information about the loaded model."""
+        return {
             "loaded": self._loaded,
             "model_path": self.model_path,
+            "model_name": self._model_name,
             "scorer_path": self.scorer_path,
-            "model_type": self._model_type if self._model_type else "none"
+            "model_type": self._model_type,
+            "language": self.language,
+            "device": "cpu",
+            "runtime": "onnx-asr",
+            "quantization": self._loaded_quantization if self._loaded else self.quantization,
+            "intra_threads": self.intra_threads,
+            "inter_threads": self.inter_threads,
+            "sample_rate": 16000,
         }
-        
-        if self._model is not None:
-            try:
-                info["sample_rate"] = getattr(self._model, 'sample_rate', 16000)
-            except Exception:
-                info["sample_rate"] = 16000
-        else:
-            info["sample_rate"] = 16000
-            
-        return info
-    
+
     def unload(self) -> None:
-        """Unload the model to free memory."""
-        self._model = None
-        self._scorer = None
-        self._loaded = False
+        """Unload model to free memory (waits for a running inference)."""
+        with self._infer_lock, self._load_lock:
+            if self._model is None:
+                return
+            self._model = None
+            self._loaded = False
         logger.info("Parakeet model unloaded")
+
+
+_shared_engine: Optional[ParakeetEngine] = None
+_shared_engine_lock = threading.Lock()
+
+
+def get_shared_engine() -> ParakeetEngine:
+    """The process-wide engine used by live and batch transcription.
+
+    One model copy serves the whole app; creating a ParakeetEngine per caller
+    is what used to load the ~2.6 GB model two or three times over.
+    """
+    global _shared_engine
+    if _shared_engine is None:
+        with _shared_engine_lock:
+            if _shared_engine is None:
+                _shared_engine = ParakeetEngine()
+    return _shared_engine
+
+
+def set_shared_engine(engine: Optional[ParakeetEngine]) -> None:
+    """Test hook: inject an engine, or pass None to reset the singleton."""
+    global _shared_engine
+    with _shared_engine_lock:
+        _shared_engine = engine
+
+
+# Backwards-compatible aliases for call sites that used Whisper names.
+WhisperError = ParakeetError
+WhisperEngine = ParakeetEngine

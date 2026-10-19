@@ -1,31 +1,54 @@
+# Chronicle runtime dependencies (BU120).
+# Every direct third-party import in src/ is listed here, pinned to the version
+# verified in .venv312. Test/build tools live in requirements-dev.txt.
+
+# UI
 PySide6==6.6.0
-mss==10.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
-soundcard>=0.4.0
-soundfile>=0.12.0
-sounddevice>=0.4.0
-numpy<2
-# Primary STT backend: Whisper
-# Whisper (openai-whisper) requires PyTorch. Installing torch is platform-dependent;
-# please install a compatible torch wheel first before installing requirements.txt.
-# Example (CPU-only, Linux/Windows/macOS):
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# Then install the rest:
-#   pip install -r requirements.txt
-openai-whisper
 
-# Note: If you cannot install torch/openai-whisper on your Python version, either
-# use a different Python (3.10/3.11 recommended) or install one of the alternative
-# backends (parakeet-ctc or coqui-stt) and provide model files as needed.
+# Core
+numpy==1.26.4
+requests==2.34.2
+httpx==0.28.1
+python-dotenv==1.2.2
 
-# QUICK SETUP (Whisper)
-# Whisper requires PyTorch. Installing PyTorch is platform and CUDA-version dependent.
-# Recommended flow:
-# 1) Install a compatible PyTorch wheel for your platform. Example CPU-only install:
-#    pip install torch --index-url https://download.pytorch.org/whl/cpu
-# 2) Install remaining Python deps (this file):
-#    pip install -r requirements.txt
+# Audio capture
+soundcard==0.4.6
+soundfile==0.13.1
+sounddevice==0.5.5
+
+# Voice Activity Detection
+webrtcvad-wheels==2.0.14
+
+# Speech-to-text: NVIDIA Parakeet (nemo-parakeet-tdt-0.6b-v3) through onnx-asr.
+# No Whisper, faster-whisper or PyTorch.
 #
-# If you prefer, create a small helper file requirements-whisper.txt that includes
-# the correct torch wheel link for your platform before openai-whisper.
+# onnxruntime 1.26.0 may fail to import on some Windows/Python 3.12 setups
+# with a DLL initialization error. Version 1.20.1 has been verified working
+# with this project. Nothing here may relax this pin.
+onnxruntime==1.20.1
+onnx-asr[cpu,hub]==0.11.0
+
+# Speaker diarization (BU162): pyannote segmentation + TitaNet embeddings.
+# sherpa-onnx loads its own onnxruntime.dll (sherpa_onnx/lib); the pip
+# onnxruntime above keeps its runtime inside onnxruntime_pybind11_state.pyd,
+# so the two load side by side in one process (verified both import orders).
+sherpa-onnx==1.13.8
+
+# Model downloads (Parakeet and the e5 embedder) - imported directly by
+# src/rag/embeddings.py, so pinned directly rather than relying on onnx-asr[hub].
+huggingface_hub==1.17.0
+
+# RAG session router (BU089): tokenizer for intfloat/multilingual-e5-small.
+# The ONNX encoder itself is loaded with the onnxruntime pinned above.
+tokenizers==0.23.1
+
+# Upload Audio (BU104): decodes .m4a / WAV / MP3 uploads. Wheels bundle FFmpeg.
+av==17.0.1
+
+# Session Documents (BU147): text of .pdf and .docx files. Both pure Python;
+# python-docx pulls in lxml.
+pypdf==6.20.0
+python-docx==1.2.0
+
+# OpenRouter API key storage in the Windows Credential Manager (BU122).
+keyring==25.7.0
